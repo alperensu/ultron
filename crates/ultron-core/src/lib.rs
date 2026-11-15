@@ -6,6 +6,8 @@ pub mod engine;
 pub mod eventlog;
 pub mod events;
 pub mod paths;
+pub mod summarizer;
+pub mod workstate;
 
 pub use config::{Config, EngineConfig, EngineId};
 pub use db::{Db, SearchHit, SessionRow, SessionStatus, StoredEvent};
