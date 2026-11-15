@@ -108,8 +108,9 @@ fn step_events(raw: &Value, step: &Value) -> Vec<EngineEvent> {
         "user_input" => Vec::new(),
         "agent_response" => {
             let delta = str_or_empty(step, "text_delta");
-            // Boşluk tek başına gelen artımlar olay üretmez; metin aynen korunur.
-            if delta.trim().is_empty() {
+            // Boşluk tek başına gelen artımlar (ör. satır sonu) da metnin parçasıdır; yalnız boş
+            // artım olay üretmez.
+            if delta.is_empty() {
                 Vec::new()
             } else {
                 vec![EngineEvent::AssistantText { text: delta }]

@@ -102,6 +102,11 @@ fn agy_parses_fixture_events() {
             EngineEvent::AssistantText {
                 text: "yanit-1".into(),
             },
+            // Son artım yalnız satır sonudur; boşluk parçaları artık atılmaz.
+            EngineEvent::AssistantText {
+                text: "
+".into(),
+            },
             EngineEvent::Usage {
                 input_tokens: Some(10),
                 output_tokens: Some(2),
@@ -175,6 +180,23 @@ fn agy_success_without_output_is_error() {
         resets_at: None,
     }];
     assert_eq!(finalize(&already_quota, Some(0)), None);
+}
+
+#[test]
+fn agy_whitespace_delta_is_kept_but_empty_is_dropped() {
+    let eng = AgyEngine::new(cfg());
+    let line = |delta: &str| {
+        json!({
+            "event": "step_update",
+            "step_update": { "step_type": "agent_response", "text_delta": delta }
+        })
+        .to_string()
+    };
+    assert_eq!(
+        eng.parse_line(&line(" ")),
+        vec![EngineEvent::AssistantText { text: " ".into() }]
+    );
+    assert!(eng.parse_line(&line("")).is_empty());
 }
 
 #[tokio::test]
