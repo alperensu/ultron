@@ -1,8 +1,8 @@
-# Harness — Tasarım Belgesi
+# Ultron — Tasarım Belgesi
 
 - Tarih: 2026-11-15
 - Durum: Taslak, kullanıcı onayı bekliyor
-- Ad: "harness" (geçici)
+- Ad: **Ultron** [K]: proje, repo ve asistan persona adı. Belgede geçen "harness" kelimesi sistemin türünü anlatır. Servis adı `ultrond`, CLI `ultron` [Ö]; belgedeki `harnessd` ifadeleri `ultrond` olarak okunur. Üçüncü kişilerle konuşurken varsayılan tanıtım "Alperen'in asistanı"dır; ayardan değiştirilebilir [Ö].
 - Kapsam: Tüm sistemin mimarisi + Aşama 1 (Çekirdek) ve Aşama 2 (Masaüstü v1) ayrıntılı tasarımı. Sonraki aşamalar kendi tasarım turlarıyla ayrıntılandırılır.
 
 Bu belgede **[K]** kullanıcının konuşmada verdiği kararları, **[Ö]** Claude'un önerip kullanıcının itiraz etmediği ya da kendi verdiği kararları gösterir. [Ö] maddeleri kullanıcı okurken değiştirebilir.
@@ -196,6 +196,28 @@ harness-brain/
 
 **Okuma:** Bağlam bütçesiyle `retrieve(query, project, audience, limit, budget_chars)` → kaynak atfı + kesilme bilgisi. `audience` alanı sızıntıyı önler: `remote_allowed=false` ya da `private` notlar ilgili motorlara (ör. API modeli) ve üçüncü kişilere gitmez. Finans botu notları varsayılan olarak `remote_allowed=false`'dur. [Ö]
 
+**Bağlamı doldurmamak: kademeli yükleme** [Ö] (kullanıcı isteği, 2026-11-15):
+1. **Kasa asla toptan yüklenmez.** Her çağrıya üç kademe gider:
+   - **Çekirdek kart** (her zaman, ~300–500 token): kullanıcının en temel bilgileri ve kuralların kısa özeti. Elle düzenlenir, sabit kalır.
+   - **Proje kartı** (projeye girilince, ~500–1000 token): proje özeti, son kararlar, sıradaki adım.
+   - **Getirilen parçalar** (bütçe dolana kadar): yalnızca sorguyla ilgili notların ilgili *bölümleri*, tüm dosya değil.
+2. **Önce özet, gerekirse tamamı:** Her notun 1–2 satırlık `summary` alanı vardır. Pakete çoğunlukla özet ve not kimliği girer. Model ayrıntıya ihtiyaç duyarsa `memory_get(id)` aracıyla notun tamamını kendisi çeker (skill listesindeki gibi aşamalı açılım).
+3. **Hafızaya gerek var mı kapısı:** Yönlendirici (yerel model) her mesaj için "hafıza gerekli mi, ne kadar?" kararı verir. "Testleri çalıştır" gibi mesajlara hafıza basılmaz.
+4. **Arama hattı:** BM25 + embedding karma arama → yerel küçük modelle yeniden sıralama → tekrarları ayıklama → bölüm düzeyinde kesme → bütçeye sığdırma.
+5. **Bütçeler:** Moda göre (Eko en küçük) ve motorun bağlam penceresine göre ayarlanır. Kesildiği bilgisi pakette yazar.
+6. **Önbellek dostu sıra:** Değişmeyen kısımlar (çekirdek kart, proje kartı) başa, değişen parçalar sona konur. Böylece CLI'ların istem önbelleği daha sık tutar.
+7. **Oturumda bir kez:** Kartlar oturum başında bir kez gönderilir. Sonraki turlarda yalnızca yeni ya da değişen parçalar eklenir.
+8. **Hafıza bakımı:** Periyodik birleştirme (tekrarlar tek nota), `review_at` süresi geçen ve uzun süre kullanılmayan notların arşive alınması. Kasa zamanla şişmez.
+9. **Ölçüm:** Gönderilen notlardan hangilerinin cevapta gerçekten kullanıldığı (atıf ya da `memory_get`) kaydedilir. Hiç kullanılmayan notların sıralaması düşer; işe yarayanlarınki yükselir.
+
+**Uzun vadeli hatırlama: az yükle ama unutma** [Ö] (kullanıcı isteği, 2026-11-15). Örnek: kullanıcı aylar önce "evde boşta duran şu özellikte bir laptopum var" demiştir; aylar sonra bir sunucu ya da deneme makinesi gerektiğinde harness bunu hatırlatmalıdır.
+1. **Kalıcı bilgiler sohbetin içinde kaybolmaz:** Hafıza önerisi adımı, sohbet arasında geçen kalıcı bilgileri yapılandırılmış notlara çıkarır: cihaz → `home/`, tercih → `me/`, kişi → `people/`. Laptop örneği `home/` altında `facts: {model, ram, cpu, durum: boşta}` alanlarıyla bir cihaz notu olur ve kaynak makbuzu o sohbete bağlanır.
+2. **Kalıcı türler eskimez:** Kullanılmama nedeniyle sıralama düşürme ve arşive alma yalnızca geçici türlere (oturum notu, günlük kaydı, geçici karar) uygulanır. `home`, `me`, `people`, `rule`, `tool` türleri yaşlanmaz. Bunlar yalnızca kullanıcı onayıyla ya da daha yeni bir bilgiyle değişir ("laptopu sattım").
+3. **Arşiv unutmak değildir:** Arşivdeki notlar ve tüm sohbet dökümü aranabilir kalır. İlk aramada bulunamazsa ikinci kademe olarak tüm geçmişte (`history_search`) aranır.
+4. **İlgi tabanlı, zaman tabanlı değil:** Arama yeniliğe değil anlama bakar. Aylar önceki bir bilgi, bugünkü bir konuşmayla eşleşirse sıralamada öne çıkar.
+5. **Varlık ve yetenek indeksi:** Yapılandırılmış bilgiler küçük bir indekste tutulur (cihazlar, araçlar, hesaplar, kişiler → ne işe yarar). Bir ihtiyaç sezildiğinde ("sunucu lazım", "bir şey 7/24 çalışmalı", "test makinesi") yönlendirici bu indeksi ucuza tarar ve eşleşen bilgiyi tek satır olarak pakete ekler. Bütün notu basmaz.
+6. **Proaktif hatırlatma:** Eşleşme güçlüyse asistan kendisi söyler: "Evde boşta duran Lenovo Z50-70'in var, bunun için kullanabiliriz." Kullanıcının sorması beklenmez.
+
 **Hızlı yakalama:** Global kısayolla açılan küçük pencere; link, metin, dosya ya da ekran görüntüsünü `inbox/`'a kart olarak atar. [Ö]
 
 **Başlangıç verisi:** `~/.claude/projects-catalog.md`, Claude hafıza dosyaları ve proje notları kasaya aktarılır. Claude Code oturum geçmişi (`~/.claude/projects/**/*.jsonl`) sohbet olarak içe aktarılır. ChatGPT dışa aktarımı sonradan eklenebilir. [Ö — varsayılan, kullanıcı itiraz etmedi]
@@ -259,6 +281,9 @@ ChatGPT/Codex masaüstü uygulamasının düzeni referans alınır, ama marka ve
 7. Acil olmayan ağır işler kotası önce sıfırlanacak havuza ya da geceye kaydırılır.
 8. Görev ve sohbet başına kota tüketimi görünür.
 9. Ekonomik mod düğmesi (Eko orkestrasyon + küçük bağlam bütçesi + daha az otomatik kontrol).
+10. **Rol bazlı çıktı üslubu** (kullanıcının `caveman` skill'i): Alt ajanların şefe yazdığı raporlar, ajanlar arası mesajlar, özetler ve hafıza önerileri kısa ve teknik üslupta yazılır, çünkü bunları insan değil model okuyor. Kullanıcıya giden cevaplar normal üslupta kalır. Kullanıcı isterse kendi sohbeti için de açabilir. [Ö]
+11. **Güncel doküman araçları isteğe bağlı** (ör. Context7): Yalnızca kod işlerinde ve bir kütüphane ya da API söz konusu olduğunda o çalıştırmaya eklenir. Yanlış sürüm bilgisi yüzünden boşa giden denemeleri azaltır, ama her çalıştırmaya yüklenirse araç tanımları kota yer. [Ö]
+12. **Mevcut skill'lerin taşınması:** `~/.claude/skills` ve plugin skill'leri harness'in skill kütüphanesine aktarılır. Skill'ler bağlama toptan basılmaz; yalnızca ad ve kısa açıklamaları gider, gövdesi ihtiyaç olunca yüklenir (§6.4 kademeli yükleme ile aynı ilke). Hangi motorun skill desteği olduğuna göre skill ya motorun kendi mekanizmasıyla ya da devir paketine eklenerek verilir. [Ö]
 
 ### 6.8 Güvenlik ve onay
 
@@ -359,6 +384,7 @@ Not: Kullanıcı mevcut Claude Code + `codex-fleet` düzenini harness Aşama 4'e
 6. **Pro/Plus kotası:** Tam mod ve uzun döngüler kotayı hızla tüketir. Varsayılan mod Dengeli. [Ö]
 7. **Yerel model kalitesi** 8 GB VRAM'de sınırlı. Yalnızca dar işler; onay modelinde kararsızlık durumunda kullanıcıya sorulur.
 8. **Codex bilgisayar kontrolü** `codex exec` içinden doğrulanmamış; harness kendi araçlarını kullanır.
+10. **Ad ve marka:** "Ultron" Marvel/Disney'in tescilli karakter adı. Kullanıcı riski bilerek seçti (2026-11-15). Açık kaynak yayında yeniden adlandırma ya da kaldırma talebi gelebilir. Bu yüzden ad kodda tek bir sabitte tutulur (uygulama adı, servis adı, persona) ve değiştirilmesi kolay olur; Marvel görselleri ve logoları kullanılmaz. [K + Ö]
 9. **Claude kota verisi:** Mevcut `limit` skill'i Claude kotasını `~/.claude/.credentials.json` içindeki OAuth token'ıyla `api.anthropic.com/api/oauth/usage` uç noktasından okuyor. Bu belgelenmemiş bir uç nokta. Kullanıcı kararı bekliyor (bkz. §11).
 
 ## 11. İnceleme sonrası netleştirmeler
