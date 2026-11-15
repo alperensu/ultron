@@ -252,7 +252,13 @@ ChatGPT/Codex masaüstü uygulamasının düzeni referans alınır, ama marka ve
 
 **Görsel yönlendirme ekranı** [K]: Satırlarda iş türleri (mimari, kod, test, araştırma, inceleme, görsel, doküman, hafıza işleri), sütunlarda modlar, hücrelerde açılır menüden model ve efor. Her hücrenin yanında haftalık kota tüketimi ve başarısızlık sayısı. Bu ekran zamanla gelişecek; v1'de tablo yeterli.
 
-**`codex-fleet` politikasının taşınması:** İş sınıfı → rota, kota kontrolü, inceleme kapıları (bağımsız doğruluk + güvenlik incelemesi), düzeltme/tırmanma sınırları ve brief şablonu harness'in orkestratör politikasına dönüşür. Skill bir başlangıç politikası olarak okunur. Kod içine gömülmez, kullanıcı düzenleyebilir. [Ö]
+**Mevcut orkestrasyon skill'lerinden miras yok** [K] (2026-11-15): `codex-fleet`, `lane.py` ve benzeri mevcut kurallar Ultron'a taşınmaz. Ultron'un orkestrasyon politikası ve talimatları sıfırdan yazılır. (§6.4'teki skill kütüphanesi ayrı bir konudur: kullanıcının skill'leri araç olarak kullanılabilir, ama orkestrasyon politikası olarak değil.)
+
+**Talimat katmanı (Ultron'un kendi sistem talimatları)** [K + Ö] (2026-11-15):
+- Katmanlar (`prompts/` altında sürümlü dosyalar): 1) kimlik, 2) değişmez kurallar, 3) rol bloğu (şef / işçi / inceleyici / temsilci), 4) çekirdek kart (yalnızca şef ve sohbet), 5) araç ve hafıza kullanımı, 6) proje kartı + devir paketi (en sonda). Sabit kısımlar başta, değişenler sonda.
+- Kaynaklar: (a) **Claude Code'un kendi talimatı** — Claude motorunda `--append-system-prompt` ile korunur, Ultron katmanları üstüne eklenir. Metni kopyalanmaz, repoya ya da başka motorlara konmaz, çünkü Anthropic'e ait yayınlanmamış metin. (b) **Karpathy esinli kodlama ilkeleri** (Forrest Chang, `multica-ai/andrej-karpathy-skills`, MIT): kodlamadan önce düşün ve varsayımları söyle, önce sadelik, cerrahi değişiklik, doğrulanabilir hedefe göre çalış. Ultron'un sözleriyle uyarlanır, lisans atfı `prompts/NOTICE` dosyasında. (c) Anthropic'in herkese açık Claude Code en iyi uygulama belgeleri, ilke düzeyinde. Codex'in talimatları kaynak olarak kullanılmaz [K].
+- Talimat bilgilendirir, Rust servisi uygular: güvenlik kuralları prompt'ta yalnızca açıklama olarak yer alır.
+- Her talimat değişikliği küçük bir senaryo setiyle ölçülür (Aşama 6).
 
 **Alt ajan yönetimi ve canlı izleme** [K]:
 - Sohbetin sağ panelinde aktif ajanlar: motor, görev adı, süre, şu anki adım ve durum (çalışıyor, bekliyor, bitti, hata).
