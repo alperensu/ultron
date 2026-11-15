@@ -68,13 +68,21 @@ pub async fn run_turn(
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        // Süreç ana iş parçacığı askıda başlar; iş nesnesine bağlanmadan kod çalıştırmaz.
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
     }
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("süreç başlatılamadı: {}", spec.program))?;
-    let job = job::Job::attach(&child);
+    let job = match job::Job::attach(&child) {
+        Ok(job) => job,
+        Err(err) => {
+            let _ = child.kill().await;
+            return Err(anyhow::Error::new(err).context("süreç iş nesnesine bağlanamadı"));
+        }
+    };
 
     if let Some(text) = spec.stdin
         && let Some(mut stdin) = child.stdin.take()
@@ -244,16 +252,28 @@ async fn cancel_turn(
 
 #[cfg(windows)]
 mod job {
+    use std::io::{Error, ErrorKind, Result};
+
     use tokio::process::Child;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject,
     };
+    use windows_sys::Win32::System::Threading::{
+        OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    };
+
+    /// Test kancası: `true` iken `attach` her zaman başarısız olur.
+    #[cfg(test)]
+    pub static FORCE_ATTACH_FAILURE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// Süreç ağacı için Job Object; kapanınca içindeki tüm süreçler ölür.
-    /// Oluşturulamazsa tutacak boştur ve işlemler etkisizdir (`kill_on_drop` yedektir).
     pub struct Job(HANDLE);
 
     // SAFETY: Job Object tutacakları iş parçacıkları arasında kullanılabilir.
@@ -261,16 +281,28 @@ mod job {
     unsafe impl Sync for Job {}
 
     impl Job {
-        pub fn attach(child: &Child) -> Job {
-            let Some(process) = child.raw_handle() else {
-                return Job(std::ptr::null_mut());
-            };
-            // SAFETY: Win32 çağrıları geçerli tutacaklarla yapılır; başarısızlıkta tutacak kapatılır.
+        /// Askıda başlatılmış süreci yeni bir Job Object'e bağlar, sonra ana iş parçacığını
+        /// devam ettirir. Herhangi bir adım başarısızsa hata döner; süreci öldürmek çağıranın
+        /// işidir (süreç askıdayken çalışmaz, `kill` güvenlidir).
+        pub fn attach(child: &Child) -> Result<Job> {
+            #[cfg(test)]
+            if FORCE_ATTACH_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::other("test: iş nesnesi bağlanamadı"));
+            }
+            let process = child
+                .raw_handle()
+                .ok_or_else(|| Error::other("süreç tutacağı yok"))?;
+            let pid = child
+                .id()
+                .ok_or_else(|| Error::other("süreç kimliği yok"))?;
+            // SAFETY: Win32 çağrıları geçerli tutacaklarla yapılır. `job` yalnızca bu
+            // fonksiyonda yaratılır; hata yolunda `Drop` tutacağı kapatır.
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if handle.is_null() {
-                    return Job(std::ptr::null_mut());
+                    return Err(Error::last_os_error());
                 }
+                let job = Job(handle);
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                 info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
                 let set = SetInformationJobObject(
@@ -279,18 +311,18 @@ mod job {
                     (&raw const info).cast(),
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 );
-                if set == 0 || AssignProcessToJobObject(handle, process as HANDLE) == 0 {
-                    CloseHandle(handle);
-                    return Job(std::ptr::null_mut());
+                if set == 0 {
+                    return Err(Error::last_os_error());
                 }
-                Job(handle)
+                if AssignProcessToJobObject(handle, process as HANDLE) == 0 {
+                    return Err(Error::last_os_error());
+                }
+                resume_main_thread(pid)?;
+                Ok(job)
             }
         }
 
         pub fn terminate(&self) {
-            if self.0.is_null() {
-                return;
-            }
             // SAFETY: tutacak `Job` yaşadıkça geçerlidir.
             unsafe {
                 TerminateJobObject(self.0, 1);
@@ -300,26 +332,85 @@ mod job {
 
     impl Drop for Job {
         fn drop(&mut self) {
-            if self.0.is_null() {
-                return;
-            }
             // SAFETY: tutacak yalnızca burada kapatılır.
             unsafe {
                 CloseHandle(self.0);
             }
         }
     }
+
+    /// `pid`'in ana iş parçacığını (askıda başlatılmış süreçte tek iş parçacığı vardır)
+    /// Toolhelp anlık görüntüsüyle bulup devam ettirir.
+    ///
+    /// SAFETY: çağıran geçerli bir süreç kimliği verir; tüm tutacaklar bu fonksiyonda
+    /// açılıp kapatılır.
+    unsafe fn resume_main_thread(pid: u32) -> Result<()> {
+        // SAFETY: bkz. fonksiyon belgesi.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(Error::last_os_error());
+            }
+            let mut entry: THREADENTRY32 = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut tid: Option<u32> = None;
+            let mut more = Thread32First(snapshot, &mut entry) != 0;
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    tid = Some(entry.th32ThreadID);
+                    break;
+                }
+                more = Thread32Next(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+            let tid = tid.ok_or_else(|| Error::new(ErrorKind::NotFound, "ana iş parçacığı yok"))?;
+
+            let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, tid);
+            if thread.is_null() {
+                return Err(Error::last_os_error());
+            }
+            let previous = ResumeThread(thread);
+            CloseHandle(thread);
+            if previous == u32::MAX {
+                return Err(Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::atomic::Ordering;
+
+        use super::{FORCE_ATTACH_FAILURE, Job};
+
+        #[tokio::test]
+        async fn job_attach_failure_is_an_error() {
+            let mut child = tokio::process::Command::new("cmd")
+                .args(["/C", "timeout /T 30 /NOBREAK >NUL"])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("test süreci başlatılamadı");
+            FORCE_ATTACH_FAILURE.store(true, Ordering::SeqCst);
+            let result = Job::attach(&child);
+            FORCE_ATTACH_FAILURE.store(false, Ordering::SeqCst);
+            assert!(result.is_err(), "bağlama hatası Ok olarak dönmemeli");
+            let _ = child.kill().await;
+        }
+    }
 }
 
 #[cfg(not(windows))]
 mod job {
+    use std::io::Result;
+
     use tokio::process::Child;
 
     pub struct Job;
 
     impl Job {
-        pub fn attach(_child: &Child) -> Job {
-            Job
+        pub fn attach(_child: &Child) -> Result<Job> {
+            Ok(Job)
         }
         pub fn terminate(&self) {}
     }
