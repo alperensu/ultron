@@ -1,5 +1,6 @@
 //! Motor arayüzü: CLI motorlarının ortak sözleşmesi.
 
+pub mod claude;
 pub mod fake;
 pub mod runner;
 
@@ -8,8 +9,25 @@ use std::path::PathBuf;
 use crate::config::EngineId;
 use crate::events::EngineEvent;
 
+pub use claude::ClaudeEngine;
 pub use fake::FakeEngine;
 pub use runner::{TurnOutcome, run_turn};
+
+/// Hata metninin kota/kullanım sınırı olup olmadığına bakar (büyük/küçük harf duyarsız).
+/// Yalnız hata ve sonuç olaylarında çağrılır.
+pub(crate) fn is_quota_message(text: &str) -> bool {
+    const INDICATORS: [&str; 7] = [
+        "usage limit",
+        "rate limit",
+        "rate_limit",
+        "quota",
+        "resource_exhausted",
+        "too many requests",
+        "429",
+    ];
+    let lower = text.to_lowercase();
+    INDICATORS.iter().any(|needle| lower.contains(needle))
+}
 
 /// Motorun araç/izin kısıtı düzeyi.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

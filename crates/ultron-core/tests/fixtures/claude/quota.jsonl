@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","cwd":"C:/proj","session_id":"sess-0002","tools":[],"mcp_servers":[],"model":"model-0001","permissionMode":"default","uuid":"uuid-0101"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":300,"num_turns":0,"result":"Claude AI usage limit reached|1700000000","stop_reason":null,"session_id":"sess-0002","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0},"uuid":"uuid-0102"}
