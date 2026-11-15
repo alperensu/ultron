@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"thread-0001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item-0","type":"agent_message","text":"yanit-1"}}
+{"type":"item.completed","item":{"id":"item-1","type":"command_execution","command":"cmd-0001","aggregated_output":"cikti-0001","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item-2","type":"file_change","changes":[{"path":"C:/proj/out.txt","kind":"add"}],"status":"completed"}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":12,"reasoning_output_tokens":0}}

@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"thread-0003"}
+{"type":"item.completed","item":{"id":"item-0","type":"error","message":"model-metadata-placeholder"}}
+{"type":"turn.started"}
+{"type":"error","message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"model-access-placeholder\",\"code\":\"model_not_found\"}}"}
+{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"model-access-placeholder\",\"code\":\"model_not_found\"}}"}}

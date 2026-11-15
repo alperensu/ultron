@@ -1,6 +1,7 @@
 //! Motor arayüzü: CLI motorlarının ortak sözleşmesi.
 
 pub mod claude;
+pub mod codex;
 pub mod fake;
 pub mod runner;
 
@@ -10,6 +11,7 @@ use crate::config::EngineId;
 use crate::events::EngineEvent;
 
 pub use claude::ClaudeEngine;
+pub use codex::CodexEngine;
 pub use fake::FakeEngine;
 pub use runner::{TurnOutcome, run_turn};
 
