@@ -118,6 +118,42 @@ fn claude_parses_init_assistant_tool_result() {
 }
 
 #[test]
+fn claude_edit_tool_emits_file_changed() {
+    let eng = ClaudeEngine::new(cfg());
+    let edit = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-9","name":"Edit","input":{"file_path":"C:/proj/a.txt","old_string":"x","new_string":"y"}}]}}"#;
+    let write = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-10","name":"Write","input":{"file_path":"C:/proj/b.txt","content":"z"}}]}}"#;
+    let notebook = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-11","name":"NotebookEdit","input":{"notebook_path":"C:/proj/n.ipynb","new_source":"q"}}]}}"#;
+    let read = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-12","name":"Read","input":{"file_path":"C:/proj/c.txt"}}]}}"#;
+
+    let events = eng.parse_line(edit);
+    assert_eq!(
+        events,
+        vec![
+            EngineEvent::FileChanged {
+                path: "C:/proj/a.txt".into(),
+                change: "edit".into(),
+            },
+            EngineEvent::ToolCall {
+                tool: "Edit".into(),
+                input: json!({ "file_path": "C:/proj/a.txt", "old_string": "x", "new_string": "y" }),
+            },
+        ]
+    );
+    assert!(matches!(
+        eng.parse_line(write).first(),
+        Some(EngineEvent::FileChanged { path, change }) if path == "C:/proj/b.txt" && change == "write"
+    ));
+    assert!(matches!(
+        eng.parse_line(notebook).first(),
+        Some(EngineEvent::FileChanged { path, change }) if path == "C:/proj/n.ipynb" && change == "edit"
+    ));
+    assert!(
+        !eng.parse_line(read).iter().any(|e| matches!(e, EngineEvent::FileChanged { .. })),
+        "Read dosya değişikliği sayılmamalı"
+    );
+}
+
+#[test]
 fn claude_unknown_event_type_is_preserved() {
     let eng = ClaudeEngine::new(cfg());
     let line = r#"{"type":"brand_new","detail":{"x":1}}"#;

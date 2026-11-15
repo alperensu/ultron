@@ -130,10 +130,21 @@ fn assistant_events(raw: &Value) -> Vec<EngineEvent> {
                     out.push(EngineEvent::AssistantText { text });
                 }
             }
-            Some("tool_use") => out.push(EngineEvent::ToolCall {
-                tool: str_or_empty(block, "name"),
-                input: block.get("input").cloned().unwrap_or(Value::Null),
-            }),
+            Some("tool_use") => {
+                let tool = str_or_empty(block, "name");
+                let input = block.get("input").cloned().unwrap_or(Value::Null);
+                if let Some(change) = file_edit_change(&tool) {
+                    let path = str_field(&input, "file_path")
+                        .or_else(|| str_field(&input, "notebook_path"));
+                    if let Some(path) = path {
+                        out.push(EngineEvent::FileChanged {
+                            path,
+                            change: change.to_string(),
+                        });
+                    }
+                }
+                out.push(EngineEvent::ToolCall { tool, input });
+            }
             Some("thinking" | "redacted_thinking") => {}
             _ => out.push(EngineEvent::Unknown { raw: block.clone() }),
         }
@@ -152,6 +163,15 @@ fn assistant_events(raw: &Value) -> Vec<EngineEvent> {
         }
     }
     out
+}
+
+/// Dosya düzenleyen araçlar ve bulunan değişiklik türü. Diğer araçlar `None` döner.
+fn file_edit_change(tool: &str) -> Option<&'static str> {
+    match tool {
+        "Write" => Some("write"),
+        "Edit" | "MultiEdit" | "NotebookEdit" => Some("edit"),
+        _ => None,
+    }
 }
 
 fn user_events(raw: &Value) -> Vec<EngineEvent> {
