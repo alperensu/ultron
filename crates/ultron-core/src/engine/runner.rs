@@ -251,8 +251,9 @@ async fn cancel_turn(
 }
 
 #[cfg(windows)]
-mod job {
+pub(crate) mod job {
     use std::io::{Error, ErrorKind, Result};
+    use std::os::windows::io::{AsRawHandle, RawHandle};
 
     use tokio::process::Child;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -285,41 +286,18 @@ mod job {
         /// devam ettirir. Herhangi bir adım başarısızsa hata döner; süreci öldürmek çağıranın
         /// işidir (süreç askıdayken çalışmaz, `kill` güvenlidir).
         pub fn attach(child: &Child) -> Result<Job> {
-            #[cfg(test)]
-            if FORCE_ATTACH_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(Error::other("test: iş nesnesi bağlanamadı"));
-            }
             let process = child
                 .raw_handle()
                 .ok_or_else(|| Error::other("süreç tutacağı yok"))?;
             let pid = child
                 .id()
                 .ok_or_else(|| Error::other("süreç kimliği yok"))?;
-            // SAFETY: Win32 çağrıları geçerli tutacaklarla yapılır. `job` yalnızca bu
-            // fonksiyonda yaratılır; hata yolunda `Drop` tutacağı kapatır.
-            unsafe {
-                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if handle.is_null() {
-                    return Err(Error::last_os_error());
-                }
-                let job = Job(handle);
-                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                let set = SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    (&raw const info).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                );
-                if set == 0 {
-                    return Err(Error::last_os_error());
-                }
-                if AssignProcessToJobObject(handle, process as HANDLE) == 0 {
-                    return Err(Error::last_os_error());
-                }
-                resume_main_thread(pid)?;
-                Ok(job)
-            }
+            attach_handle(process, pid)
+        }
+
+        /// `std::process::Child` için aynı bağlama (askıda başlatılmış süreç varsayılır).
+        pub fn attach_std(child: &std::process::Child) -> Result<Job> {
+            attach_handle(child.as_raw_handle(), child.id())
         }
 
         pub fn terminate(&self) {
@@ -327,6 +305,38 @@ mod job {
             unsafe {
                 TerminateJobObject(self.0, 1);
             }
+        }
+    }
+
+    fn attach_handle(process: RawHandle, pid: u32) -> Result<Job> {
+        #[cfg(test)]
+        if FORCE_ATTACH_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::other("test: iş nesnesi bağlanamadı"));
+        }
+        // SAFETY: Win32 çağrıları geçerli tutacaklarla yapılır. `job` yalnızca bu
+        // fonksiyonda yaratılır; hata yolunda `Drop` tutacağı kapatır.
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return Err(Error::last_os_error());
+            }
+            let job = Job(handle);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set == 0 {
+                return Err(Error::last_os_error());
+            }
+            if AssignProcessToJobObject(handle, process as HANDLE) == 0 {
+                return Err(Error::last_os_error());
+            }
+            resume_main_thread(pid)?;
+            Ok(job)
         }
     }
 
@@ -401,7 +411,7 @@ mod job {
 }
 
 #[cfg(not(windows))]
-mod job {
+pub(crate) mod job {
     use std::io::Result;
 
     use tokio::process::Child;
@@ -410,6 +420,9 @@ mod job {
 
     impl Job {
         pub fn attach(_child: &Child) -> Result<Job> {
+            Ok(Job)
+        }
+        pub fn attach_std(_child: &std::process::Child) -> Result<Job> {
             Ok(Job)
         }
         pub fn terminate(&self) {}
