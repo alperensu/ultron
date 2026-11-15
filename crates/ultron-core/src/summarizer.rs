@@ -19,6 +19,7 @@ use crate::engine::{
     AgyEngine, Capabilities, CommandSpec, Engine, ToolPolicy, TurnOutcome, TurnRequest, run_turn,
 };
 use crate::events::EngineEvent;
+use crate::handoff::conversation_messages;
 use crate::workstate::{WorkState, clip};
 
 /// Özetleyici çağrısının üst süresi.
@@ -51,6 +52,11 @@ pub type SummaryFuture<'a> = Pin<Box<dyn Future<Output = Result<SummaryPatch>> +
 /// Çalışma durumunu özetleyen arayüz.
 pub trait Summarizer: Send + Sync {
     fn refresh<'a>(&'a self, state: &'a WorkState, recent: &'a [StoredEvent]) -> SummaryFuture<'a>;
+
+    /// Özetleyicinin adı (yapılandırma seçimini sınamak için).
+    fn kind(&self) -> &'static str {
+        "null"
+    }
 }
 
 /// Hiçbir şey yapmayan özetleyici; yalnız kural tabanlı durum kalır.
@@ -82,6 +88,10 @@ impl AgySummarizer {
 }
 
 impl Summarizer for AgySummarizer {
+    fn kind(&self) -> &'static str {
+        "agy"
+    }
+
     fn refresh<'a>(&'a self, state: &'a WorkState, recent: &'a [StoredEvent]) -> SummaryFuture<'a> {
         Box::pin(async move {
             let req = TurnRequest {
@@ -182,17 +192,9 @@ fn parse_patch(text: &str) -> Result<SummaryPatch> {
 
 fn build_prompt(state: &WorkState, recent: &[StoredEvent]) -> String {
     let state_json = serde_json::to_string(state).unwrap_or_default();
-    let messages: Vec<String> = recent
-        .iter()
-        .filter_map(|ev| {
-            let role = match ev.kind.as_str() {
-                "user_text" => "kullanıcı",
-                "assistant_text" => "asistan",
-                _ => return None,
-            };
-            let text = ev.payload.get("text")?.as_str()?;
-            Some(format!("- [{role}] {}", clip(text, MESSAGE_CLIP_CHARS)))
-        })
+    let messages: Vec<String> = conversation_messages(recent)
+        .into_iter()
+        .map(|(role, text)| format!("- [{role}] {}", clip(&text, MESSAGE_CLIP_CHARS)))
         .collect();
     let start = messages.len().saturating_sub(RECENT_MESSAGES);
     format!(

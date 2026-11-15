@@ -19,6 +19,7 @@ use ultron_core::events::{EngineEvent, SwitchReason};
 use ultron_core::ipc::{
     self, MAX_LINE_BYTES, Request, Response, ct_eq, read_frame, sys, write_msg,
 };
+use ultron_core::summarizer::{AgySummarizer, NullSummarizer, Summarizer};
 use ultron_core::{Config, Db, EngineId, EventLog, Paths, SessionManager, SessionStatus};
 
 use crate::keepawake::KeepAwake;
@@ -103,7 +104,7 @@ pub fn recover_interrupted(db: &Db, log: &EventLog) -> Result<usize> {
         if session.status != SessionStatus::Running {
             continue;
         }
-        let last = db.events_for_chat(&session.chat_id, None)?.pop();
+        let last = db.last_event(&session.chat_id)?;
         if last.as_ref().is_some_and(|e| e.kind == "turn_completed") {
             continue;
         }
@@ -120,6 +121,21 @@ pub fn recover_interrupted(db: &Db, log: &EventLog) -> Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+/// Çalışma durumu özetleyicisini yapılandırmaya göre seçer. agy etkinse agy özetleyicisi
+/// kurulur; değilse yalnız kural tabanlı durum kalır. Özetleyici, kullanıcı projelerinden
+/// ayrı `run\summarizer` dizininde (salt okunur kipte) çalışır.
+pub fn select_summarizer(paths: &Paths, cfg: &Config) -> Result<Box<dyn Summarizer>> {
+    match cfg.engines.iter().find(|e| e.id == EngineId::Agy && e.enabled) {
+        Some(agy) => {
+            let dir = paths.run.join("summarizer");
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("özetleyici dizini oluşturulamadı: {}", dir.display()))?;
+            Ok(Box::new(AgySummarizer::agy(agy.clone(), dir)))
+        }
+        None => Ok(Box::new(NullSummarizer)),
+    }
 }
 
 /// Sunucuyu başlatır: kilit, token, kurtarma, pipe. Çağıranın tokio çalışma zamanında olması gerekir.
@@ -150,8 +166,10 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
         .with_context(|| format!("pipe oluşturulamadı: {pipe_name}"))?;
 
     let keep = KeepAwake::new();
+    let summarizer = select_summarizer(&paths, &cfg)?;
     let state = Arc::new(State {
-        manager: SessionManager::new(db.clone(), log.clone(), cfg.clone(), engines),
+        manager: SessionManager::new(db.clone(), log.clone(), cfg.clone(), engines)
+            .with_summarizer(summarizer),
         db,
         log,
         token: token.clone(),
@@ -355,7 +373,11 @@ async fn dispatch(
                 return Err(anyhow!("cwd mutlak bir yol olmalı: {cwd}"));
             }
             let chat_id = chat_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-            let engine = engine.unwrap_or(st.default_engine);
+            // Motor verilmezse mevcut sohbetin motoru kullanılır (sessiz motor değişimi olmaz).
+            let engine = match engine {
+                Some(engine) => engine,
+                None => st.db.chat_engine(&chat_id)?.unwrap_or(st.default_engine),
+            };
             let mut last_seq = st.db.next_seq(&chat_id)? - 1;
             let mut wake = st.log.subscribe();
             let guard = st.keep.acquire();
@@ -451,12 +473,25 @@ async fn dispatch(
             }
             None if follow => {
                 let mut wake = st.log.subscribe();
+                // Sohbet başına son iletilen sıra. Yayın kanalı taşarsa (Lagged) kaçan olaylar
+                // bu imleçlerden itibaren veritabanından tamamlanır.
+                let mut cursors: HashMap<String, i64> = HashMap::new();
                 loop {
                     tokio::select! {
                         () = cancel.cancelled() => return Ok(Flow::Close),
                         woke = wake.recv() => match woke {
-                            Ok(ev) => write_msg(writer, &Response::Event(ev)).await?,
-                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Ok(ev) => {
+                                let seen = cursors.get(&ev.chat_id).copied().unwrap_or(0);
+                                if ev.seq > seen {
+                                    cursors.insert(ev.chat_id.clone(), ev.seq);
+                                    write_msg(writer, &Response::Event(ev)).await?;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                for (chat, cursor) in cursors.iter_mut() {
+                                    flush_events(st, chat, cursor, writer).await?;
+                                }
+                            }
                             Err(broadcast::error::RecvError::Closed) => return Ok(Flow::Close),
                         },
                         extra = reader.fill_buf() => {
@@ -501,5 +536,32 @@ fn outcome_name(outcome: &TurnOutcome) -> &'static str {
         TurnOutcome::Cancelled => "cancelled",
         TurnOutcome::QuotaExhausted => "quota_exhausted",
         TurnOutcome::Failed { .. } => "failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_agy(enabled: bool) -> Config {
+        let mut cfg = Config::default();
+        for engine in cfg.engines.iter_mut().filter(|e| e.id == EngineId::Agy) {
+            engine.enabled = enabled;
+        }
+        cfg
+    }
+
+    #[test]
+    fn agy_summarizer_is_selected_only_when_agy_is_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(tmp.path().join("ultron"));
+        paths.ensure().unwrap();
+
+        let enabled = select_summarizer(&paths, &config_with_agy(true)).unwrap();
+        assert_eq!(enabled.kind(), "agy");
+        assert!(paths.run.join("summarizer").is_dir());
+
+        let disabled = select_summarizer(&paths, &config_with_agy(false)).unwrap();
+        assert_eq!(disabled.kind(), "null");
     }
 }

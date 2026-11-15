@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::EngineId;
-use crate::db::{Db, StoredEvent};
+use crate::db::{Db, RECENT_EVENTS_WINDOW, StoredEvent};
 use crate::events::EngineEvent;
 use crate::summarizer::{Summarizer, SummaryPatch};
 
@@ -35,6 +35,10 @@ pub struct WorkState {
     pub approvals_pending: Vec<String>,
     /// Son özet yenilemesi başarısız olduysa `true`; özet alanları eski olabilir.
     pub summary_stale: bool,
+    /// Kural alanlarına uygulanan en yüksek olay `seq` değeri. Yenilemede yalnız bundan
+    /// sonraki olaylar işlenir; böylece eski dosya ve karar kayıtları korunur.
+    #[serde(default)]
+    pub rules_seq: i64,
 }
 
 /// Bir karar kaydı. Kaynak olayın kimliği izlenebilirlik için tutulur.
@@ -150,30 +154,11 @@ impl WorkStateService {
         Self { db, summarizer }
     }
 
-    /// Bir tur bittiğinde çağrılır: kuralları olay günlüğünün tamamına uygular, özetleyiciyi
-    /// çalıştırır ve sonucu kaydeder. Özetleyici hatası durumunda kural durumu yine kaydedilir
-    /// ve `summary_stale` doğru olarak işaretlenir; olay yazılmaz.
+    /// Bir tur tamamlandığında çağrılır: kuralları günceller, özetleyiciyi çalıştırır ve sonucu
+    /// kaydeder. Özetleyici hatası durumunda kural durumu yine kaydedilir ve `summary_stale`
+    /// doğru olarak işaretlenir; olay yazılmaz.
     pub async fn on_turn_completed(&self, chat_id: &str) -> Result<WorkState> {
-        let prev: WorkState = match self.db.get_work_state(chat_id)? {
-            Some(value) => serde_json::from_value(value)?,
-            None => WorkState::default(),
-        };
-        let events = self.db.events_for_chat(chat_id, None)?;
-
-        // Özet alanları önceki durumdan taşınır; kural alanları sıfırdan türetilir.
-        let mut state = WorkState {
-            goal: prev.goal,
-            plan: prev.plan,
-            done: prev.done,
-            next_step: prev.next_step,
-            open_questions: prev.open_questions,
-            approvals_pending: prev.approvals_pending,
-            ..WorkState::default()
-        };
-        for ev in &events {
-            state.apply_rules(ev);
-        }
-
+        let (mut state, events) = self.apply_new_rules(chat_id)?;
         match self.summarizer.refresh(&state, &events).await {
             Ok(patch) => {
                 state.apply_summary(patch);
@@ -184,9 +169,49 @@ impl WorkStateService {
                 state.summary_stale = true;
             }
         }
-
         self.db
             .put_work_state(chat_id, &serde_json::to_value(&state)?)?;
         Ok(state)
+    }
+
+    /// Yalnız kural tabanlı yenileme; özetleyici çağrılmaz. Tur tamamlanmadan bittiğinde
+    /// (kota, hata, iptal) kullanılır. Özet alanları eski kabul edilir ve `summary_stale`
+    /// işaretlenir.
+    pub fn refresh_rules(&self, chat_id: &str) -> Result<WorkState> {
+        let (mut state, _events) = self.apply_new_rules(chat_id)?;
+        state.summary_stale = true;
+        self.db
+            .put_work_state(chat_id, &serde_json::to_value(&state)?)?;
+        Ok(state)
+    }
+
+    /// Kayıtlı durumu okur, son [`RECENT_EVENTS_WINDOW`] olaydan `rules_seq`'ten yeni olanları
+    /// kural alanlarına uygular. Döndürülen olaylar özetleyiciye verilir.
+    fn apply_new_rules(&self, chat_id: &str) -> Result<(WorkState, Vec<StoredEvent>)> {
+        let prev: WorkState = match self.db.get_work_state(chat_id)? {
+            Some(value) => serde_json::from_value(value)?,
+            None => WorkState::default(),
+        };
+        let events = self.db.events_tail(chat_id, RECENT_EVENTS_WINDOW)?;
+
+        // Özet alanları ve birikmiş kural kayıtları önceki durumdan taşınır.
+        let mut state = WorkState {
+            goal: prev.goal,
+            plan: prev.plan,
+            decisions: prev.decisions,
+            files_touched: prev.files_touched,
+            done: prev.done,
+            next_step: prev.next_step,
+            open_questions: prev.open_questions,
+            engine_history: prev.engine_history,
+            approvals_pending: prev.approvals_pending,
+            summary_stale: prev.summary_stale,
+            rules_seq: prev.rules_seq,
+        };
+        for ev in events.iter().filter(|ev| ev.seq > prev.rules_seq) {
+            state.apply_rules(ev);
+            state.rules_seq = state.rules_seq.max(ev.seq);
+        }
+        Ok((state, events))
     }
 }

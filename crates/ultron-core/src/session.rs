@@ -13,17 +13,20 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::{Config, EngineId};
-use crate::db::{Db, SessionRow, SessionStatus};
+use crate::db::{Db, RECENT_EVENTS_WINDOW, SessionRow, SessionStatus};
 use crate::engine::{Engine, ToolPolicy, TurnOutcome, TurnRequest, agy, run_turn};
 use crate::eventlog::EventLog;
 use crate::events::{EngineEvent, SwitchReason};
 use crate::external;
-use crate::handoff::build_handoff;
+use crate::handoff::build_handoff_before;
 use crate::summarizer::{NullSummarizer, Summarizer};
 use crate::workstate::WorkStateService;
 
 /// Devir paketinde aynen verilen son mesaj sayısı.
 const HANDOFF_RECENT_MESSAGES: usize = 6;
+
+/// Yerel oturum devam ettirilemediğinde, yeni oturum öncesinde yazılan olay metni.
+const RESUME_FAILED_MESSAGE: &str = "yerel oturum devam ettirilemedi, yeni oturum açıldı";
 
 type ActiveTurns = Arc<Mutex<HashMap<String, CancellationToken>>>;
 
@@ -80,6 +83,8 @@ impl SessionManager {
     /// Bir tur çalıştırır. Aynı motorda açık oturum varsa native resume; yoksa (sohbetin
     /// önceki olayları varsa) devir paketi + mesaj ile yeni oturum başlatır. Sohbetin güncel
     /// motoru `engine`'den farklıysa önce `EngineSwitched` yazılır (sessiz değişim yok).
+    /// Native resume başarısız olursa (`Failed`) oturum kapatılır ve tur bir kez devir
+    /// paketiyle yeni oturumda yeniden denenir.
     pub async fn send(
         &self,
         chat_id: &str,
@@ -98,15 +103,16 @@ impl SessionManager {
         self.db.insert_chat(chat_id, None, "", Utc::now())?;
 
         // Dış değişiklikler, motor değişim olayı yazılmadan önceki son olay zamanına göre bulunur.
-        let prior_events = self.db.events_for_chat(chat_id, None)?;
-        let last_ts = prior_events.last().map(|e| e.ts);
-        let had_events = last_ts.is_some();
-        let external = match last_ts {
-            Some(since) => {
+        let had_events = self.db.has_events(chat_id)?;
+        let external = match self.db.last_event(chat_id)? {
+            Some(last) => {
+                let since = last.ts;
                 let head = self.db.chat_last_head(chat_id)?;
                 // Yalnız `since` anında ya da sonrasında Ultron'un dokunduğu dosyalar dışlanır;
                 // önceki turlarda dokunulan dosyalara sonradan yapılan kullanıcı düzenlemesi raporlanır.
-                let touched: BTreeSet<String> = prior_events
+                let touched: BTreeSet<String> = self
+                    .db
+                    .events_tail(chat_id, RECENT_EVENTS_WINDOW)?
                     .iter()
                     .filter(|e| e.ts >= since && e.kind == "file_changed")
                     .filter_map(|e| e.payload.get("path").and_then(|p| p.as_str()))
@@ -144,28 +150,22 @@ impl SessionManager {
         let resume_native_id = resumable
             .as_ref()
             .and_then(|s| s.native_session_id.clone());
-        let mut session = resumable.unwrap_or_else(|| SessionRow {
-            id: Uuid::new_v4().to_string(),
-            chat_id: chat_id.to_string(),
-            engine,
-            native_session_id: None,
-            status: SessionStatus::Running,
-            started_at: Utc::now(),
-            ended_at: None,
-        });
+        let resumed = resume_native_id.is_some();
+        let mut session = resumable.unwrap_or_else(|| new_session(chat_id, engine));
         session.status = SessionStatus::Running;
         session.ended_at = None;
         self.db.upsert_session(&session)?;
 
-        let prompt = if resume_native_id.is_some() {
+        let prompt = if resumed {
             match &external {
                 Some(ext) => format!("[SON OTURUMDAN BERİ DEĞİŞENLER]\n{ext}\n\n{text}"),
                 None => text.to_string(),
             }
         } else if had_events {
-            let pack = build_handoff(
+            let pack = build_handoff_before(
                 &self.db,
                 chat_id,
+                None,
                 self.cfg.context_budget_chars,
                 HANDOFF_RECENT_MESSAGES,
                 external.as_deref(),
@@ -176,13 +176,16 @@ impl SessionManager {
             text.to_string()
         };
 
-        self.log.append(
-            chat_id,
-            Some(&session.id),
-            EngineEvent::UserText {
-                text: text.to_string(),
-            },
-        )?;
+        let user_seq = self
+            .log
+            .append(
+                chat_id,
+                Some(&session.id),
+                EngineEvent::UserText {
+                    text: text.to_string(),
+                },
+            )?
+            .seq;
 
         let req = TurnRequest {
             chat_id: chat_id.to_string(),
@@ -191,35 +194,45 @@ impl SessionManager {
             resume_native_id,
             tool_policy: policy,
         };
-        let (tx, mut rx) = mpsc::channel::<EngineEvent>(64);
-        let run = run_turn(driver.as_ref(), req, tx, cancel);
-        let consume = async {
-            let mut summary = TurnSummary::default();
-            while let Some(ev) = rx.recv().await {
-                if let EngineEvent::SessionStarted {
-                    native_session_id: Some(id),
-                } = &ev
-                {
-                    session.native_session_id = Some(id.clone());
-                    self.db.upsert_session(&session)?;
-                }
-                summary.observe(&ev);
-                self.log.append(chat_id, Some(&session.id), ev)?;
-            }
-            Ok::<_, anyhow::Error>(summary)
-        };
-        let (outcome, summary) = tokio::join!(run, consume);
+        let (mut outcome, mut summary) = self
+            .run_attempt(chat_id, &mut session, req, driver.clone(), cancel.clone())
+            .await?;
 
-        let (mut outcome, summary) = match (outcome, summary) {
-            (Ok(outcome), Ok(summary)) => (outcome, summary),
-            (outcome, collected) => {
-                let err = outcome.err().or(collected.err());
-                session.status = SessionStatus::Failed;
-                session.ended_at = Some(Utc::now());
-                self.db.upsert_session(&session)?;
-                return Err(err.unwrap_or_else(|| anyhow!("tur beklenmedik şekilde bitti")));
-            }
-        };
+        if resumed && matches!(outcome, TurnOutcome::Failed { .. }) {
+            // Yerel oturum bozuk olabilir: kapat, devir paketiyle yeni oturumda bir kez daha dene.
+            session.status = SessionStatus::Closed;
+            session.ended_at = Some(Utc::now());
+            self.db.upsert_session(&session)?;
+            session = new_session(chat_id, engine);
+            self.db.upsert_session(&session)?;
+            self.log.append(
+                chat_id,
+                Some(&session.id),
+                EngineEvent::Error {
+                    message: RESUME_FAILED_MESSAGE.to_string(),
+                },
+            )?;
+            // Bu turun kullanıcı mesajı zaten günlükte; pakete girmesin diye kendisinden önceki olaylar alınır.
+            let pack = build_handoff_before(
+                &self.db,
+                chat_id,
+                Some(user_seq),
+                self.cfg.context_budget_chars,
+                HANDOFF_RECENT_MESSAGES,
+                external.as_deref(),
+                Some(cwd),
+            )?;
+            let retry = TurnRequest {
+                chat_id: chat_id.to_string(),
+                cwd: cwd.to_path_buf(),
+                prompt: format!("{}\n\n{text}", pack.text),
+                resume_native_id: None,
+                tool_policy: policy,
+            };
+            (outcome, summary) = self
+                .run_attempt(chat_id, &mut session, retry, driver, cancel)
+                .await?;
+        }
 
         let exit_code = match &outcome {
             TurnOutcome::Completed => Some(0),
@@ -285,9 +298,14 @@ impl SessionManager {
         if let Some(head) = blocking(move || external::git_head(&dir)).await? {
             self.db.set_chat_last_head(chat_id, &head)?;
         }
-        if outcome == TurnOutcome::Completed
-            && let Err(err) = self.workstate.on_turn_completed(chat_id).await
-        {
+        // Özetleyici yalnız tamamlanan turda çalışır; diğer sonuçlarda kural tabanlı durum
+        // yine güncellenir ve özet eski işaretlenir.
+        let refreshed = if outcome == TurnOutcome::Completed {
+            self.workstate.on_turn_completed(chat_id).await
+        } else {
+            self.workstate.refresh_rules(chat_id)
+        };
+        if let Err(err) = refreshed {
             tracing::warn!(chat_id, error = %err, "çalışma durumu güncellenemedi");
         }
         Ok(outcome)
@@ -312,6 +330,60 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("sohbette çalışan tur yok"))?;
         token.cancel();
         Ok(())
+    }
+
+    /// Tek bir motor denemesi: olayları günlüğe yazar ve sonucu döndürür. Tur sonunda hata
+    /// görülüp `TurnCompleted` gelmediyse sonuç `Failed` sayılır. Olay toplama veya çalıştırma
+    /// hatasında oturum `Failed` yapılır ve hata döner.
+    async fn run_attempt(
+        &self,
+        chat_id: &str,
+        session: &mut SessionRow,
+        req: TurnRequest,
+        driver: Arc<dyn Engine>,
+        cancel: CancellationToken,
+    ) -> Result<(TurnOutcome, TurnSummary)> {
+        let (tx, mut rx) = mpsc::channel::<EngineEvent>(64);
+        let run = run_turn(driver.as_ref(), req, tx, cancel);
+        let consume = async {
+            let mut summary = TurnSummary::default();
+            while let Some(ev) = rx.recv().await {
+                if let EngineEvent::SessionStarted {
+                    native_session_id: Some(id),
+                } = &ev
+                {
+                    session.native_session_id = Some(id.clone());
+                    self.db.upsert_session(session)?;
+                }
+                summary.observe(&ev);
+                self.log.append(chat_id, Some(&session.id), ev)?;
+            }
+            Ok::<_, anyhow::Error>(summary)
+        };
+        let (outcome, summary) = tokio::join!(run, consume);
+
+        let (outcome, summary) = match (outcome, summary) {
+            (Ok(outcome), Ok(summary)) => (outcome, summary),
+            (outcome, collected) => {
+                let err = outcome.err().or(collected.err());
+                session.status = SessionStatus::Failed;
+                session.ended_at = Some(Utc::now());
+                self.db.upsert_session(session)?;
+                return Err(err.unwrap_or_else(|| anyhow!("tur beklenmedik şekilde bitti")));
+            }
+        };
+        let outcome = if outcome == TurnOutcome::Completed
+            && summary.saw_error
+            && !summary.saw_turn_completed
+        {
+            TurnOutcome::Failed {
+                exit_code: Some(0),
+                stderr_excerpt: "tur tamamlanmadan hata bildirildi".to_string(),
+            }
+        } else {
+            outcome
+        };
+        Ok((outcome, summary))
     }
 
     fn begin_turn(&self, chat_id: &str) -> Result<(TurnGuard, CancellationToken)> {
@@ -362,6 +434,18 @@ impl SessionManager {
     }
 }
 
+fn new_session(chat_id: &str, engine: EngineId) -> SessionRow {
+    SessionRow {
+        id: Uuid::new_v4().to_string(),
+        chat_id: chat_id.to_string(),
+        engine,
+        native_session_id: None,
+        status: SessionStatus::Running,
+        started_at: Utc::now(),
+        ended_at: None,
+    }
+}
+
 /// Tur sırasında gelen olaylardan yalnız sonuç kararında gereken bilgiler; olaylar
 /// bellekte biriktirilmez (uzun turlarda bellek sınırsız büyümesin diye).
 #[derive(Default)]
@@ -369,6 +453,7 @@ struct TurnSummary {
     saw_text: bool,
     saw_error: bool,
     saw_quota: bool,
+    saw_turn_completed: bool,
 }
 
 impl TurnSummary {
@@ -377,6 +462,7 @@ impl TurnSummary {
             EngineEvent::AssistantText { .. } => self.saw_text = true,
             EngineEvent::Error { .. } => self.saw_error = true,
             EngineEvent::QuotaExhausted { .. } => self.saw_quota = true,
+            EngineEvent::TurnCompleted => self.saw_turn_completed = true,
             _ => {}
         }
     }

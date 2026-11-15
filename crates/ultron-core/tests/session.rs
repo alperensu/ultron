@@ -363,3 +363,122 @@ async fn user_edit_to_previously_touched_file_is_reported() {
         .expect("external_changes olayı");
     assert!(ext.payload["summary"].as_str().unwrap().contains("b.txt"));
 }
+
+#[tokio::test]
+async fn quota_turn_still_updates_work_state() {
+    let file = r#"{"type":"file_changed","path":"src/ana.rs","change":"modified"}"#;
+    let quota = r#"{"type":"quota_exhausted","message":"limit doldu","resets_at":null}"#;
+    let env = env_with(&[(EngineId::Claude, vec![STARTED, file, quota])]);
+    let out = env
+        .mgr
+        .send("c1", &env.cwd, EngineId::Claude, "merhaba", ToolPolicy::ReadOnly)
+        .await
+        .unwrap();
+    assert_eq!(out, TurnOutcome::QuotaExhausted);
+    let state = env.db.get_work_state("c1").unwrap().expect("çalışma durumu yazılmalı");
+    assert_eq!(state["summary_stale"].as_bool(), Some(true));
+    assert!(
+        state["files_touched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str() == Some("src/ana.rs")),
+        "{state}"
+    );
+}
+
+#[tokio::test]
+async fn error_without_turn_completed_is_failed() {
+    let err = r#"{"type":"error","message":"model hatası"}"#;
+    let env = env_with(&[(EngineId::Claude, vec![STARTED, err])]);
+    let out = env
+        .mgr
+        .send("c1", &env.cwd, EngineId::Claude, "merhaba", ToolPolicy::ReadOnly)
+        .await
+        .unwrap();
+    assert!(matches!(out, TurnOutcome::Failed { .. }), "{out:?}");
+    assert_eq!(
+        env.db.latest_session("c1").unwrap().unwrap().status,
+        SessionStatus::Failed
+    );
+}
+
+/// Native resume turunu başarısız eden, yeni oturumu ayrı fixture ile çalıştıran motor.
+struct ResumeAwareEngine {
+    fresh: FakeEngine,
+    resumed: FakeEngine,
+    reqs: Reqs,
+}
+
+impl Engine for ResumeAwareEngine {
+    fn id(&self) -> EngineId {
+        EngineId::Claude
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.fresh.capabilities()
+    }
+    fn command(&self, req: &TurnRequest) -> CommandSpec {
+        self.reqs.lock().unwrap().push(req.clone());
+        if req.resume_native_id.is_some() {
+            self.resumed.command(req)
+        } else {
+            self.fresh.command(req)
+        }
+    }
+    fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
+        self.fresh.parse_line(line)
+    }
+}
+
+#[tokio::test]
+async fn broken_native_session_retries_once_in_fresh_session() {
+    // SAFETY: testler bu değişkeni yalnızca aynı değerle yazar.
+    unsafe { std::env::set_var("ULTRON_FAKE_CLI", env!("CARGO_BIN_EXE_ultron-fake-cli")) };
+    let tmp = tempfile::tempdir().unwrap();
+    let fresh_fixture = tmp.path().join("fresh.jsonl");
+    std::fs::write(&fresh_fixture, [STARTED, REPLY, DONE].join("\n") + "\n").unwrap();
+    let resumed_fixture = tmp.path().join("resumed.jsonl");
+    std::fs::write(&resumed_fixture, r#"{"type":"error","message":"oturum bozuk"}"#.to_string() + "\n")
+        .unwrap();
+    let reqs: Reqs = Arc::default();
+    let engine = ResumeAwareEngine {
+        fresh: FakeEngine::from_fixture(&fresh_fixture),
+        resumed: FakeEngine::from_fixture(&resumed_fixture),
+        reqs: reqs.clone(),
+    };
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let db = Arc::new(Db::open(&paths.db).unwrap());
+    let log = Arc::new(EventLog::new(db.clone(), paths));
+    let mut map: HashMap<EngineId, Arc<dyn Engine>> = HashMap::new();
+    map.insert(EngineId::Claude, Arc::new(engine));
+    let mgr = SessionManager::new(db.clone(), log, Config::default(), map);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    mgr.send("c1", &cwd, EngineId::Claude, "ilk", ToolPolicy::ReadOnly)
+        .await
+        .unwrap();
+    let out = mgr
+        .send("c1", &cwd, EngineId::Claude, "ikinci", ToolPolicy::ReadOnly)
+        .await
+        .unwrap();
+    assert_eq!(out, TurnOutcome::Completed);
+
+    let recorded = reqs.lock().unwrap();
+    assert_eq!(recorded.len(), 3, "ilk tur, başarısız resume, yeni oturum");
+    assert_eq!(recorded[1].resume_native_id.as_deref(), Some("nat-1"));
+    assert_eq!(recorded[2].resume_native_id, None);
+    assert!(recorded[2].prompt.starts_with("[ULTRON DEVİR]"));
+    assert!(recorded[2].prompt.ends_with("\n\nikinci"));
+    let notice = db
+        .events_for_chat("c1", None)
+        .unwrap()
+        .into_iter()
+        .any(|e| e.kind == "error" && e.payload["message"] == "yerel oturum devam ettirilemedi, yeni oturum açıldı");
+    assert!(notice, "bilgilendirme olayı yazılmalı");
+    assert_eq!(
+        db.latest_session("c1").unwrap().unwrap().native_session_id.as_deref(),
+        Some("nat-1")
+    );
+}
