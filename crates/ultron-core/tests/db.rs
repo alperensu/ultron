@@ -95,3 +95,51 @@ fn replay_is_paged() {
     }
     assert_eq!(seen, (1..=1200).collect::<Vec<i64>>());
 }
+
+#[test]
+fn last_event_returns_highest_seq() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open_with_chat(tmp.path());
+    assert!(db.last_event("chat-1").unwrap().is_none());
+    assert!(!db.has_events("chat-1").unwrap());
+    for seq in [1, 3, 2] {
+        db.insert_event(&event(
+            &format!("e{seq}"),
+            "chat-1",
+            seq,
+            "user_text",
+            json!({"type": "user_text", "text": format!("m{seq}")}),
+        ))
+        .unwrap();
+    }
+    let last = db.last_event("chat-1").unwrap().unwrap();
+    assert_eq!(last.seq, 3);
+    assert_eq!(last.id, "e3");
+    assert!(db.has_events("chat-1").unwrap());
+}
+
+#[test]
+fn events_tail_returns_last_n_in_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open_with_chat(tmp.path());
+    for seq in 1..=10 {
+        db.insert_event(&event(
+            &format!("e{seq}"),
+            "chat-1",
+            seq,
+            "user_text",
+            json!({"type": "user_text", "text": format!("m{seq}")}),
+        ))
+        .unwrap();
+    }
+    let tail: Vec<i64> = db
+        .events_tail("chat-1", 4)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(tail, vec![7, 8, 9, 10]);
+    let all = db.events_tail("chat-1", 100).unwrap();
+    assert_eq!(all.len(), 10);
+    assert_eq!(all[0].seq, 1);
+}

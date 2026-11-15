@@ -11,6 +11,10 @@ use serde_json::Value;
 
 use crate::config::EngineId;
 
+/// Devir paketi ve çalışma durumu türetimi için bir sohbetten okunan en fazla olay sayısı.
+/// Daha eski geçmiş yalnız tam metin aramasıyla (`ultron history search`) erişilebilir.
+pub const RECENT_EVENTS_WINDOW: usize = 2000;
+
 /// Motor oturumunun durumu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +198,48 @@ impl Db {
         for row in rows {
             out.push(raw_to_event(row?)?);
         }
+        Ok(out)
+    }
+
+    /// Sohbetin en yüksek `seq` değerine sahip olayı (yoksa `None`). Tüm geçmişi okumaz.
+    pub fn last_event(&self, chat_id: &str) -> Result<Option<StoredEvent>> {
+        let conn = self.conn()?;
+        let raw = conn
+            .query_row(
+                "SELECT id, chat_id, session_id, seq, ts, kind, payload_json
+                 FROM events WHERE chat_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![chat_id],
+                raw_event_row,
+            )
+            .optional()?;
+        raw.map(raw_to_event).transpose()
+    }
+
+    /// Sohbetin en az bir olayı var mı?
+    pub fn has_events(&self, chat_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let found: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE chat_id = ?1)",
+            params![chat_id],
+            |r| r.get(0),
+        )?;
+        Ok(found)
+    }
+
+    /// Sohbetin son `limit` olayını `seq` sırasıyla (eskiden yeniye) döner.
+    pub fn events_tail(&self, chat_id: &str, limit: usize) -> Result<Vec<StoredEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, session_id, seq, ts, kind, payload_json
+             FROM events WHERE chat_id = ?1 ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![chat_id, limit], raw_event_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(raw_to_event(row?)?);
+        }
+        out.reverse();
         Ok(out)
     }
 

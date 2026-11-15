@@ -137,3 +137,30 @@ fn pack_names_project_instruction_files() {
     let pack = build_handoff(&db, "chat-1", 100_000, 6, None, Some(&empty)).unwrap();
     assert!(!pack.text.contains("[PROJE TALİMATLARI]"));
 }
+
+#[test]
+fn pack_coalesces_streamed_fragments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&tmp.path().join("ultron.db")).unwrap();
+    db.insert_chat("chat-1", None, "test", Utc::now()).unwrap();
+    let fragments = ["Bir ", "iki ", "üç ", "dört ", "beş"];
+    let mut events: Vec<(&str, &str)> = fragments.iter().map(|f| ("assistant_text", *f)).collect();
+    events.push(("user_text", "son soru"));
+    for (i, (kind, text)) in events.into_iter().enumerate() {
+        db.insert_event(&StoredEvent {
+            id: format!("f{i}"),
+            chat_id: "chat-1".into(),
+            session_id: None,
+            seq: i as i64 + 1,
+            ts: Utc::now(),
+            kind: kind.into(),
+            payload: json!({"type": kind, "text": text}),
+        })
+        .unwrap();
+    }
+    let pack = build_handoff(&db, "chat-1", 100_000, 6, None, None).unwrap();
+    let assistant_lines = pack.text.lines().filter(|l| l.starts_with("asistan: ")).count();
+    assert_eq!(assistant_lines, 1, "{}", pack.text);
+    assert!(pack.text.contains("asistan: Bir iki üç dört beş\n"), "{}", pack.text);
+    assert!(pack.text.contains("kullanıcı: son soru\n"), "{}", pack.text);
+}

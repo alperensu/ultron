@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::EngineId;
-use crate::db::Db;
+use crate::db::{Db, RECENT_EVENTS_WINDOW, StoredEvent};
 use crate::workstate::{WorkState, clip};
 
 /// Son mesajlardan asla kırpılmayan adet.
@@ -37,9 +37,26 @@ pub struct HandoffPack {
 /// hemen ardından `[PROJE TALİMATLARI]` bölümü olarak eklenir. Bütçe aşılırsa eski özet,
 /// ardından kırpılabilir son mesajlar en eskiden başlayarak atılır ve `[KIRPILDI: N karakter]`
 /// eklenir. Çalışma durumu ve son iki mesaj bütçe aşılsa da korunur.
+///
+/// Yalnız sohbetin son [`RECENT_EVENTS_WINDOW`] olayı okunur; daha eski geçmiş pakete girmez
+/// ve `[GEÇMİŞ]` ipucu üzerinden tam metin aramasıyla ulaşılır.
 pub fn build_handoff(
     db: &Db,
     chat_id: &str,
+    budget_chars: usize,
+    recent_verbatim: usize,
+    external: Option<&str>,
+    cwd: Option<&Path>,
+) -> Result<HandoffPack> {
+    build_handoff_before(db, chat_id, None, budget_chars, recent_verbatim, external, cwd)
+}
+
+/// [`build_handoff`] ile aynıdır; `before_seq` verilirse yalnız o sıra numarasından küçük
+/// olaylar mesaj olarak alınır (ör. turun kendi kullanıcı mesajı zaten günlüğe yazıldıysa).
+pub fn build_handoff_before(
+    db: &Db,
+    chat_id: &str,
+    before_seq: Option<i64>,
     budget_chars: usize,
     recent_verbatim: usize,
     external: Option<&str>,
@@ -49,19 +66,12 @@ pub fn build_handoff(
         Some(value) => serde_json::from_value(value)?,
         None => WorkState::default(),
     };
-    let messages: Vec<(&'static str, String)> = db
-        .events_for_chat(chat_id, None)?
+    let tail: Vec<StoredEvent> = db
+        .events_tail(chat_id, RECENT_EVENTS_WINDOW)?
         .into_iter()
-        .filter_map(|ev| {
-            let role = match ev.kind.as_str() {
-                "user_text" => "kullanıcı",
-                "assistant_text" => "asistan",
-                _ => return None,
-            };
-            let text = ev.payload.get("text")?.as_str()?.to_string();
-            Some((role, text))
-        })
+        .filter(|ev| before_seq.is_none_or(|limit| ev.seq < limit))
         .collect();
+    let messages = conversation_messages(&tail);
 
     let window = recent_verbatim.max(PROTECTED_MESSAGES);
     let split = messages.len().saturating_sub(window);
@@ -80,8 +90,10 @@ pub fn build_handoff(
         summary: render_summary(older),
         cuttable: cuttable.iter().map(message_line).collect(),
         protected: protected.iter().map(message_line).collect(),
-        history: "[GEÇMİŞ]\nAyrıntı gerekirse `ultron history search \"<sorgu>\"` çalıştır.\n"
-            .to_string(),
+        history: format!(
+            "[GEÇMİŞ]\nBu paket sohbetin son {RECENT_EVENTS_WINDOW} olayını kapsar; daha eski ayrıntı için \
+             `ultron history search \"<sorgu>\"` çalıştır.\n"
+        ),
     };
 
     let mut cut_summary = false;
@@ -104,6 +116,38 @@ pub fn build_handoff(
         text: assembled.text,
         sections: assembled.sections,
     })
+}
+
+/// Olay dizisinden sohbet mesajlarını çıkarır (`(rol, metin)`, sıra korunur).
+///
+/// Motor akış parçaları (`assistant_text`) her parça için ayrı olay yazar. Aynı oturumdan
+/// ardışık asistan parçaları tek mesajda birleştirilir; araya giren kullanıcı mesajı birleşmeyi
+/// keser. Mesaj olmayan olaylar atlanır. Özet ve devir paketi bu listeyi kullanır.
+pub(crate) fn conversation_messages(events: &[StoredEvent]) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    // Son eklenen mesajın oturumu; yalnız asistan mesajları birleşir.
+    let mut last_session: Option<&Option<String>> = None;
+    for ev in events {
+        let role = match ev.kind.as_str() {
+            "user_text" => "kullanıcı",
+            "assistant_text" => "asistan",
+            _ => continue,
+        };
+        let Some(text) = ev.payload.get("text").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        if role == "asistan"
+            && let Some(prev) = out.last_mut()
+            && prev.0 == "asistan"
+            && last_session == Some(&ev.session_id)
+        {
+            prev.1.push_str(text);
+            continue;
+        }
+        out.push((role, text.to_string()));
+        last_session = Some(&ev.session_id);
+    }
+    out
 }
 
 /// Pakete girecek ham bölümler; kırpma kararları `assemble` içinde verilir.
