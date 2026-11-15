@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "ultron-fake-cli"
+path = "tests/bin/fake_cli.rs"
+test = false
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -12,8 +17,12 @@ rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

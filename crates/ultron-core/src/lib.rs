@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod db;
+pub mod engine;
 pub mod eventlog;
 pub mod events;
 pub mod paths;

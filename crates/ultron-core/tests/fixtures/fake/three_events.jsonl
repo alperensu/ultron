@@ -1,0 +1,4 @@
+{"type":"session_started","native_session_id":"fake-1"}
+{"type":"assistant_text","text":"Merhaba, bu sentetik bir yanıttır."}
+
+{"type":"turn_completed"}

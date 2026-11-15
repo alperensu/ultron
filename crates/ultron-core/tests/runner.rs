@@ -1,0 +1,152 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use ultron_core::EngineEvent;
+use ultron_core::engine::{FakeEngine, ToolPolicy, TurnOutcome, TurnRequest, run_turn};
+
+fn engine(args: &[&str], append_prompt: bool) -> FakeEngine {
+    // Cargo, entegrasyon testi derlenirken ikiliyi de üretir; yolu ortam değişkeniyle verir.
+    // SAFETY: testler yalnızca bu değişkeni aynı değerle yazar.
+    unsafe { std::env::set_var("ULTRON_FAKE_CLI", env!("CARGO_BIN_EXE_ultron-fake-cli")) };
+    FakeEngine::with_mode(args, append_prompt)
+}
+
+fn request(cwd: &Path, prompt: &str) -> TurnRequest {
+    TurnRequest {
+        chat_id: "c1".into(),
+        cwd: cwd.to_path_buf(),
+        prompt: prompt.into(),
+        resume_native_id: None,
+        tool_policy: ToolPolicy::ReadOnly,
+    }
+}
+
+async fn collect(mut rx: mpsc::Receiver<EngineEvent>) -> Vec<EngineEvent> {
+    let mut out = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        out.push(ev);
+    }
+    out
+}
+
+#[tokio::test]
+async fn runner_streams_fixture_events() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake/three_events.jsonl");
+    let eng = {
+        let _ = engine(&["echo"], false);
+        FakeEngine::from_fixture(&fixture)
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let outcome = run_turn(&eng, request(tmp.path(), "x"), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(rx).await;
+    assert_eq!(outcome, TurnOutcome::Completed);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(events[0], EngineEvent::SessionStarted { .. }));
+    assert!(matches!(events[2], EngineEvent::TurnCompleted));
+}
+
+#[tokio::test]
+async fn runner_child_killed_midstream_keeps_events() {
+    let eng = engine(&["partial", "2", "137"], false);
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let outcome = run_turn(&eng, request(tmp.path(), "x"), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(rx).await;
+    assert_eq!(events.len(), 2, "yarım satır atılmalı: {events:?}");
+    assert!(matches!(
+        outcome,
+        TurnOutcome::Failed {
+            exit_code: Some(137),
+            ..
+        }
+    ));
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: tutacak açılır, sorgulanır ve kapatılır.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn runner_cancel_terminates_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pidfile = tmp.path().join("pids.txt");
+    let eng = engine(&["sleep", &pidfile.to_string_lossy()], false);
+    let (tx, rx) = mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let cwd = tmp.path().to_path_buf();
+    let c2 = cancel.clone();
+    let task = tokio::spawn(async move { run_turn(&eng, request(&cwd, "x"), tx, c2).await });
+
+    let started = Instant::now();
+    let pids = loop {
+        if let Ok(text) = std::fs::read_to_string(&pidfile) {
+            let v: Vec<u32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+            if v.len() == 2 {
+                break v;
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "pid dosyası yazılmadı");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(pids.iter().all(|p| pid_alive(*p)));
+
+    cancel.cancel();
+    let outcome = task.await.unwrap().unwrap();
+    assert_eq!(outcome, TurnOutcome::Cancelled);
+    drop(rx);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pids.iter().any(|p| pid_alive(*p)) {
+        assert!(Instant::now() < deadline, "süreç ağacı 2 sn içinde ölmedi");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn runner_passes_unicode_and_spaced_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("roblox 2");
+    std::fs::create_dir(&cwd).unwrap();
+    let prompt = "Ödeme ekranı çalışsın mı?";
+    let eng = engine(&["echo"], true);
+    let (tx, rx) = mpsc::channel(16);
+    let outcome = run_turn(&eng, request(&cwd, prompt), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    let events = collect(rx).await;
+    let EngineEvent::AssistantText { text } = &events[0] else {
+        panic!("beklenmeyen olay: {events:?}");
+    };
+    let echoed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(echoed["args"], serde_json::json!([prompt]));
+    let echoed_cwd = PathBuf::from(echoed["cwd"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(echoed_cwd).unwrap(),
+        std::fs::canonicalize(&cwd).unwrap()
+    );
+}
