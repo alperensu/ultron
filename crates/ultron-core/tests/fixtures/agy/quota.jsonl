@@ -1,0 +1,2 @@
+{"event":"init","conversation_id":"conv-0002","init":{"model":"model-0001","cwd":"C:/proj","permission_mode":"plan","tools":[]}}
+{"event":"result","result":{"conversation_id":"conv-0002","status":"FAILED","response":"429 RESOURCE_EXHAUSTED: quota exceeded for this model","duration_seconds":0.4,"num_turns":0}}

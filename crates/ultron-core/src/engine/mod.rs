@@ -1,5 +1,6 @@
 //! Motor arayüzü: CLI motorlarının ortak sözleşmesi.
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod fake;
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 use crate::config::EngineId;
 use crate::events::EngineEvent;
 
+pub use agy::AgyEngine;
 pub use claude::ClaudeEngine;
 pub use codex::CodexEngine;
 pub use fake::FakeEngine;
