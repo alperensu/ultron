@@ -303,7 +303,15 @@ Dört katman [K]:
 
 ### 6.9 Kapılar
 
-**Masaüstü uygulaması (ana arayüz)** [K] — Tauri 2 + React + TypeScript. Ekranlar:
+**Masaüstü uygulaması (ana arayüz)** [K] — Tauri 2 + React + TypeScript.
+
+**His ve görünüm** [K] (2026-11-15): Uygulama yağ gibi akıcı animasyonlarla iyi hissettirmeli ve **koyu tema zorunlu**.
+- Koyu tema varsayılan ve birincil tasarım hedefi. Açık tema yapılmaz ya da en fazla sonradan eklenen bir seçenek olur. Renkler tasarım token'larında tanımlanır, metin kontrastı WCAG AA'yı geçer.
+- Animasyon ilkeleri [Ö]: yalnızca `transform` ve `opacity` animasyonu (GPU'da çalışır, yerleşimi bozmaz). Yay (spring) tabanlı geçişler: sohbet akışı, panel açılıp kapanması, ajan kartlarının belirmesi, model devri. Akan metin tek tek karakterlerle değil, kare başına toplu olarak işlenir. Uzun listeler sanallaştırılır. Hedef WebView2'de 60 FPS+ ve kare düşmesi olmaması. Windows'un "animasyonları azalt" ayarına uyulur.
+- Kütüphane tercihi builder'a: Motion (Framer Motion) ya da eşdeğeri. Aşama 2 kabulüne, animasyonlu bir ekran kaydıyla performans profili (kare süresi) eklenir.
+- Görsel yön Aşama 2 başında `frontend-design` ilkeleriyle maketlerle belirlenir; ChatGPT düzeni referans, görünüm özgün.
+
+Ekranlar:
 - **Ana ekran:** İkinci beyin o anki ihtiyaca göre içeriği seçer (gece olanlar, bekleyen onaylar, öneriler, kota özeti). Yazı kutusu ve bekleyen onaylar hep aynı yerde. [K + Ö]
 - **Sohbet:** Mesajlar, katlanır "X dk boyunca çalıştı" özetleri, model/mod seçici, devir düğmesi, erişim modu çipi, sağ panel (ajanlar, değişiklikler, çıktılar, kaynaklar).
 - **Ajan penceresi:** §6.6.
