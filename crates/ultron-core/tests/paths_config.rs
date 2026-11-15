@@ -1,0 +1,74 @@
+use std::sync::Mutex;
+
+use ultron_core::{Config, EngineConfig, EngineId, Paths};
+
+/// Ortam değişkeni (ULTRON_HOME) kullanan testleri sıraya koyar.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn paths_respect_ultron_home() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    // SAFETY: ENV_LOCK ile bu test dışında ortam değişkeni okunmaz/yazılmaz.
+    unsafe { std::env::set_var("ULTRON_HOME", tmp.path()) };
+    let paths = Paths::resolve().unwrap();
+    unsafe { std::env::remove_var("ULTRON_HOME") };
+
+    assert_eq!(paths.root, tmp.path());
+    assert_eq!(paths.db, tmp.path().join("state").join("ultron.db"));
+    paths.ensure().unwrap();
+    assert!(paths.transcripts.is_dir());
+    assert!(paths.run.is_dir());
+}
+
+#[test]
+fn config_defaults_when_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().to_path_buf());
+    let cfg = Config::load(&paths).unwrap();
+
+    let codex = cfg.engines.iter().find(|e| e.id == EngineId::Codex).unwrap();
+    assert_eq!(codex.model.as_deref(), Some("gpt-6.1-sol"));
+    let agy = cfg.engines.iter().find(|e| e.id == EngineId::Agy).unwrap();
+    assert_eq!(agy.model.as_deref(), Some("gemini-3.8-flash-low"));
+    assert_eq!(cfg.context_budget_chars, 24000);
+}
+
+#[test]
+fn validate_rejects_astra() {
+    let cfg = engine(EngineId::Codex, Some("gpt-6.1-astra"), Some("medium"));
+    assert!(cfg.validate().is_err());
+    let cfg = engine(EngineId::Codex, Some("GPT-6.1-ASTRA"), Some("medium"));
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn validate_rejects_effort_above_high_for_sol() {
+    let cfg = engine(EngineId::Codex, Some("gpt-6.1-sol"), Some("max"));
+    assert!(cfg.validate().is_err());
+    let cfg = engine(EngineId::Codex, Some("gpt-6.1-sol"), Some("high"));
+    assert!(cfg.validate().is_ok());
+    let cfg = engine(EngineId::Codex, Some("gpt-6-luna"), Some("medium"));
+    assert!(cfg.validate().is_err());
+    let cfg = engine(EngineId::Codex, Some("gpt-6-luna"), Some("max"));
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_non_gemini_agy() {
+    let cfg = engine(EngineId::Agy, Some("claude-sonnet"), None);
+    assert!(cfg.validate().is_err());
+    let cfg = engine(EngineId::Agy, Some("gemini-3.8-flash-low"), None);
+    assert!(cfg.validate().is_ok());
+}
+
+fn engine(id: EngineId, model: Option<&str>, effort: Option<&str>) -> EngineConfig {
+    EngineConfig {
+        id,
+        enabled: true,
+        binary: "fake".to_string(),
+        model: model.map(str::to_string),
+        effort: effort.map(str::to_string),
+        extra_args: Vec::new(),
+    }
+}
