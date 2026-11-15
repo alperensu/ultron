@@ -1,0 +1,12 @@
+[package]
+name = "ultrond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ultron-core = { path = "../ultron-core" }
+
+[lints]
+workspace = true
