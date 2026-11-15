@@ -5,6 +5,7 @@ pub mod db;
 pub mod engine;
 pub mod eventlog;
 pub mod events;
+pub mod handoff;
 pub mod paths;
 pub mod summarizer;
 pub mod workstate;
