@@ -127,6 +127,25 @@ async fn runner_cancel_terminates_tree() {
 }
 
 #[tokio::test]
+async fn runner_child_exit_with_lingering_grandchild_returns() {
+    let eng = engine(&["linger"], false);
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_turn(&eng, request(tmp.path(), "x"), tx, CancellationToken::new()),
+    )
+    .await
+    .expect("torun boru yüzünden 5 sn'den uzun bekledi")
+    .unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let events = collect(rx).await;
+    assert_eq!(events.len(), 1, "olaylar: {events:?}");
+}
+
+#[tokio::test]
 async fn runner_passes_unicode_and_spaced_cwd() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("roblox 2");

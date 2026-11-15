@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::{Engine, TurnRequest};
@@ -15,6 +16,10 @@ use crate::events::EngineEvent;
 
 /// stderr için tutulan en fazla bayt.
 const STDERR_CAP: usize = 64 * 1024;
+
+/// Çocuk çıktıktan sonra stdout'un EOF'a ulaşması için tanınan süre.
+/// Aşılırsa boruyu tutan torunlar sonlandırılır.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// Bir turun sonucu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,10 +96,23 @@ pub async fn run_turn(
     let mut buf = [0u8; 8192];
     let mut quota = false;
     let mut cancelled = false;
+    let mut status: Option<std::process::ExitStatus> = None;
+    let mut grace_deadline: Option<Instant> = None;
 
     loop {
         tokio::select! {
             () = cancel.cancelled() => { cancelled = true; break; }
+            s = child.wait(), if status.is_none() => {
+                status = Some(s.context("süreç beklenemedi")?);
+                grace_deadline = Some(Instant::now() + EXIT_GRACE);
+            }
+            () = tokio::time::sleep_until(grace_deadline.unwrap_or_else(Instant::now)),
+                if grace_deadline.is_some() =>
+            {
+                // Çocuk bitti ama boruyu tutan bir torun var: ağacı sonlandır.
+                job.terminate();
+                break;
+            }
             read = stdout.read(&mut buf) => {
                 let n = match read { Ok(0) | Err(_) => break, Ok(n) => n };
                 pending.extend_from_slice(&buf[..n]);
@@ -123,11 +141,14 @@ pub async fn run_turn(
         return Ok(cancel_turn(&job, &mut child, stderr_task).await);
     }
 
-    let status = tokio::select! {
-        () = cancel.cancelled() => {
-            return Ok(cancel_turn(&job, &mut child, stderr_task).await);
-        }
-        s = child.wait() => s.context("süreç beklenemedi")?,
+    let status = match status {
+        Some(s) => s,
+        None => tokio::select! {
+            () = cancel.cancelled() => {
+                return Ok(cancel_turn(&job, &mut child, stderr_task).await);
+            }
+            s = child.wait() => s.context("süreç beklenemedi")?,
+        },
     };
     // Torunlar borunun ucunu tutuyorsa sonsuza dek beklememek için sınır.
     let stderr_bytes = match tokio::time::timeout(Duration::from_secs(1), stderr_task).await {

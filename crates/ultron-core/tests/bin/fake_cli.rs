@@ -1,5 +1,5 @@
 //! Testler için sahte motor CLI'ı. Davranış ilk argümanla seçilir:
-//! `replay <fixture>`, `echo <args...>`, `partial <n> <exit>`, `sleep <pidfile>`, `hold`.
+//! `replay <fixture>`, `echo <args...>`, `partial <n> <exit>`, `sleep <pidfile>`, `linger`, `hold`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -48,6 +48,19 @@ fn main() {
             out.flush().unwrap();
             std::thread::sleep(Duration::from_secs(120));
             let _ = grandchild.wait();
+        }
+        "linger" => {
+            // Stdout'u miras alan uzun ömürlü bir torun: çocuk çıkar, boru açık kalır.
+            let exe = std::env::current_exe().unwrap();
+            let _grandchild = Command::new(exe)
+                .arg("hold")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("alt süreç başlatılamadı");
+            writeln!(out, "{{\"type\":\"assistant_text\",\"text\":\"bitti\"}}").unwrap();
+            out.flush().unwrap();
+            std::process::exit(0);
         }
         "hold" => std::thread::sleep(Duration::from_secs(120)),
         other => {
