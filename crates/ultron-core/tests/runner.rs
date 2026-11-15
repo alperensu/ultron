@@ -127,6 +127,42 @@ async fn runner_cancel_terminates_tree() {
 }
 
 #[tokio::test]
+async fn runner_clean_exit_processes_unterminated_final_json() {
+    let eng = engine(&["tailjson", "0"], false);
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let outcome = run_turn(&eng, request(tmp.path(), "x"), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    let events = collect(rx).await;
+    assert_eq!(
+        events,
+        vec![
+            EngineEvent::AssistantText { text: "satır 0".into() },
+            EngineEvent::AssistantText { text: "son".into() },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn runner_crash_discards_unterminated_final_json() {
+    let eng = engine(&["tailjson", "1"], false);
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let outcome = run_turn(&eng, request(tmp.path(), "x"), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(matches!(outcome, TurnOutcome::Failed { exit_code: Some(1), .. }));
+    let events = collect(rx).await;
+    assert_eq!(
+        events,
+        vec![EngineEvent::AssistantText { text: "satır 0".into() }],
+        "çökmede son satır atılmalı"
+    );
+}
+
+#[tokio::test]
 async fn runner_child_exit_with_lingering_grandchild_returns() {
     let eng = engine(&["linger"], false);
     let tmp = tempfile::tempdir().unwrap();

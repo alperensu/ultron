@@ -122,6 +122,8 @@ pub async fn run_turn(
     let mut skipping = false;
     let mut total_out: u64 = 0;
     let mut over_budget = false;
+    // Torun borusu açık kalıp sonlandırıldıysa (çocuk zaten çıkmıştır).
+    let mut linger_killed = false;
 
     loop {
         tokio::select! {
@@ -134,6 +136,7 @@ pub async fn run_turn(
                 if grace_deadline.is_some() =>
             {
                 // Çocuk bitti ama boruyu tutan bir torun var: ağacı sonlandır.
+                linger_killed = true;
                 job.terminate();
                 break;
             }
@@ -187,9 +190,6 @@ pub async fn run_turn(
             }
         }
     }
-    // Kalan `pending` yarım satırdır; bilerek atılır.
-    drop(pending);
-
     if over_budget {
         job.terminate();
         let _ = child.kill().await;
@@ -214,6 +214,22 @@ pub async fn run_turn(
             s = child.wait() => s.context("süreç beklenemedi")?,
         },
     };
+    // Kalan `pending` sonlandırıcısız son satırdır. Temiz çıkışta ve geçerli JSON ise işlenir;
+    // çökme, iptal ve sonlandırmada yarım satır atılır.
+    if !linger_killed && status.success() && !pending.is_empty() {
+        let text = String::from_utf8_lossy(&pending).into_owned();
+        let line = text.trim_end_matches('\r');
+        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+            for ev in engine.parse_line(line) {
+                if matches!(ev, EngineEvent::QuotaExhausted { .. }) {
+                    quota = true;
+                }
+                let _ = sink.send(ev).await;
+            }
+        }
+    }
+    drop(pending);
+
     // Torunlar borunun ucunu tutuyorsa sonsuza dek beklememek için sınır.
     let stderr_bytes = match tokio::time::timeout(Duration::from_secs(1), stderr_task).await {
         Ok(Ok(bytes)) => bytes,

@@ -80,6 +80,14 @@ fn main() {
             }
             let _ = out.flush();
         }
+        "tailjson" => {
+            // Bir tam satır, ardından sonlandırıcısız geçerli bir JSON; çıkış kodu argümandan.
+            let code: i32 = args[1].parse().unwrap();
+            writeln!(out, "{{\"type\":\"assistant_text\",\"text\":\"satır 0\"}}").unwrap();
+            write!(out, "{{\"type\":\"assistant_text\",\"text\":\"son\"}}").unwrap();
+            out.flush().unwrap();
+            std::process::exit(code);
+        }
         "hold" => std::thread::sleep(Duration::from_secs(120)),
         other => {
             eprintln!("bilinmeyen kip: {other}");
