@@ -2,10 +2,14 @@
 
 pub mod config;
 pub mod db;
+pub mod eventlog;
+pub mod events;
 pub mod paths;
 
 pub use config::{Config, EngineConfig, EngineId};
 pub use db::{Db, SearchHit, SessionRow, SessionStatus, StoredEvent};
+pub use eventlog::EventLog;
+pub use events::{EngineEvent, SwitchReason};
 pub use paths::Paths;
 
 /// Uygulama adı; tek kaynak.
