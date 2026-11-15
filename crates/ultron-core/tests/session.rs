@@ -255,7 +255,8 @@ async fn external_changes_detects_user_edit() {
     assert!(summary.contains("a.txt"), "{summary}");
     assert!(!summary.contains("b.txt"), "{summary}");
 
-    // Yönetici üzerinden: ilk tur b.txt'yi dokunulmuş işaretler, sonra kullanıcı iki dosyayı da değiştirir.
+    // Yönetici üzerinden: önceki turda dokunulan dosyaya kullanıcı düzenlemesi de raporlanır
+    // (ayrıntı: `user_edit_to_previously_touched_file_is_reported`).
     env.mgr
         .send("c1", &env.cwd, EngineId::Claude, "başla", ToolPolicy::Workspace)
         .await
@@ -275,7 +276,7 @@ async fn external_changes_detects_user_edit() {
         .find(|e| e.kind == "external_changes")
         .expect("external_changes olayı");
     let text = ext.payload["summary"].as_str().unwrap();
-    assert!(text.contains("a.txt") && !text.contains("b.txt"), "{text}");
+    assert!(text.contains("a.txt"), "{text}");
     // Resume turunda özet kullanıcı metninin önüne eklenir.
     let reqs = env.reqs[&EngineId::Claude].lock().unwrap();
     assert!(reqs[1].prompt.contains("a.txt") && reqs[1].prompt.ends_with("devam"));
@@ -332,4 +333,33 @@ async fn second_send_while_running_is_rejected() {
     );
     // Kilit serbest kaldı.
     assert!(env.mgr.cancel("c1").await.is_err());
+}
+
+#[tokio::test]
+async fn user_edit_to_previously_touched_file_is_reported() {
+    let touched = r#"{"type":"file_changed","path":"b.txt","change":"modified"}"#;
+    let env = env_with(&[(EngineId::Claude, vec![STARTED, touched, REPLY, DONE])]);
+    git(&env.cwd, &["init"]);
+    std::fs::write(env.cwd.join("b.txt"), "bir").unwrap();
+    git(&env.cwd, &["add", "."]);
+    git(&env.cwd, &["commit", "-m", "ilk"]);
+    env.mgr
+        .send("c1", &env.cwd, EngineId::Claude, "başla", ToolPolicy::Workspace)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // b.txt önceki turda Ultron tarafından değiştirilmişti; şimdi kullanıcı yeniden düzenliyor.
+    std::fs::write(env.cwd.join("b.txt"), "kullanıcı düzenledi").unwrap();
+    env.mgr
+        .send("c1", &env.cwd, EngineId::Claude, "devam", ToolPolicy::Workspace)
+        .await
+        .unwrap();
+    let ext = env
+        .db
+        .events_for_chat("c1", None)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "external_changes")
+        .expect("external_changes olayı");
+    assert!(ext.payload["summary"].as_str().unwrap().contains("b.txt"));
 }

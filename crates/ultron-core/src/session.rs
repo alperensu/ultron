@@ -20,7 +20,7 @@ use crate::events::{EngineEvent, SwitchReason};
 use crate::external;
 use crate::handoff::build_handoff;
 use crate::summarizer::{NullSummarizer, Summarizer};
-use crate::workstate::{WorkState, WorkStateService};
+use crate::workstate::WorkStateService;
 
 /// Devir paketinde aynen verilen son mesaj sayısı.
 const HANDOFF_RECENT_MESSAGES: usize = 6;
@@ -98,16 +98,20 @@ impl SessionManager {
         self.db.insert_chat(chat_id, None, "", Utc::now())?;
 
         // Dış değişiklikler, motor değişim olayı yazılmadan önceki son olay zamanına göre bulunur.
-        let last_ts = self
-            .db
-            .events_for_chat(chat_id, None)?
-            .last()
-            .map(|e| e.ts);
+        let prior_events = self.db.events_for_chat(chat_id, None)?;
+        let last_ts = prior_events.last().map(|e| e.ts);
         let had_events = last_ts.is_some();
         let external = match last_ts {
             Some(since) => {
                 let head = self.db.chat_last_head(chat_id)?;
-                let touched = self.files_touched(chat_id)?;
+                // Yalnız `since` anında ya da sonrasında Ultron'un dokunduğu dosyalar dışlanır;
+                // önceki turlarda dokunulan dosyalara sonradan yapılan kullanıcı düzenlemesi raporlanır.
+                let touched: BTreeSet<String> = prior_events
+                    .iter()
+                    .filter(|e| e.ts >= since && e.kind == "file_changed")
+                    .filter_map(|e| e.payload.get("path").and_then(|p| p.as_str()))
+                    .map(str::to_string)
+                    .collect();
                 let dir = cwd.to_path_buf();
                 blocking(move || external::changes_since(&dir, since, head.as_deref(), &touched))
                     .await??
@@ -359,13 +363,6 @@ impl SessionManager {
         }
         self.db.set_chat_engine(chat_id, to)?;
         Ok(())
-    }
-
-    fn files_touched(&self, chat_id: &str) -> Result<BTreeSet<String>> {
-        Ok(match self.db.get_work_state(chat_id)? {
-            Some(value) => serde_json::from_value::<WorkState>(value)?.files_touched,
-            None => BTreeSet::new(),
-        })
     }
 }
 
