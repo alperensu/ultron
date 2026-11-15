@@ -164,6 +164,28 @@ fn codex_model_not_found_is_error_not_quota() {
     assert!(!events.iter().any(|e| matches!(e, EngineEvent::TurnCompleted)));
 }
 
+#[test]
+fn codex_item_error_is_not_quota() {
+    // Öğe düzeyindeki hata tur sonu değildir; kota mesajı bile olsa Error olmalı.
+    let eng = CodexEngine::new(cfg());
+    let line = r#"{"type":"item.completed","item":{"id":"item-9","type":"error","message":"You have reached your usage limit"}}"#;
+    assert_eq!(
+        eng.parse_line(line),
+        vec![EngineEvent::Error {
+            message: "You have reached your usage limit".into(),
+        }]
+    );
+}
+
+#[test]
+fn assistant_text_with_quota_word_is_not_quota() {
+    let eng = CodexEngine::new(cfg());
+    let line = r#"{"type":"item.completed","item":{"id":"item-3","type":"agent_message","text":"usage limit ve quota exceeded kodunu inceledim, 429 yok"}}"#;
+    let events = eng.parse_line(line);
+    assert!(!events.iter().any(|e| matches!(e, EngineEvent::QuotaExhausted { .. })), "{events:?}");
+    assert!(matches!(events.as_slice(), [EngineEvent::AssistantText { .. }]));
+}
+
 #[tokio::test]
 #[ignore = "canlı CLI; kota harcar. Yalnız onaylı ve kota <%90 iken: cargo test -- --ignored live_"]
 async fn live_codex_roundtrip() {

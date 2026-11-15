@@ -18,19 +18,31 @@ pub use fake::FakeEngine;
 pub use runner::{TurnOutcome, run_turn};
 
 /// Hata metninin kota/kullanım sınırı olup olmadığına bakar (büyük/küçük harf duyarsız).
-/// Yalnız hata ve sonuç olaylarında çağrılır.
+/// Yalnız hata ve sonuç olaylarında çağrılır. Metin kelimelere ayrılır; `429` yalnız tam
+/// kelime olarak eşleşir (`14290` ve `req_ab429cd` eşleşmez).
 pub(crate) fn is_quota_message(text: &str) -> bool {
-    const INDICATORS: [&str; 7] = [
-        "usage limit",
-        "rate limit",
-        "rate_limit",
-        "quota",
-        "resource_exhausted",
-        "too many requests",
-        "429",
-    ];
     let lower = text.to_lowercase();
-    INDICATORS.iter().any(|needle| lower.contains(needle))
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let pair = |a: &str, b: &str| words.windows(2).any(|w| w[0] == a && w[1] == b);
+    if pair("usage", "limit") || pair("rate", "limit") || pair("resource", "exhausted") {
+        return true;
+    }
+    if words.windows(3).any(|w| w == ["too", "many", "requests"]) {
+        return true;
+    }
+    if words.contains(&"429") {
+        return true;
+    }
+    // "quota" yalnız limit/exceed/exhaust kelimeleriyle yan yana geçtiğinde kota hatasıdır.
+    words.iter().enumerate().any(|(i, w)| {
+        *w == "quota"
+            && words[i.saturating_sub(2)..(i + 3).min(words.len())]
+                .iter()
+                .any(|n| n.starts_with("exceed") || n.starts_with("limit") || n.starts_with("exhaust"))
+    })
 }
 
 /// Motorun araç/izin kısıtı düzeyi.
@@ -83,4 +95,35 @@ pub trait Engine: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     fn command(&self, req: &TurnRequest) -> CommandSpec;
     fn parse_line(&self, line: &str) -> Vec<EngineEvent>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_quota_message;
+
+    #[test]
+    fn quota_detection_ignores_numbers_containing_429() {
+        assert!(!is_quota_message("tokens 14290"));
+        assert!(!is_quota_message("req_ab429cd"));
+        assert!(!is_quota_message("id 4290 / 1429"));
+    }
+
+    #[test]
+    fn quota_detection_matches_http_429() {
+        assert!(is_quota_message("HTTP 429 Too Many Requests"));
+        assert!(is_quota_message("status=429"));
+        assert!(is_quota_message("You have reached your usage limit."));
+        assert!(is_quota_message("rate_limit_error"));
+        assert!(is_quota_message("RESOURCE_EXHAUSTED"));
+        assert!(is_quota_message("quota exceeded for this project"));
+        assert!(is_quota_message("daily quota exhausted"));
+    }
+
+    #[test]
+    fn quota_word_alone_is_not_quota() {
+        assert!(!is_quota_message("quota"));
+        assert!(!is_quota_message("the quota helper module failed to compile"));
+        assert!(!is_quota_message("rate limiting was added to the parser"));
+        assert!(!is_quota_message("accurate limit values"));
+    }
 }

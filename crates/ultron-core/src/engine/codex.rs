@@ -165,7 +165,11 @@ fn item_events(raw: &Value, item: &Value) -> Vec<EngineEvent> {
             ),
             input: item.get("arguments").cloned().unwrap_or(Value::Null),
         }],
-        "error" => failure(str_or_empty(item, "message")),
+        // Öğe düzeyindeki hata tur sonunu belirlemez (ör. yeniden deneme); kota yalnız
+        // turn.failed / üst düzey error olayında değerlendirilir.
+        "error" => vec![EngineEvent::Error {
+            message: str_or_empty(item, "message"),
+        }],
         // Akıl yürütme özeti gürültüdür; diğer tipler ham olarak korunur.
         "reasoning" => Vec::new(),
         _ => unknown(raw),

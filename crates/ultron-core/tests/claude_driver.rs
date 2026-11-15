@@ -154,6 +154,15 @@ fn claude_edit_tool_emits_file_changed() {
 }
 
 #[test]
+fn assistant_text_with_quota_word_is_not_quota() {
+    let eng = ClaudeEngine::new(cfg());
+    let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"usage limit ve quota exceeded kodunu inceledim, 429 yok"}]}}"#;
+    let events = eng.parse_line(line);
+    assert!(!events.iter().any(|e| matches!(e, EngineEvent::QuotaExhausted { .. })), "{events:?}");
+    assert!(matches!(events.as_slice(), [EngineEvent::AssistantText { .. }]));
+}
+
+#[test]
 fn claude_unknown_event_type_is_preserved() {
     let eng = ClaudeEngine::new(cfg());
     let line = r#"{"type":"brand_new","detail":{"x":1}}"#;

@@ -183,6 +183,19 @@ fn agy_success_without_output_is_error() {
 }
 
 #[test]
+fn assistant_text_with_quota_word_is_not_quota() {
+    let eng = AgyEngine::new(cfg());
+    let line = json!({
+        "event": "step_update",
+        "step_update": { "step_type": "agent_response", "text_delta": "usage limit ve quota exceeded kodunu inceledim, 429 yok" }
+    })
+    .to_string();
+    let events = eng.parse_line(&line);
+    assert!(!events.iter().any(|e| matches!(e, EngineEvent::QuotaExhausted { .. })), "{events:?}");
+    assert!(matches!(events.as_slice(), [EngineEvent::AssistantText { .. }]));
+}
+
+#[test]
 fn agy_whitespace_delta_is_kept_but_empty_is_dropped() {
     let eng = AgyEngine::new(cfg());
     let line = |delta: &str| {
