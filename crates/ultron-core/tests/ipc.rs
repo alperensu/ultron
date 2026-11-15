@@ -17,7 +17,7 @@ async fn read_frame_enforces_limit_and_splits_lines() {
     assert_eq!(read_frame(&mut r, 16).await.unwrap().as_deref(), Some("iki"));
     assert!(read_frame(&mut r, 16).await.unwrap().is_none());
 
-    let long = vec![b'x'; 100];
+    let long = [b'x'; 100];
     let mut r = BufReader::with_capacity(8, &long[..]);
     assert!(matches!(
         read_frame(&mut r, 32).await,
