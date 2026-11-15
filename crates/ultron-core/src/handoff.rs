@@ -6,6 +6,7 @@
 //! durumu ve son iki mesaj hiçbir zaman kırpılmaz.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -31,7 +32,9 @@ pub struct HandoffPack {
 /// Bir sohbetin devir paketini üretir.
 ///
 /// `recent_verbatim` son mesajları aynen koyar (en az 2). `external` verilirse
-/// `[SON OTURUMDAN BERİ DEĞİŞENLER]` bölümü olarak eklenir. Bütçe aşılırsa eski özet,
+/// `[SON OTURUMDAN BERİ DEĞİŞENLER]` bölümü olarak eklenir. `cwd` verilirse içindeki
+/// `AGENTS.md` / `CLAUDE.md` / `agents.md` dosyalarının yolları (içerikleri değil) başlığın
+/// hemen ardından `[PROJE TALİMATLARI]` bölümü olarak eklenir. Bütçe aşılırsa eski özet,
 /// ardından kırpılabilir son mesajlar en eskiden başlayarak atılır ve `[KIRPILDI: N karakter]`
 /// eklenir. Çalışma durumu ve son iki mesaj bütçe aşılsa da korunur.
 pub fn build_handoff(
@@ -40,6 +43,7 @@ pub fn build_handoff(
     budget_chars: usize,
     recent_verbatim: usize,
     external: Option<&str>,
+    cwd: Option<&Path>,
 ) -> Result<HandoffPack> {
     let state: WorkState = match db.get_work_state(chat_id)? {
         Some(value) => serde_json::from_value(value)?,
@@ -67,6 +71,7 @@ pub fn build_handoff(
 
     let parts = Parts {
         header: "[ULTRON DEVİR]\nBu sohbet bir motordan diğerine devredildi; aşağıdaki çalışma durumu ve mesajlar bağlamdır.\n\n".to_string(),
+        instructions: cwd.and_then(render_instructions),
         state: render_state(&state),
         external: external
             .map(str::trim)
@@ -104,6 +109,7 @@ pub fn build_handoff(
 /// Pakete girecek ham bölümler; kırpma kararları `assemble` içinde verilir.
 struct Parts {
     header: String,
+    instructions: Option<String>,
     state: String,
     external: Option<String>,
     summary: String,
@@ -133,8 +139,11 @@ fn assemble(parts: &Parts, cut_summary: bool, cut_messages: usize) -> Assembled 
 
     let mut blocks: Vec<(&'static str, String)> = vec![
         ("header", parts.header.clone()),
-        ("work_state", parts.state.clone()),
     ];
+    if let Some(instructions) = &parts.instructions {
+        blocks.push(("project_instructions", instructions.clone()));
+    }
+    blocks.push(("work_state", parts.state.clone()));
     if let Some(external) = &parts.external {
         blocks.push(("external_changes", external.clone()));
     }
@@ -160,6 +169,34 @@ fn assemble(parts: &Parts, cut_summary: bool, cut_messages: usize) -> Assembled 
         text.push_str(&block);
     }
     Assembled { text, sections }
+}
+
+/// Proje talimat dosyalarının yollarını listeler; içerik pakete girmez.
+fn render_instructions(cwd: &Path) -> Option<String> {
+    let names: Vec<String> = std::fs::read_dir(cwd)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.file_type().ok()?.is_file().then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    let mut found = Vec::new();
+    for wanted in ["AGENTS.md", "CLAUDE.md"] {
+        if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(wanted)) {
+            found.push(cwd.join(name));
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "[PROJE TALİMATLARI]\nBu projede talimat dosyaları var; işe başlamadan önce oku:\n",
+    );
+    for path in found {
+        let _ = writeln!(out, "- {}", path.display());
+    }
+    out.push('\n');
+    Some(out)
 }
 
 fn render_state(state: &WorkState) -> String {

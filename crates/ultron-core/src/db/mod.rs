@@ -241,6 +241,88 @@ impl Db {
         Ok(out)
     }
 
+    /// Sohbetin en son başlayan oturumu (durumdan bağımsız).
+    pub fn latest_session(&self, chat_id: &str) -> Result<Option<SessionRow>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, chat_id, engine, native_session_id, status, started_at, ended_at
+                 FROM engine_sessions WHERE chat_id = ?1
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                params![chat_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(id, chat_id, engine, native, status, started, ended)| {
+            Ok(SessionRow {
+                id,
+                chat_id,
+                engine: engine_parse(&engine)?,
+                native_session_id: native,
+                status: SessionStatus::parse(&status)?,
+                started_at: parse_ts(&started)?,
+                ended_at: ended.as_deref().map(parse_ts).transpose()?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Sohbetin güncel motoru (henüz hiç tur yoksa `None`).
+    pub fn chat_engine(&self, chat_id: &str) -> Result<Option<EngineId>> {
+        let conn = self.conn()?;
+        let text: Option<Option<String>> = conn
+            .query_row(
+                "SELECT current_engine FROM chats WHERE id = ?1",
+                params![chat_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        text.flatten().as_deref().map(engine_parse).transpose()
+    }
+
+    /// Sohbetin güncel motorunu yazar.
+    pub fn set_chat_engine(&self, chat_id: &str, engine: EngineId) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE chats SET current_engine = ?2 WHERE id = ?1",
+            params![chat_id, engine_str(engine)],
+        )?;
+        Ok(())
+    }
+
+    /// Sohbette son görülen git HEAD'i okur.
+    pub fn chat_last_head(&self, chat_id: &str) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        let head: Option<Option<String>> = conn
+            .query_row(
+                "SELECT last_head FROM chats WHERE id = ?1",
+                params![chat_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(head.flatten())
+    }
+
+    /// Sohbette son görülen git HEAD'i yazar.
+    pub fn set_chat_last_head(&self, chat_id: &str, head: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE chats SET last_head = ?2 WHERE id = ?1",
+            params![chat_id, head],
+        )?;
+        Ok(())
+    }
+
     /// Sohbetin çalışma durumunu yazar (üzerine yazar).
     pub fn put_work_state(&self, chat_id: &str, json: &Value) -> Result<()> {
         let conn = self.conn()?;

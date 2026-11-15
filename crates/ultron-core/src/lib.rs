@@ -5,8 +5,10 @@ pub mod db;
 pub mod engine;
 pub mod eventlog;
 pub mod events;
+pub mod external;
 pub mod handoff;
 pub mod paths;
+pub mod session;
 pub mod summarizer;
 pub mod workstate;
 
@@ -15,6 +17,7 @@ pub use db::{Db, SearchHit, SessionRow, SessionStatus, StoredEvent};
 pub use eventlog::EventLog;
 pub use events::{EngineEvent, SwitchReason};
 pub use paths::Paths;
+pub use session::SessionManager;
 
 /// Uygulama adı; tek kaynak.
 pub const APP_NAME: &str = "ultron";

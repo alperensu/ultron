@@ -47,6 +47,11 @@ const MIGRATIONS: &[&str] = &[
         updated_at TEXT NOT NULL
     );
     "#,
+    // v2: sohbet başına güncel motor ve son görülen git HEAD.
+    r#"
+    ALTER TABLE chats ADD COLUMN current_engine TEXT;
+    ALTER TABLE chats ADD COLUMN last_head TEXT;
+    "#,
 ];
 
 /// Bekleyen migrasyonları `user_version` üzerinden sırayla uygular.

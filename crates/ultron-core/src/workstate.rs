@@ -179,7 +179,10 @@ impl WorkStateService {
                 state.apply_summary(patch);
                 state.summary_stale = false;
             }
-            Err(_) => state.summary_stale = true,
+            Err(err) => {
+                tracing::warn!(chat_id, error = %err, "çalışma durumu özetleyicisi başarısız");
+                state.summary_stale = true;
+            }
         }
 
         self.db

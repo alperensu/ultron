@@ -49,7 +49,7 @@ fn position(text: &str, needle: &str) -> usize {
 fn pack_order_is_stable_first() {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path(), 12, 60);
-    let pack = build_handoff(&db, "chat-1", 100_000, 6, None).unwrap();
+    let pack = build_handoff(&db, "chat-1", 100_000, 6, None, None).unwrap();
     assert!(!pack.truncated);
     assert!(pack.text.starts_with("[ULTRON DEVİR]"));
     let order = [
@@ -78,7 +78,7 @@ fn pack_order_is_stable_first() {
 fn pack_respects_budget_and_marks_truncation() {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path(), 20, 300);
-    let pack = build_handoff(&db, "chat-1", 2000, 6, None).unwrap();
+    let pack = build_handoff(&db, "chat-1", 2000, 6, None, None).unwrap();
     assert!(pack.text.chars().count() <= 2000, "bütçe aşıldı: {}", pack.text.chars().count());
     assert!(pack.truncated);
     assert!(pack.text.contains("[KIRPILDI: "));
@@ -88,7 +88,7 @@ fn pack_respects_budget_and_marks_truncation() {
 fn pack_never_drops_work_state_or_last_two_messages() {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path(), 20, 300);
-    let pack = build_handoff(&db, "chat-1", 1200, 6, None).unwrap();
+    let pack = build_handoff(&db, "chat-1", 1200, 6, None, None).unwrap();
     assert!(pack.truncated);
     assert!(pack.text.chars().count() <= 1200);
     assert!(pack.text.contains("Test hedefi"));
@@ -102,7 +102,7 @@ fn pack_includes_external_changes_section() {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path(), 3, 40);
     let external = "src/main.rs dosyası sohbet dışında değişti";
-    let pack = build_handoff(&db, "chat-1", 100_000, 6, Some(external)).unwrap();
+    let pack = build_handoff(&db, "chat-1", 100_000, 6, Some(external), None).unwrap();
     assert!(pack.text.contains("[SON OTURUMDAN BERİ DEĞİŞENLER]"));
     assert!(pack.text.contains(external));
     assert!(
@@ -114,4 +114,26 @@ fn pack_includes_external_changes_section() {
             < position(&pack.text, "[SON MESAJLAR]")
     );
     assert!(pack.sections.iter().any(|(n, _)| n == "external_changes"));
+}
+
+#[test]
+fn pack_names_project_instruction_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = seeded_db(tmp.path(), 4, 40);
+    let project = tmp.path().join("proje");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("AGENTS.md"), "GIZLI-ICERIK-1").unwrap();
+    std::fs::write(project.join("CLAUDE.md"), "GIZLI-ICERIK-2").unwrap();
+    let pack = build_handoff(&db, "chat-1", 100_000, 6, None, Some(&project)).unwrap();
+    let header = position(&pack.text, "[ULTRON DEVİR]");
+    let instr = position(&pack.text, "[PROJE TALİMATLARI]");
+    let state = position(&pack.text, "[ÇALIŞMA DURUMU]");
+    assert!(header < instr && instr < state);
+    assert!(pack.text.contains(&project.join("AGENTS.md").display().to_string()));
+    assert!(pack.text.contains(&project.join("CLAUDE.md").display().to_string()));
+    assert!(!pack.text.contains("GIZLI-ICERIK"));
+    let empty = tmp.path().join("bos");
+    std::fs::create_dir_all(&empty).unwrap();
+    let pack = build_handoff(&db, "chat-1", 100_000, 6, None, Some(&empty)).unwrap();
+    assert!(!pack.text.contains("[PROJE TALİMATLARI]"));
 }
