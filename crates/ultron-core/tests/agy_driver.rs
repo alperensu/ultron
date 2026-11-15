@@ -196,6 +196,30 @@ fn assistant_text_with_quota_word_is_not_quota() {
 }
 
 #[test]
+fn agy_prompt_is_truncated_to_cmdline_limit() {
+    let eng = AgyEngine::new(cfg());
+    // Sonda kullanıcı metni (SON), başta uzun bir dolgu ve sınırda vekil çiftleri (emoji).
+    let filler = "a".repeat(29_990);
+    let prompt = format!("{filler}😀😀😀😀😀😀{}SON", "ö".repeat(40_000));
+    let mut req = request(ToolPolicy::ReadOnly, None);
+    req.prompt = prompt.clone();
+    let spec = eng.command(&req);
+    let arg = spec.args.last().unwrap();
+    assert!(arg.starts_with("-p=[KIRPILDI: komut satırı sınırı]\n"), "{}", &arg[..40]);
+    assert!(arg.encode_utf16().count() <= 30_000, "sınır aşıldı");
+    assert!(arg.ends_with("SON"), "kullanıcı metninin sonu kesildi");
+    // Kırpılmış kısım orijinal istemin son kısmıdır.
+    let tail = arg.strip_prefix("-p=[KIRPILDI: komut satırı sınırı]\n").unwrap();
+    assert!(prompt.ends_with(tail));
+
+    // Kısa istem değişmeden geçer.
+    assert_eq!(
+        eng.command(&request(ToolPolicy::ReadOnly, None)).args.last().map(String::as_str),
+        Some("-p=Sadece TAMAM yaz.")
+    );
+}
+
+#[test]
 fn agy_whitespace_delta_is_kept_but_empty_is_dropped() {
     let eng = AgyEngine::new(cfg());
     let line = |delta: &str| {

@@ -67,7 +67,7 @@ impl Engine for AgyEngine {
             ToolPolicy::Full => args.extend(["--mode".into(), "accept-edits".into()]),
         }
         // İstem her zaman son argüman; `--dangerously-skip-permissions` asla eklenmez.
-        args.push(format!("-p={}", req.prompt));
+        args.push(prompt_arg(&req.prompt));
         CommandSpec {
             program: self.cfg.binary.clone(),
             args,
@@ -84,6 +84,39 @@ impl Engine for AgyEngine {
             }],
         }
     }
+}
+
+/// Windows komut satırı sınırının (32767 karakter) güvenli altında kalan istem üst sınırı,
+/// UTF-16 birimi cinsinden. `-p=` öneki ve kırpma işareti bu sınırın içindedir.
+const MAX_PROMPT_ARG_UTF16: usize = 30_000;
+
+/// Kırpıldığında istemin başına eklenen işaret.
+const TRUNCATION_MARK: &str = "[KIRPILDI: komut satırı sınırı]\n";
+
+/// `-p=<istem>` argümanını kurar. İstem sınırı aşarsa en son kısmı (kullanıcı metni sonda
+/// olduğu için) tutulur ve başına kırpma işareti eklenir. Kırpma karakter sınırında yapılır;
+/// UTF-16 vekil çifti asla bölünmez.
+fn prompt_arg(prompt: &str) -> String {
+    let arg = format!("-p={prompt}");
+    if utf16_len(&arg) <= MAX_PROMPT_ARG_UTF16 {
+        return arg;
+    }
+    let budget = MAX_PROMPT_ARG_UTF16 - "-p=".len() - utf16_len(TRUNCATION_MARK);
+    let mut used = 0;
+    let mut start = prompt.len();
+    for (idx, ch) in prompt.char_indices().rev() {
+        let width = ch.len_utf16();
+        if used + width > budget {
+            break;
+        }
+        used += width;
+        start = idx;
+    }
+    format!("-p={TRUNCATION_MARK}{}", &prompt[start..])
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
 }
 
 fn parse_value(raw: &Value) -> Vec<EngineEvent> {
