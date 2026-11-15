@@ -1,7 +1,7 @@
 # Ultron — Tasarım Belgesi
 
 - Tarih: 2026-11-15
-- Durum: Taslak, kullanıcı onayı bekliyor
+- Durum: Onaylandı (2026-11-15). Kullanıcı kalan kararları Claude'a bıraktı; bu kararlar [Ö] ile işaretli.
 - Ad: **Ultron** [K]: proje, repo ve asistan persona adı. Belgede geçen "harness" kelimesi sistemin türünü anlatır. Servis adı `ultrond`, CLI `ultron` [Ö]; belgedeki `harnessd` ifadeleri `ultrond` olarak okunur. Üçüncü kişilerle konuşurken varsayılan tanıtım "Alperen'in asistanı"dır; ayardan değiştirilebilir [Ö].
 - Kapsam: Tüm sistemin mimarisi + Aşama 1 (Çekirdek) ve Aşama 2 (Masaüstü v1) ayrıntılı tasarımı. Sonraki aşamalar kendi tasarım turlarıyla ayrıntılandırılır.
 
@@ -385,7 +385,7 @@ Not: Kullanıcı mevcut Claude Code + `codex-fleet` düzenini harness Aşama 4'e
 7. **Yerel model kalitesi** 8 GB VRAM'de sınırlı. Yalnızca dar işler; onay modelinde kararsızlık durumunda kullanıcıya sorulur.
 8. **Codex bilgisayar kontrolü** `codex exec` içinden doğrulanmamış; harness kendi araçlarını kullanır.
 10. **Ad ve marka:** "Ultron" Marvel/Disney'in tescilli karakter adı. Kullanıcı riski bilerek seçti (2026-11-15). Açık kaynak yayında yeniden adlandırma ya da kaldırma talebi gelebilir. Bu yüzden ad kodda tek bir sabitte tutulur (uygulama adı, servis adı, persona) ve değiştirilmesi kolay olur; Marvel görselleri ve logoları kullanılmaz. [K + Ö]
-9. **Claude kota verisi:** Mevcut `limit` skill'i Claude kotasını `~/.claude/.credentials.json` içindeki OAuth token'ıyla `api.anthropic.com/api/oauth/usage` uç noktasından okuyor. Bu belgelenmemiş bir uç nokta. Kullanıcı kararı bekliyor (bkz. §11).
+9. **Claude kota verisi:** Mevcut `limit` skill'i Claude kotasını `~/.claude/.credentials.json` içindeki OAuth token'ıyla `api.anthropic.com/api/oauth/usage` uç noktasından okuyor. Bu belgelenmemiş bir uç nokta. **Karar [Ö]:** Token yalnızca bu okuma için kullanılır, model çağrısı için asla. Token belleğe alınmaz, loglanmaz, başka bir yere kopyalanmaz. Özellik ayarlarda "Claude kotasını canlı oku" anahtarıyla kapatılabilir; kapalıyken §11 madde 8'deki tahmini yol kullanılır. Uç nokta bozulursa otomatik olarak tahmini yola düşülür ve bunun bildirimi yapılır.
 
 ## 11. İnceleme sonrası netleştirmeler
 
