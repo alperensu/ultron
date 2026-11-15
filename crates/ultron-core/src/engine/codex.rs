@@ -74,6 +74,7 @@ impl Engine for CodexEngine {
                 sandbox.into(),
             ]),
         }
+        args.extend(self.cfg.extra_args.iter().cloned());
         // Son argüman: istemi stdin'den oku.
         args.push("-".into());
         CommandSpec {

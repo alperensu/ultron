@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use ultron_core::EngineEvent;
+use ultron_core::engine::runner::resolve_binary_in;
 use ultron_core::engine::{FakeEngine, ToolPolicy, TurnOutcome, TurnRequest, run_turn};
 
 fn engine(args: &[&str], append_prompt: bool) -> FakeEngine {
@@ -124,6 +125,40 @@ async fn runner_cancel_terminates_tree() {
         assert!(Instant::now() < deadline, "süreç ağacı 2 sn içinde ölmedi");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[test]
+fn resolve_binary_leaves_explicit_paths_and_extensions() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("tool.exe"), "").unwrap();
+    let dirs = vec![tmp.path().to_path_buf()];
+    // Uzantılı ya da yol içeren ad olduğu gibi kalır.
+    assert_eq!(resolve_binary_in("tool.exe", &dirs).unwrap(), "tool.exe");
+    assert_eq!(resolve_binary_in("C:/x/tool", &dirs).unwrap(), "C:/x/tool");
+    // Bulunamayan ad olduğu gibi döner; hata süreç başlatmada çıkar.
+    assert_eq!(resolve_binary_in("yok-boyle-bir-arac", &dirs).unwrap(), "yok-boyle-bir-arac");
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_binary_prefers_exe_and_rejects_cmd_shims() {
+    let exe_dir = tempfile::tempdir().unwrap();
+    std::fs::write(exe_dir.path().join("fakeeng.exe"), "").unwrap();
+    let dirs = vec![exe_dir.path().to_path_buf()];
+    let resolved = resolve_binary_in("fakeeng", &dirs).unwrap();
+    assert!(resolved.ends_with("fakeeng.exe"), "{resolved}");
+
+    let shim_dir = tempfile::tempdir().unwrap();
+    std::fs::write(shim_dir.path().join("shimeng.cmd"), "@echo off").unwrap();
+    let dirs = vec![shim_dir.path().to_path_buf()];
+    let err = resolve_binary_in("shimeng", &dirs).unwrap_err();
+    assert!(err.to_string().contains(".exe"), "{err}");
+
+    // Aynı PATH'te .exe varsa .cmd'den önce gelir.
+    std::fs::write(shim_dir.path().join("both.exe"), "").unwrap();
+    std::fs::write(shim_dir.path().join("both.cmd"), "@echo off").unwrap();
+    let resolved = resolve_binary_in("both", &dirs).unwrap();
+    assert!(resolved.ends_with("both.exe"), "{resolved}");
 }
 
 #[tokio::test]

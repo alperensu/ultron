@@ -62,6 +62,17 @@ fn validate_rejects_non_gemini_agy() {
     assert!(cfg.validate().is_ok());
 }
 
+#[test]
+fn validate_rejects_astra_in_extra_args() {
+    let mut cfg = engine(EngineId::Claude, None, None);
+    cfg.extra_args = vec!["--model".into(), "claude-astra-1".into()];
+    assert!(cfg.validate().is_err());
+    cfg.extra_args = vec!["--ASTRA-mode".into()];
+    assert!(cfg.validate().is_err());
+    cfg.extra_args = vec!["--verbose".into()];
+    assert!(cfg.validate().is_ok());
+}
+
 fn engine(id: EngineId, model: Option<&str>, effort: Option<&str>) -> EngineConfig {
     EngineConfig {
         id,

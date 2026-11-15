@@ -165,6 +165,17 @@ fn codex_model_not_found_is_error_not_quota() {
 }
 
 #[test]
+fn extra_args_precede_stdin_marker() {
+    let mut c = cfg();
+    c.extra_args = vec!["--profile".into(), "ozel".into()];
+    let eng = CodexEngine::new(c);
+    let spec = eng.command(&request(ToolPolicy::Workspace, None));
+    let pos = spec.args.iter().position(|a| a == "--profile").expect("ek argüman yok");
+    assert_eq!(spec.args[pos + 1], "ozel");
+    assert_eq!(spec.args.last().map(String::as_str), Some("-"));
+}
+
+#[test]
 fn codex_item_error_is_not_quota() {
     // Öğe düzeyindeki hata tur sonu değildir; kota mesajı bile olsa Error olmalı.
     let eng = CodexEngine::new(cfg());

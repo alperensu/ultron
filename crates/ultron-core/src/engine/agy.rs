@@ -66,6 +66,7 @@ impl Engine for AgyEngine {
             }
             ToolPolicy::Full => args.extend(["--mode".into(), "accept-edits".into()]),
         }
+        args.extend(self.cfg.extra_args.iter().cloned());
         // İstem her zaman son argüman; `--dangerously-skip-permissions` asla eklenmez.
         args.push(prompt_arg(&req.prompt));
         CommandSpec {

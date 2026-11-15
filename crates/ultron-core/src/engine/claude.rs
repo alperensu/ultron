@@ -64,6 +64,7 @@ impl Engine for ClaudeEngine {
             "--mcp-config".into(),
             EMPTY_MCP.into(),
         ]);
+        args.extend(self.cfg.extra_args.iter().cloned());
         // Değişken uzunluklu bayraklar (--tools, --disallowedTools) en sona konur.
         match req.tool_policy {
             ToolPolicy::ReadOnly => args.extend([

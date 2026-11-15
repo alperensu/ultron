@@ -154,6 +154,16 @@ fn claude_edit_tool_emits_file_changed() {
 }
 
 #[test]
+fn extra_args_are_passed_to_claude() {
+    let mut c = cfg();
+    c.extra_args = vec!["--add-dir".into(), "C:/extra".into()];
+    let eng = ClaudeEngine::new(c);
+    let spec = eng.command(&request(ToolPolicy::Full, None));
+    let pos = spec.args.iter().position(|a| a == "--add-dir").expect("ek argüman yok");
+    assert_eq!(spec.args[pos + 1], "C:/extra");
+}
+
+#[test]
 fn assistant_text_with_quota_word_is_not_quota() {
     let eng = ClaudeEngine::new(cfg());
     let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"usage limit ve quota exceeded kodunu inceledim, 429 yok"}]}}"#;

@@ -45,6 +45,44 @@ pub enum TurnOutcome {
     QuotaExhausted,
 }
 
+/// Motor ikilisini PATH üzerinde çözer (`binary` uzantısız ve yol içermiyorsa).
+pub fn resolve_binary(binary: &str) -> Result<String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+    resolve_binary_in(binary, &dirs)
+}
+
+/// `resolve_binary`'nin PATH dizinleri verilmiş biçimi. Windows'ta uzantısız ad önce `.exe`
+/// olarak aranır. Yalnız `.cmd`/`.bat` kabuğu bulunursa hata döner: istemi bu kabuklardan
+/// geçirmek (tırnak ve `%` kaçışları) güvenli değildir; tam `.exe` yolu yapılandırılmalıdır.
+/// Bulunamazsa ad olduğu gibi döner; süreç başlatma hatası çağırana kalır.
+pub fn resolve_binary_in(binary: &str, dirs: &[std::path::PathBuf]) -> Result<String> {
+    let has_ext_or_sep =
+        std::path::Path::new(binary).extension().is_some() || binary.contains(['/', '\\']);
+    if !cfg!(windows) || has_ext_or_sep {
+        return Ok(binary.to_string());
+    }
+    for dir in dirs {
+        let exe = dir.join(format!("{binary}.exe"));
+        if exe.is_file() {
+            return Ok(exe.to_string_lossy().into_owned());
+        }
+    }
+    for dir in dirs {
+        for ext in ["cmd", "bat"] {
+            let shim = dir.join(format!("{binary}.{ext}"));
+            if shim.is_file() {
+                anyhow::bail!(
+                    "'{binary}' bir kabuk betiği ({}); istem bu betikten geçirilemez. \
+                     Yapılandırmada tam .exe yolunu verin.",
+                    shim.display()
+                );
+            }
+        }
+    }
+    Ok(binary.to_string())
+}
+
 /// Motor komutunu çalıştırır; stdout'taki her tam satırı olaya çevirip `sink`'e yollar.
 /// Yarım son satır (süreç ölünce ya da iptalde) atılır.
 pub async fn run_turn(
@@ -54,7 +92,8 @@ pub async fn run_turn(
     cancel: CancellationToken,
 ) -> Result<TurnOutcome> {
     let spec = engine.command(&req);
-    let mut cmd = Command::new(&spec.program);
+    let program = resolve_binary(&spec.program)?;
+    let mut cmd = Command::new(&program);
     cmd.args(&spec.args)
         .current_dir(&spec.cwd)
         .stdin(if spec.stdin.is_some() {

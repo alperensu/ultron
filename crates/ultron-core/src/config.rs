@@ -27,6 +27,11 @@ pub struct EngineConfig {
 impl EngineConfig {
     /// Model ve efor kurallarını denetler.
     pub fn validate(&self) -> Result<()> {
+        for arg in &self.extra_args {
+            if arg.to_lowercase().contains("astra") {
+                bail!("'astra' ek argümanlarda desteklenmiyor: {arg}");
+            }
+        }
         if let Some(model) = &self.model {
             let lower = model.to_lowercase();
             if lower.contains("astra") {

@@ -183,6 +183,17 @@ fn agy_success_without_output_is_error() {
 }
 
 #[test]
+fn extra_args_precede_prompt() {
+    let mut c = cfg();
+    c.extra_args = vec!["--verbose".into()];
+    let eng = AgyEngine::new(c);
+    let spec = eng.command(&request(ToolPolicy::ReadOnly, None));
+    let pos = spec.args.iter().position(|a| a == "--verbose").expect("ek argüman yok");
+    assert!(pos < spec.args.len() - 1, "ek argüman istemden sonra");
+    assert_eq!(spec.args.last().map(String::as_str), Some("-p=Sadece TAMAM yaz."));
+}
+
+#[test]
 fn assistant_text_with_quota_word_is_not_quota() {
     let eng = AgyEngine::new(cfg());
     let line = json!({
