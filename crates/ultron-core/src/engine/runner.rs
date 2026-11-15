@@ -21,6 +21,18 @@ const STDERR_CAP: usize = 64 * 1024;
 /// Aşılırsa boruyu tutan torunlar sonlandırılır.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 
+/// Tek bir stdout satırının en fazla boyutu; aşan satır atlanır.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// Bir turun stdout'undan okunacak en fazla toplam bayt; aşılırsa süreç sonlandırılır.
+const MAX_TURN_STDOUT: u64 = 64 * 1024 * 1024;
+
+fn line_too_long() -> EngineEvent {
+    EngineEvent::Error {
+        message: "satır çok uzun, atlandı".to_string(),
+    }
+}
+
 /// Bir turun sonucu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnOutcome {
@@ -98,6 +110,10 @@ pub async fn run_turn(
     let mut cancelled = false;
     let mut status: Option<std::process::ExitStatus> = None;
     let mut grace_deadline: Option<Instant> = None;
+    // Üst sınırı aşan satırın geri kalanı yutulurken `true`.
+    let mut skipping = false;
+    let mut total_out: u64 = 0;
+    let mut over_budget = false;
 
     loop {
         tokio::select! {
@@ -115,10 +131,39 @@ pub async fn run_turn(
             }
             read = stdout.read(&mut buf) => {
                 let n = match read { Ok(0) | Err(_) => break, Ok(n) => n };
-                pending.extend_from_slice(&buf[..n]);
-                while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
-                    let raw: Vec<u8> = pending.drain(..=pos).collect();
-                    let text = String::from_utf8_lossy(&raw[..raw.len() - 1]);
+                total_out += n as u64;
+                if total_out > MAX_TURN_STDOUT {
+                    over_budget = true;
+                    break;
+                }
+                let mut rest = &buf[..n];
+                while !rest.is_empty() {
+                    let Some(pos) = rest.iter().position(|&b| b == b'\n') else {
+                        // Satır henüz bitmedi; üst sınır aşılırsa satır atlanır ve sonuna dek yutulur.
+                        if !skipping {
+                            pending.extend_from_slice(rest);
+                            if pending.len() > MAX_LINE_BYTES {
+                                pending.clear();
+                                skipping = true;
+                                let _ = sink.send(line_too_long()).await;
+                            }
+                        }
+                        break;
+                    };
+                    let head = &rest[..pos];
+                    rest = &rest[pos + 1..];
+                    if skipping {
+                        skipping = false;
+                        continue;
+                    }
+                    pending.extend_from_slice(head);
+                    if pending.len() > MAX_LINE_BYTES {
+                        pending.clear();
+                        let _ = sink.send(line_too_long()).await;
+                        continue;
+                    }
+                    let raw = std::mem::take(&mut pending);
+                    let text = String::from_utf8_lossy(&raw);
                     let line = text.trim_end_matches('\r');
                     if line.trim().is_empty() {
                         continue;
@@ -136,6 +181,17 @@ pub async fn run_turn(
     }
     // Kalan `pending` yarım satırdır; bilerek atılır.
     drop(pending);
+
+    if over_budget {
+        job.terminate();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        stderr_task.abort();
+        return Ok(TurnOutcome::Failed {
+            exit_code: None,
+            stderr_excerpt: "çıktı bütçesi aşıldı".to_string(),
+        });
+    }
 
     if cancelled {
         return Ok(cancel_turn(&job, &mut child, stderr_task).await);

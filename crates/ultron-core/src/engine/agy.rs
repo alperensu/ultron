@@ -156,25 +156,28 @@ fn result_events(result: &Value) -> Vec<EngineEvent> {
 /// "başarılı göründü ama çıktı yazılmadı" durumudur ve `Error` üretilir.
 /// Çıkış kodu sıfır değilse ya da tur zaten hata/kota olayı ürettiyse `None` döner.
 pub fn finalize(events: &[EngineEvent], exit_code: Option<i32>) -> Option<EngineEvent> {
-    if exit_code != Some(0) {
-        return None;
-    }
     let already_failed = events
         .iter()
         .any(|e| matches!(e, EngineEvent::Error { .. } | EngineEvent::QuotaExhausted { .. }));
-    if already_failed {
-        return None;
-    }
-    let has_output = events
+    let saw_text = events
         .iter()
         .any(|e| matches!(e, EngineEvent::AssistantText { .. }));
-    if has_output {
-        None
-    } else {
-        Some(EngineEvent::Error {
-            message: "agy çıkış kodu 0 ile bitti ama çıktı üretilmedi".to_string(),
-        })
+    finalize_summary(saw_text, already_failed, exit_code)
+}
+
+/// `finalize`'ın olay listesi tutmayan biçimi: tur boyunca yalnız "metin geldi mi" ve
+/// "hata/kota oldu mu" bilgisi yeterlidir.
+pub fn finalize_summary(
+    saw_text: bool,
+    already_failed: bool,
+    exit_code: Option<i32>,
+) -> Option<EngineEvent> {
+    if exit_code != Some(0) || already_failed || saw_text {
+        return None;
     }
+    Some(EngineEvent::Error {
+        message: "agy çıkış kodu 0 ile bitti ama çıktı üretilmedi".to_string(),
+    })
 }
 
 fn unknown(raw: &Value) -> Vec<EngineEvent> {

@@ -194,7 +194,7 @@ impl SessionManager {
         let (tx, mut rx) = mpsc::channel::<EngineEvent>(64);
         let run = run_turn(driver.as_ref(), req, tx, cancel);
         let consume = async {
-            let mut collected = Vec::new();
+            let mut summary = TurnSummary::default();
             while let Some(ev) = rx.recv().await {
                 if let EngineEvent::SessionStarted {
                     native_session_id: Some(id),
@@ -203,15 +203,15 @@ impl SessionManager {
                     session.native_session_id = Some(id.clone());
                     self.db.upsert_session(&session)?;
                 }
-                self.log.append(chat_id, Some(&session.id), ev.clone())?;
-                collected.push(ev);
+                summary.observe(&ev);
+                self.log.append(chat_id, Some(&session.id), ev)?;
             }
-            Ok::<_, anyhow::Error>(collected)
+            Ok::<_, anyhow::Error>(summary)
         };
-        let (outcome, collected) = tokio::join!(run, consume);
+        let (outcome, summary) = tokio::join!(run, consume);
 
-        let (mut outcome, collected) = match (outcome, collected) {
-            (Ok(outcome), Ok(collected)) => (outcome, collected),
+        let (mut outcome, summary) = match (outcome, summary) {
+            (Ok(outcome), Ok(summary)) => (outcome, summary),
             (outcome, collected) => {
                 let err = outcome.err().or(collected.err());
                 session.status = SessionStatus::Failed;
@@ -226,11 +226,10 @@ impl SessionManager {
             TurnOutcome::Failed { exit_code, .. } => *exit_code,
             TurnOutcome::Cancelled | TurnOutcome::QuotaExhausted => None,
         };
-        let mut has_error = collected
-            .iter()
-            .any(|e| matches!(e, EngineEvent::Error { .. }));
+        let mut has_error = summary.saw_error;
         if engine == EngineId::Agy
-            && let Some(ev) = agy::finalize(&collected, exit_code)
+            && let Some(ev) =
+                agy::finalize_summary(summary.saw_text, summary.already_failed(), exit_code)
         {
             if let EngineEvent::Error { message } = &ev {
                 outcome = TurnOutcome::Failed {
@@ -264,10 +263,7 @@ impl SessionManager {
                 SessionStatus::Failed
             }
             TurnOutcome::QuotaExhausted => {
-                if !collected
-                    .iter()
-                    .any(|e| matches!(e, EngineEvent::QuotaExhausted { .. }))
-                {
+                if !summary.saw_quota {
                     self.log.append(
                         chat_id,
                         Some(&session.id),
@@ -363,6 +359,30 @@ impl SessionManager {
         }
         self.db.set_chat_engine(chat_id, to)?;
         Ok(())
+    }
+}
+
+/// Tur sırasında gelen olaylardan yalnız sonuç kararında gereken bilgiler; olaylar
+/// bellekte biriktirilmez (uzun turlarda bellek sınırsız büyümesin diye).
+#[derive(Default)]
+struct TurnSummary {
+    saw_text: bool,
+    saw_error: bool,
+    saw_quota: bool,
+}
+
+impl TurnSummary {
+    fn observe(&mut self, ev: &EngineEvent) {
+        match ev {
+            EngineEvent::AssistantText { .. } => self.saw_text = true,
+            EngineEvent::Error { .. } => self.saw_error = true,
+            EngineEvent::QuotaExhausted { .. } => self.saw_quota = true,
+            _ => {}
+        }
+    }
+
+    fn already_failed(&self) -> bool {
+        self.saw_error || self.saw_quota
     }
 }
 

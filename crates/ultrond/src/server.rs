@@ -29,6 +29,9 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Arama sonucu üst sınırı.
 const MAX_SEARCH_LIMIT: usize = 100;
 
+/// Olay replay'inde tek sorguda okunan en fazla olay sayısı (bellek sınırı).
+const REPLAY_PAGE: usize = 500;
+
 type Reader = BufReader<ReadHalf<NamedPipeServer>>;
 type Writer = WriteHalf<NamedPipeServer>;
 
@@ -477,11 +480,19 @@ async fn flush_events(
     last_seq: &mut i64,
     writer: &mut Writer,
 ) -> Result<()> {
-    for ev in st.db.events_for_chat(chat_id, Some(*last_seq))? {
-        *last_seq = ev.seq;
-        write_msg(writer, &Response::Event(ev)).await?;
+    loop {
+        let page = st
+            .db
+            .events_for_chat_page(chat_id, Some(*last_seq), REPLAY_PAGE)?;
+        let full = page.len() == REPLAY_PAGE;
+        for ev in page {
+            *last_seq = ev.seq;
+            write_msg(writer, &Response::Event(ev)).await?;
+        }
+        if !full {
+            return Ok(());
+        }
     }
-    Ok(())
 }
 
 fn outcome_name(outcome: &TurnOutcome) -> &'static str {

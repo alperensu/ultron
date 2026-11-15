@@ -169,3 +169,45 @@ async fn runner_passes_unicode_and_spaced_cwd() {
         std::fs::canonicalize(&cwd).unwrap()
     );
 }
+
+#[tokio::test]
+async fn runner_overlong_line_is_skipped() {
+    let eng = engine(&["longline"], false);
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let outcome = run_turn(&eng, request(tmp.path(), "x"), tx, CancellationToken::new())
+        .await
+        .unwrap();
+    let events = collect(rx).await;
+    assert_eq!(outcome, TurnOutcome::Completed);
+    let errors = events
+        .iter()
+        .filter(|e| matches!(e, EngineEvent::Error { message } if message == "satır çok uzun, atlandı"))
+        .count();
+    assert_eq!(errors, 1, "olaylar: {events:?}");
+    assert_eq!(events.len(), 2, "olaylar: {events:?}");
+    assert!(events.iter().any(|e| matches!(e, EngineEvent::AssistantText { text } if text == "tamam")));
+}
+
+#[tokio::test]
+async fn runner_output_budget_fails_turn() {
+    let eng = engine(&["flood"], false);
+    let tmp = tempfile::tempdir().unwrap();
+    let (tx, rx) = mpsc::channel(64);
+    // Alıcı aynı anda tüketmeli; yoksa gönderici kanal dolunca bekler.
+    let drain = tokio::spawn(collect(rx));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        run_turn(&eng, request(tmp.path(), "x"), tx, CancellationToken::new()),
+    )
+    .await
+    .expect("çıktı bütçesi aşıldıktan sonra tur sonlanmadı")
+    .unwrap();
+    drain.await.unwrap();
+    match outcome {
+        TurnOutcome::Failed { exit_code: None, stderr_excerpt } => {
+            assert_eq!(stderr_excerpt, "çıktı bütçesi aşıldı");
+        }
+        other => panic!("beklenmeyen sonuç: {other:?}"),
+    }
+}

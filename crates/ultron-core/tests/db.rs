@@ -71,3 +71,27 @@ fn fts_finds_turkish_text() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].event_id, "e1");
 }
+
+#[test]
+fn replay_is_paged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open_with_chat(tmp.path());
+    let batch: Vec<StoredEvent> = (1..=1200)
+        .map(|seq| event(&format!("e{seq}"), "chat-1", seq, "user_text", json!({"text": "x"})))
+        .collect();
+    for ev in &batch {
+        db.insert_event(ev).unwrap();
+    }
+    let mut seen: Vec<i64> = Vec::new();
+    let mut after = None;
+    loop {
+        let page = db.events_for_chat_page("chat-1", after, 500).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 500);
+        after = page.last().map(|e| e.seq);
+        seen.extend(page.iter().map(|e| e.seq));
+    }
+    assert_eq!(seen, (1..=1200).collect::<Vec<i64>>());
+}

@@ -172,6 +172,31 @@ impl Db {
         Ok(out)
     }
 
+    /// `events_for_chat`'in sayfalı hali: en fazla `limit` olay, `seq` sırasıyla.
+    /// Sonraki sayfa için son dönen olayın `seq` değeri `after_seq` olarak verilir.
+    pub fn events_for_chat_page(
+        &self,
+        chat_id: &str,
+        after_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, session_id, seq, ts, kind, payload_json
+             FROM events WHERE chat_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(
+            params![chat_id, after_seq.unwrap_or(0), limit],
+            raw_event_row,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(raw_to_event(row?)?);
+        }
+        Ok(out)
+    }
+
     /// Sohbetin bir sonraki sıra numarası (ilk olay için 1).
     pub fn next_seq(&self, chat_id: &str) -> Result<i64> {
         let conn = self.conn()?;

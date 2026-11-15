@@ -1,5 +1,6 @@
 //! Testler için sahte motor CLI'ı. Davranış ilk argümanla seçilir:
-//! `replay <fixture>`, `echo <args...>`, `partial <n> <exit>`, `sleep <pidfile>`, `linger`, `hold`.
+//! `replay <fixture>`, `echo <args...>`, `partial <n> <exit>`, `sleep <pidfile>`, `linger`, `hold`,
+//! `longline`, `flood`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -61,6 +62,23 @@ fn main() {
             writeln!(out, "{{\"type\":\"assistant_text\",\"text\":\"bitti\"}}").unwrap();
             out.flush().unwrap();
             std::process::exit(0);
+        }
+        "longline" => {
+            // 2 MiB'lık tek satır (atlanmalı), ardından normal bir olay.
+            out.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
+            writeln!(out).unwrap();
+            writeln!(out, "{{\"type\":\"assistant_text\",\"text\":\"tamam\"}}").unwrap();
+            out.flush().unwrap();
+        }
+        "flood" => {
+            // Bütçeyi aşacak kadar çıktı; ana süreç bizi sonlandırmalı.
+            let line = format!("{}\n", "y".repeat(8 * 1024));
+            for _ in 0..(72 * 1024 * 1024 / line.len()) {
+                if out.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            let _ = out.flush();
         }
         "hold" => std::thread::sleep(Duration::from_secs(120)),
         other => {
