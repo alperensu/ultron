@@ -76,6 +76,16 @@ fn validate_rejects_effort_above_high_for_sol() {
 }
 
 #[test]
+fn effort_ceiling_matches_family_suffix_any_version() {
+    for model in ["gpt-5.6-sol", "gpt-7-terra"] {
+        assert!(engine(EngineId::Codex, Some(model), Some("max")).validate().is_err());
+        assert!(engine(EngineId::Codex, Some(model), Some("high")).validate().is_ok());
+    }
+    assert!(engine(EngineId::Codex, Some("gpt-7.2-luna"), Some("medium")).validate().is_err());
+    assert!(engine(EngineId::Codex, Some("gpt-7.2-luna"), Some("max")).validate().is_ok());
+}
+
+#[test]
 fn validate_rejects_non_gemini_agy() {
     let cfg = engine(EngineId::Agy, Some("claude-sonnet"), None);
     assert!(cfg.validate().is_err());
