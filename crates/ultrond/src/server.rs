@@ -364,6 +364,21 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
     Ok(())
 }
 
+/// Yol, kullanıcının ev dizini mi (büyük/küçük harf ve sembolik bağdan bağımsız)?
+fn is_user_home(path: &Path) -> bool {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        return false;
+    };
+    let norm = |p: &Path| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    norm(path) == norm(Path::new(&home))
+}
+
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
 
 /// IPC'den gelen katalog yolunu sınırlı okur: düzenli dosya, `.md`/`.txt`, en çok 1 MiB.
@@ -564,7 +579,17 @@ async fn dispatch(
                 ),
                 None => None,
             };
-            let cwd = project.as_ref().map_or(cwd, |p| p.path.clone());
+            let cwd = match &project {
+                Some(p) => p.path.clone(),
+                // Projesiz sohbet kullanıcının ev dizininde çalışmaz: sohbete özel çalışma alanı.
+                None if cwd.trim().is_empty() || is_user_home(Path::new(&cwd)) => {
+                    let dir = st.paths.root.join("workspaces").join(&chat_id);
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("çalışma alanı oluşturulamadı: {}", dir.display()))?;
+                    dir.to_string_lossy().into_owned()
+                }
+                None => cwd,
+            };
             if !Path::new(&cwd).is_absolute() {
                 return Err(anyhow!("cwd mutlak bir yol olmalı: {cwd}"));
             }
@@ -958,6 +983,62 @@ mod tests {
             Response::Error { .. }
         ));
         assert_eq!(data(&h, Request::ListProjects).await, before);
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn projectless_send_uses_scratch_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let h = start_with(&paths, &unique_pipe(), &[STARTED, REPLY, DONE]).await;
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE tanımlı olmalı");
+        for (chat, cwd) in [("kapsam-1", home), ("kapsam-2", String::new())] {
+            let mut client = connect(&h).await;
+            client
+                .send(&Request::Send {
+                    chat_id: Some(chat.into()),
+                    cwd,
+                    engine: Some(EngineId::Claude),
+                    text: "merhaba".into(),
+                    policy: PolicyArg::ReadOnly,
+                    project_id: None,
+                })
+                .await
+                .unwrap();
+            loop {
+                match next(&mut client).await.unwrap() {
+                    Response::Ok { data } if data.get("done").is_some() => break,
+                    Response::Error { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                paths.root.join("workspaces").join(chat).is_dir(),
+                "{chat} için çalışma alanı oluşmalı"
+            );
+        }
+        // Ev dizini dışındaki açık bir cwd olduğu gibi kullanılır (çalışma alanı açılmaz).
+        let own = abs_dir(tmp.path());
+        let mut client = connect(&h).await;
+        client
+            .send(&Request::Send {
+                chat_id: Some("kapsam-3".into()),
+                cwd: own.to_string_lossy().into_owned(),
+                engine: Some(EngineId::Claude),
+                text: "merhaba".into(),
+                policy: PolicyArg::ReadOnly,
+                project_id: None,
+            })
+            .await
+            .unwrap();
+        loop {
+            match next(&mut client).await.unwrap() {
+                Response::Ok { data } if data.get("done").is_some() => break,
+                Response::Error { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        assert!(!paths.root.join("workspaces").join("kapsam-3").exists());
         h.shutdown().await;
     }
 
