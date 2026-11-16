@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -92,6 +92,19 @@ pub struct Db {
 
 type RawEvent = (String, String, Option<String>, i64, String, String, String);
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImportCheckpoint {
+    pub offset: u64,
+    pub generation: i64,
+    pub file_size: u64,
+    pub first_line_hash: Option<String>,
+    pub session_cwd: Option<String>,
+}
+
+pub(crate) fn normalized_project_path(path: &str) -> String {
+    path.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
 impl Db {
     /// Veritabanını açar (WAL, yabancı anahtarlar) ve migrasyonları uygular.
     pub fn open(path: &Path) -> Result<Db> {
@@ -134,10 +147,10 @@ impl Db {
     pub fn upsert_project(&self, p: &ProjectInfo) -> Result<()> {
         let conn = self.conn()?;
         conn.execute(
-            "INSERT INTO projects(id, name, path, aliases_json, description, last_active_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO projects(id, name, path, aliases_json, description, last_active_at, path_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name, path = excluded.path,
+                name = excluded.name, path = excluded.path, path_key = excluded.path_key,
                 aliases_json = excluded.aliases_json, description = excluded.description,
                 last_active_at = COALESCE(excluded.last_active_at, projects.last_active_at)",
             params![
@@ -147,6 +160,7 @@ impl Db {
                 serde_json::to_string(&p.aliases)?,
                 p.description,
                 p.last_active_at,
+                normalized_project_path(&p.path),
             ],
         )?;
         Ok(())
@@ -172,13 +186,13 @@ impl Db {
         seeds: &[crate::projects::ProjectSeed],
     ) -> Result<crate::ipc::CatalogImportReport> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut report = crate::ipc::CatalogImportReport::default();
         for seed in seeds {
             let existing: Option<String> = tx
                 .query_row(
-                    "SELECT id FROM projects WHERE path = ?1 ORDER BY id LIMIT 1",
-                    params![seed.path],
+                    "SELECT id FROM projects WHERE path_key = ?1 ORDER BY id LIMIT 1",
+                    params![normalized_project_path(&seed.path)],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -190,12 +204,13 @@ impl Db {
                 report.updated += 1;
             } else {
                 tx.execute(
-                    "INSERT INTO projects(id, name, path, description) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO projects(id, name, path, description, path_key) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         uuid::Uuid::new_v4().simple().to_string(),
                         seed.name,
                         seed.path,
-                        seed.description
+                        seed.description,
+                        normalized_project_path(&seed.path),
                     ],
                 )?;
                 report.imported += 1;
@@ -398,6 +413,74 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn import_checkpoints(
+        &self,
+    ) -> Result<std::collections::HashMap<String, ImportCheckpoint>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT path, byte_offset, generation, file_size, first_line_hash, session_cwd
+             FROM import_state",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, ImportCheckpoint {
+                offset: r.get::<_, i64>(1)?.max(0) as u64,
+                generation: r.get(2)?,
+                file_size: r.get::<_, i64>(3)?.max(0) as u64,
+                first_line_hash: r.get(4)?,
+                session_cwd: r.get(5)?,
+            }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Sıra tahsisi, olay/FTS yazımı ve kontrol noktası aynı yazma kilidindedir.
+    /// Yalnız kaynak olay kimliği yinelenirse ekleme atlanır.
+    pub(crate) fn commit_import_record(
+        &self,
+        path: &str,
+        checkpoint: &ImportCheckpoint,
+        event: Option<&StoredEvent>,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut inserted = false;
+        if let Some(ev) = event {
+            // Her kayıt için yeniden tahsis: araya giren canlı olaylar sıra tüketebilir.
+            let seq: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE chat_id = ?1",
+                params![ev.chat_id], |r| r.get(0),
+            )?;
+            inserted = tx.execute(
+                "INSERT INTO events(id, chat_id, session_id, seq, ts, kind, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
+                params![ev.id, ev.chat_id, ev.session_id, seq, ev.ts.to_rfc3339(), ev.kind, ev.payload.to_string()],
+            )? != 0;
+            if inserted {
+                if let Some(text) = indexable_text(&ev.kind, &ev.payload) {
+                    tx.execute(
+                        "INSERT INTO messages_fts(chat_id, event_id, text) VALUES (?1, ?2, ?3)",
+                        params![ev.chat_id, ev.id, text],
+                    )?;
+                }
+                tx.execute("UPDATE chats SET updated_at = ?2 WHERE id = ?1",
+                    params![ev.chat_id, ev.ts.to_rfc3339()])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO import_state(path, byte_offset, updated_at, generation, file_size, first_line_hash, session_cwd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(path) DO UPDATE SET byte_offset = excluded.byte_offset,
+                updated_at = excluded.updated_at, generation = excluded.generation,
+                file_size = excluded.file_size, first_line_hash = excluded.first_line_hash,
+                session_cwd = excluded.session_cwd",
+            params![path, i64::try_from(checkpoint.offset)?, Utc::now().to_rfc3339(),
+                checkpoint.generation, i64::try_from(checkpoint.file_size)?,
+                checkpoint.first_line_hash, checkpoint.session_cwd],
+        )?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Sohbetin güncellenme zamanını verilen değere ayarlar (içe aktarma için).
     pub fn set_chat_updated_at(&self, chat_id: &str, at: DateTime<Utc>) -> Result<()> {
         let conn = self.conn()?;
@@ -431,8 +514,8 @@ impl Db {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO events(id, chat_id, session_id, seq, ts, kind, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO events(id, chat_id, session_id, seq, ts, kind, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
             params![
                 ev.id,
                 ev.chat_id,

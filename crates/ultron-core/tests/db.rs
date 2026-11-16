@@ -43,6 +43,15 @@ fn event_insert_is_idempotent() {
 }
 
 #[test]
+fn sequence_collision_is_not_an_id_duplicate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open_with_chat(tmp.path());
+    db.insert_event(&event("a", "chat-1", 1, "user_text", json!({"text":"first"}))).unwrap();
+    assert!(db.insert_event(&event("b", "chat-1", 1, "user_text", json!({"text":"second"}))).is_err());
+    assert!(db.search_messages(None, "second", 10).unwrap().is_empty());
+}
+
+#[test]
 fn events_survive_reopen() {
     let tmp = tempfile::tempdir().unwrap();
     let db = open_with_chat(tmp.path());

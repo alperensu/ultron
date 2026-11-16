@@ -35,6 +35,9 @@ fn import_masks_secrets() {
         "password=hunter2",
         "api_token=abc123",
         "secret=\"has space\"",
+        "--password=syntheticflag",
+        "(token=syntheticpunctuation)",
+        "?token=syntheticquery&x=ok",
     ];
     for p in positives {
         let (out, n) = mask_secrets(&format!("onceki {p} sonraki"));
@@ -168,4 +171,182 @@ fn import_binds_project_by_cwd() {
     // Sohbetler listelenebilir kalır (motor alanı geçersiz değer taşımaz).
     assert_eq!(db.list_chats(None, false).unwrap().len(), 2);
     assert!(a.title.starts_with("Merhaba"));
+}
+
+fn write_records(file: &Path, records: &[serde_json::Value]) {
+    let text = records.iter().map(|v| format!("{v}\n")).collect::<String>();
+    std::fs::write(file, text).unwrap();
+}
+
+fn message(text: &str) -> serde_json::Value {
+    serde_json::json!({"type":"user", "message":{"content":text}})
+}
+
+#[test]
+fn import_after_live_events_loses_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    db.insert_chat("claude-live", None, "", chrono::Utc::now()).unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("ultron.db")).unwrap();
+    // Deterministically interleave a live event after the first imported event.
+    conn.execute_batch(r#"
+        CREATE TRIGGER live_interleave AFTER INSERT ON events
+        WHEN NEW.chat_id = 'claude-live' AND NEW.seq = 1
+        BEGIN
+            INSERT INTO events(id, chat_id, seq, ts, kind, payload_json)
+            VALUES ('live-event', NEW.chat_id, 2, NEW.ts, 'user_text', '{"text":"live"}');
+        END;
+    "#).unwrap();
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    write_records(&root.join("live.jsonl"), &[message("first"), message("second"), message("third")]);
+    let report = import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    assert_eq!(report.messages, 3);
+    let events = db.events_for_chat("claude-live", None).unwrap();
+    assert_eq!(texts(&events), ["first", "live", "second", "third"]);
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3, 4]);
+    assert_eq!(import_claude_history(&db, &root, &mut ImportState::load(&db).unwrap()).unwrap().messages, 0);
+}
+
+#[test]
+fn rewritten_file_imports_new_messages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let file = root.join("rewrite.jsonl");
+    // Equal-size rewrites must be detected even when the offset equals the size.
+    write_records(&file, &[message("old")]);
+    import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    write_records(&file, &[message("new")]);
+    let report = import_claude_history(&db, &root, &mut ImportState::load(&db).unwrap()).unwrap();
+    assert_eq!(report.messages, 1);
+    assert_eq!(texts(&db.events_for_chat("claude-rewrite", None).unwrap()), ["old", "new"]);
+
+    let original = serde_json::json!({"type":"user", "uuid":"source-1", "message":{"content":"uuid message"}});
+    write_records(&file, &[original.clone(), message("long padding message")]);
+    import_claude_history(&db, &root, &mut ImportState::load(&db).unwrap()).unwrap();
+    write_records(&file, &[original, message("short")]);
+    let report = import_claude_history(&db, &root, &mut ImportState::load(&db).unwrap()).unwrap();
+    assert_eq!(report.messages, 1, "source UUID survives a new generation");
+    let events = db.events_for_chat("claude-rewrite", None).unwrap();
+    assert_eq!(texts(&events).iter().filter(|t| *t == "uuid message").count(), 1);
+}
+
+#[test]
+fn cwd_from_metadata_binds_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    for id in ["alpha", "user-choice"] {
+        db.upsert_project(&ProjectInfo { id: id.into(), name: id.into(), path: format!("c:/work/{id}"), aliases: vec![], description: None, last_active_at: None }).unwrap();
+    }
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let metadata = serde_json::json!({"type":"user", "isMeta":true, "cwd":"C:\\Work\\Alpha\\"});
+    let mut state = ImportState::default();
+    write_records(&root.join("before.jsonl"), &[metadata.clone(), message("before")]);
+    write_records(&root.join("after.jsonl"), &[message("after")]);
+    import_claude_history(&db, &root, &mut state).unwrap();
+    assert_eq!(db.get_chat("claude-before").unwrap().unwrap().project_id.as_deref(), Some("alpha"));
+    write_records(&root.join("after.jsonl"), &[message("after"), metadata.clone()]);
+    import_claude_history(&db, &root, &mut state).unwrap();
+    assert_eq!(db.get_chat("claude-after").unwrap().unwrap().project_id.as_deref(), Some("alpha"));
+    db.update_chat("claude-after", None, None, None, Some(Some("user-choice"))).unwrap();
+    write_records(&root.join("after.jsonl"), &[message("after"), metadata.clone(), metadata]);
+    import_claude_history(&db, &root, &mut state).unwrap();
+    assert_eq!(db.get_chat("claude-after").unwrap().unwrap().project_id.as_deref(), Some("user-choice"));
+}
+
+#[test]
+fn structured_secrets_are_masked_before_storage_and_fts() {
+    let positives = [
+        r#"{"password":"syntheticpassword"}"#,
+        r#"'token': 'synthetictoken'"#,
+        "api_key: syntheticapikey",
+        r#"{"password":"prefix\"syntheticescaped"}"#,
+        r#"'password': 'prefix\'syntheticsingle'"#,
+        r#"api_key="syntheticquotedkey""#,
+    ];
+    for text in positives {
+        let (masked, count) = mask_secrets(text);
+        assert_eq!(count, 1, "{text}");
+        assert!(!masked.contains("synthetic"), "{masked}");
+    }
+    for text in ["token_count: 5", "tokenizer: abc", "password_hint: abc", "api_keys: abc", "password: ", "password policy", r#"{"description":"token example"}"#] {
+        assert_eq!(mask_secrets(text), (text.into(), 0), "{text}");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    write_records(&root.join("secrets.jsonl"), &positives.iter().map(|t| message(t)).collect::<Vec<_>>());
+    let report = import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    assert_eq!(report.masked, positives.len());
+    assert!(texts(&db.events_for_chat("claude-secrets", None).unwrap()).iter().all(|t| !t.contains("synthetic")));
+    let conn = rusqlite::Connection::open(tmp.path().join("ultron.db")).unwrap();
+    for table in ["events", "messages_fts"] {
+        let column = if table == "events" { "payload_json" } else { "text" };
+        let leaked: i64 = conn.query_row(&format!("SELECT count(*) FROM {table} WHERE {column} LIKE '%synthetic%'"), [], |r| r.get(0)).unwrap();
+        assert_eq!(leaked, 0, "{table}");
+    }
+    for raw in ["syntheticpassword", "synthetictoken", "syntheticapikey", "syntheticescaped", "syntheticsingle", "syntheticquotedkey"] {
+        assert!(db.search_messages(None, raw, 10).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn mask_before_truncate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let arg = format!("{}https://u:syntheticpass@host/path", "x".repeat(65));
+    let record = serde_json::json!({"type":"assistant", "message":{"content":[{"type":"tool_use", "name":"Fetch", "input":{"url":arg}}]}});
+    write_records(&root.join("tool.jsonl"), &[record]);
+    let report = import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    assert_eq!(report.masked, 1);
+    let text = texts(&db.events_for_chat("claude-tool", None).unwrap()).remove(0);
+    assert!(!text.contains("u:synt"), "{text}");
+    assert!(db.search_messages(None, "synt", 10).unwrap().is_empty());
+}
+
+#[test]
+fn failed_checkpoint_rolls_back_message_and_fts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    write_records(&root.join("atomic.jsonl"), &[message("atomicmessage")]);
+    let conn = rusqlite::Connection::open(tmp.path().join("ultron.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_checkpoint BEFORE INSERT ON import_state
+         WHEN NEW.byte_offset > 0 BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;",
+    ).unwrap();
+    let mut state = ImportState::default();
+    assert!(import_claude_history(&db, &root, &mut state).is_err());
+    assert!(db.events_for_chat("claude-atomic", None).unwrap().is_empty());
+    assert!(db.search_messages(None, "atomicmessage", 10).unwrap().is_empty());
+    assert!(db.import_offsets().unwrap().is_empty());
+    conn.execute_batch("DROP TRIGGER reject_checkpoint").unwrap();
+    assert_eq!(import_claude_history(&db, &root, &mut state).unwrap().messages, 1);
+    assert_eq!(db.search_messages(None, "atomicmessage", 10).unwrap().len(), 1);
+}
+
+#[test]
+fn metadata_cwd_survives_restart_before_first_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    db.upsert_project(&ProjectInfo {
+        id: "alpha".into(), name: "Alpha".into(), path: "c:/work/alpha".into(),
+        aliases: vec![], description: None, last_active_at: None,
+    }).unwrap();
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let file = root.join("metadata.jsonl");
+    let metadata = serde_json::json!({"type":"system", "cwd":"C:\\Work\\Alpha"});
+    write_records(&file, std::slice::from_ref(&metadata));
+    assert_eq!(import_claude_history(&db, &root, &mut ImportState::default()).unwrap().chats, 0);
+    write_records(&file, &[metadata, message("first")]);
+    import_claude_history(&db, &root, &mut ImportState::load(&db).unwrap()).unwrap();
+    assert_eq!(db.get_chat("claude-metadata").unwrap().unwrap().project_id.as_deref(), Some("alpha"));
 }

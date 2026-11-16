@@ -151,3 +151,19 @@ fn route_result_round_trips_over_ipc() {
     let json = serde_json::to_value(&r).unwrap();
     assert_eq!(serde_json::from_value::<RouteResult>(json).unwrap(), r);
 }
+
+#[test]
+fn catalog_upsert_normalizes_windows_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&tmp.path().join("db")).unwrap();
+    project(&db, "alpha", "Alpha", Path::new(r"C:\Work\Alpha"), &["kept"]);
+    for path in ["c:/work/alpha", "C:/Work/Alpha/", "c:\\work\\alpha\\"] {
+        let report = import_catalog(&db, &format!("- **Updated** — `{path}` — Description")).unwrap();
+        assert_eq!((report.imported, report.updated), (0, 1));
+    }
+    let projects = db.list_projects().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].id, "alpha");
+    assert_eq!(projects[0].path, r"C:\Work\Alpha");
+    assert_eq!(projects[0].aliases, ["kept"]);
+}

@@ -36,10 +36,10 @@ fn rules() -> &'static [Rule] {
             ),
             // URL içi kullanıcı:parola@
             (r"([A-Za-z][A-Za-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@", "${1}[MASKED]@"),
-            // password= / token= / secret= (ön ekli adlar dahil) sonrası değer
+            // Atama, JSON ve YAML; kaçışlı tırnaklar değerin tamamıyla maskelenir.
             (
-                r#"(?i)\b([a-z0-9_]*(?:password|passwd|token|secret))\s*=\s*(?:"[^"]*"|'[^']*'|[^\s,;&"']+)"#,
-                "${1}=[MASKED]",
+                r#"(?im)(^|[^a-z0-9_"'])((?:"[a-z0-9_]*(?:password|passwd|token|secret|api_key)"|'[a-z0-9_]*(?:password|passwd|token|secret|api_key)'|[a-z0-9_]*(?:password|passwd|token|secret|api_key))\s*[:=][ \t]*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}&\]"']+)"#,
+                "${1}${2}[MASKED]",
             ),
         ];
         defs.iter()

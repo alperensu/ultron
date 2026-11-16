@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::secrets::mask_secrets;
-use crate::db::{Db, StoredEvent, auto_title};
+use crate::db::{Db, ImportCheckpoint, StoredEvent, auto_title};
 use crate::ipc::ImportReport;
 
 /// Tek satır üst sınırı; aşan satır atlanır (bellek koruması).
@@ -24,14 +24,14 @@ const TOOL_ARG_CHARS: usize = 80;
 /// Dosya başına işlenmiş bayt ofsetleri (kalıcı kopya `import_state` tablosundadır).
 #[derive(Debug, Default)]
 pub struct ImportState {
-    offsets: HashMap<String, u64>,
+    checkpoints: HashMap<String, ImportCheckpoint>,
 }
 
 impl ImportState {
     /// Kalıcı ofsetleri yükler.
     pub fn load(db: &Db) -> Result<ImportState> {
         Ok(ImportState {
-            offsets: db.import_offsets()?,
+            checkpoints: db.import_checkpoints()?,
         })
     }
 }
@@ -74,7 +74,7 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn norm_path(p: &str) -> String {
-    p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+    crate::db::normalized_project_path(p)
 }
 
 fn sanitize_id(s: &str) -> String {
@@ -87,6 +87,20 @@ fn sanitize_id(s: &str) -> String {
             }
         })
         .collect()
+}
+
+// Süreç yeniden başlatıldığında değişmeyen 128 bit içerik parmak izi.
+// İki bağımsız FNV-1a akışı; Rust'ın sürüme bağlı DefaultHasher'ı kullanılmaz.
+fn fingerprint(parts: &[&[u8]]) -> String {
+    let mut a = 0xcbf29ce484222325_u64;
+    let mut b = 0x84222325cbf29ce4_u64;
+    for part in parts {
+        for byte in (part.len() as u64).to_le_bytes().iter().chain(part.iter()) {
+            a = (a ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+            b = (b ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{a:016x}{b:016x}")
 }
 
 /// Bir satırı okur. `None`: dosya sonu. `Some((bytes, tam_mı))`; aşırı uzun satır
@@ -135,45 +149,77 @@ fn import_file(
 ) -> Result<()> {
     let key = file.to_string_lossy().to_string();
     let len = std::fs::metadata(file)?.len();
-    let mut offset = state.offsets.get(&key).copied().unwrap_or(0);
-    if offset > len {
-        offset = 0; // dosya kısalmış/yeniden yazılmış
+    let mut checkpoint = match state.checkpoints.get(&key) {
+        Some(saved) => saved.clone(),
+        None => {
+            // Ofset belleği sıfırlansa bile kalıcı nesli koru; kimlikler tekrar etmez.
+            let mut saved = db.import_checkpoints()?.remove(&key).unwrap_or_default();
+            saved.offset = 0;
+            saved
+        }
+    };
+    let mut reader = BufReader::new(File::open(file)?);
+    let first_hash = read_line(&mut reader)?
+        .filter(|(_, complete, _)| *complete)
+        .map(|(line, _, _)| fingerprint(&[&line]));
+    let rewritten = len < checkpoint.file_size
+        || checkpoint
+            .first_line_hash
+            .as_ref()
+            .zip(first_hash.as_ref())
+            .is_some_and(|(old, new)| old != new);
+    if rewritten {
+        checkpoint.generation += 1;
+        checkpoint.offset = 0;
+        checkpoint.session_cwd = None;
     }
-    if offset == len {
-        return Ok(());
-    }
-    let mut f = File::open(file)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut reader = BufReader::new(f);
+    checkpoint.file_size = len;
+    checkpoint.first_line_hash = first_hash;
+    reader.seek(SeekFrom::Start(checkpoint.offset))?;
 
     let stem = file
         .file_stem()
         .map(|s| sanitize_id(&s.to_string_lossy()))
         .unwrap_or_default();
     let chat_id = format!("claude-{stem}");
-    let mut seq: Option<i64> = None;
     let mut touched = false;
-    let mut last_ts: Option<DateTime<Utc>> = None;
+    let mut project = checkpoint.session_cwd.as_deref().and_then(|cwd| {
+        projects
+            .iter()
+            .find(|(_, path)| path == cwd)
+            .map(|(id, _)| id.clone())
+    });
 
     while let Some((line, complete, consumed)) = read_line(&mut reader)? {
         if !complete {
             break; // yarım yazılmış son satır; sonraki çalıştırmada
         }
-        let line_start = offset;
-        offset += consumed;
+        let line_start = checkpoint.offset;
+        checkpoint.offset += consumed;
         let text = String::from_utf8_lossy(&line);
         let text = text.trim();
         if text.is_empty() {
+            db.commit_import_record(&key, &checkpoint, None)?;
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             report.skipped += 1;
+            db.commit_import_record(&key, &checkpoint, None)?;
             continue;
         };
-        let Some((kind, body)) = extract_message(&v) else {
+        // cwd, mesaj olmayan metadata kayıtlarında da bulunabilir.
+        if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
+            let cwd = norm_path(cwd);
+            if let Some((id, _)) = projects.iter().find(|(_, path)| *path == cwd) {
+                project = Some(id.clone());
+                db.bind_chat_project(&chat_id, id)?;
+            }
+            checkpoint.session_cwd = Some(cwd);
+        }
+        let Some((kind, body, masked)) = extract_message(&v) else {
+            db.commit_import_record(&key, &checkpoint, None)?;
             continue;
         };
-        let (body, masked) = mask_secrets(&body);
         let ts = v
             .get("timestamp")
             .and_then(Value::as_str)
@@ -185,53 +231,55 @@ fn import_file(
             touched = true;
             report.files += 1;
         }
-        if seq.is_none() {
-            if db.get_chat(&chat_id)?.is_none() {
-                let cwd = v.get("cwd").and_then(Value::as_str).map(norm_path);
-                let project = cwd.and_then(|c| {
-                    projects
-                        .iter()
-                        .find(|(_, p)| *p == c)
-                        .map(|(id, _)| id.as_str())
-                });
-                let title = if kind == "user_text" {
-                    auto_title(&body)
-                } else {
-                    String::new()
-                };
-                db.insert_chat(&chat_id, project, &title, ts)?;
-                report.chats += 1;
-            }
-            seq = Some(db.next_seq(&chat_id)?);
+        if db.get_chat(&chat_id)?.is_none() {
+            let title = if kind == "user_text" {
+                auto_title(&body)
+            } else {
+                String::new()
+            };
+            db.insert_chat(&chat_id, project.as_deref(), &title, ts)?;
+            report.chats += 1;
         }
-        let n = seq.unwrap_or(1);
+        if let Some(project) = &project {
+            db.bind_chat_project(&chat_id, project)?;
+        }
+        let source_id = if let Some(uuid) = v
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            fingerprint(&[key.as_bytes(), b"uuid", uuid.as_bytes()])
+        } else {
+            fingerprint(&[
+                key.as_bytes(),
+                b"content",
+                &checkpoint.generation.to_le_bytes(),
+                &line_start.to_le_bytes(),
+                text.as_bytes(),
+            ])
+        };
         let ev = StoredEvent {
-            id: format!("imp-{stem}-{line_start}"),
+            id: format!("imp-{source_id}"),
             chat_id: chat_id.clone(),
             session_id: None,
-            seq: n,
+            seq: 0, // İşlem içinde tahsis edilir.
             ts,
             kind: kind.to_string(),
             payload: serde_json::json!({"text": body, "source": "claude-imported"}),
         };
-        if db.insert_event(&ev)? {
-            seq = Some(n + 1);
+        if db.commit_import_record(&key, &checkpoint, Some(&ev))? {
             report.messages += 1;
             report.masked += masked;
-            last_ts = Some(ts);
         }
     }
 
-    if let Some(ts) = last_ts {
-        db.set_chat_updated_at(&chat_id, ts)?;
-    }
-    db.set_import_offset(&key, offset)?;
-    state.offsets.insert(key, offset);
+    db.commit_import_record(&key, &checkpoint, None)?;
+    state.checkpoints.insert(key, checkpoint);
     Ok(())
 }
 
 /// Satırdan (olay türü, metin) çıkarır; metin içermeyen satırlar `None`.
-fn extract_message(v: &Value) -> Option<(&'static str, String)> {
+fn extract_message(v: &Value) -> Option<(&'static str, String, usize)> {
     let kind = match v.get("type").and_then(Value::as_str)? {
         "user" => "user_text",
         "assistant" => "assistant_text",
@@ -242,17 +290,28 @@ fn extract_message(v: &Value) -> Option<(&'static str, String)> {
     }
     let content = v.get("message")?.get("content")?;
     let mut parts: Vec<String> = Vec::new();
+    let mut masked = 0;
     match content {
-        Value::String(s) => parts.push(s.clone()),
+        Value::String(s) => {
+            let (text, count) = mask_secrets(s);
+            parts.push(text);
+            masked += count;
+        }
         Value::Array(blocks) => {
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            parts.push(t.to_string());
+                            let (text, count) = mask_secrets(t);
+                            parts.push(text);
+                            masked += count;
                         }
                     }
-                    Some("tool_use") => parts.push(tool_summary(b)),
+                    Some("tool_use") => {
+                        let (summary, count) = tool_summary(b);
+                        parts.push(summary);
+                        masked += count;
+                    }
                     // thinking, tool_result, görseller: alınmaz
                     _ => {}
                 }
@@ -268,24 +327,27 @@ fn extract_message(v: &Value) -> Option<(&'static str, String)> {
     if joined.trim().is_empty() {
         None
     } else {
-        Some((kind, joined))
+        Some((kind, joined, masked))
     }
 }
 
-fn tool_summary(b: &Value) -> String {
+fn tool_summary(b: &Value) -> (String, usize) {
     let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
+    let (name, mut masked) = mask_secrets(name);
     let arg = b
         .get("input")
         .and_then(Value::as_object)
         .and_then(|o| o.values().find_map(Value::as_str))
         .map(|s| {
+            let (s, count) = mask_secrets(s);
+            masked += count;
             let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
             flat.chars().take(TOOL_ARG_CHARS).collect::<String>()
         })
         .unwrap_or_default();
     if arg.is_empty() {
-        format!("[araç: {name}]")
+        (format!("[araç: {name}]"), masked)
     } else {
-        format!("[araç: {name} {arg}]")
+        (format!("[araç: {name} {arg}]"), masked)
     }
 }

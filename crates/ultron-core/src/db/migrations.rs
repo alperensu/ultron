@@ -70,6 +70,19 @@ const MIGRATIONS: &[&str] = &[
         updated_at TEXT NOT NULL
     );
     "#,
+    // v5: dosya yeniden yazımlarını ve mesaj dışı cwd bilgisini kalıcı izle.
+    r#"
+    ALTER TABLE import_state ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE import_state ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE import_state ADD COLUMN first_line_hash TEXT;
+    ALTER TABLE import_state ADD COLUMN session_cwd TEXT;
+    UPDATE import_state SET file_size = byte_offset;
+    "#,
+    // v6: gösterim yolunu ve mevcut proje/sohbet kimliklerini koruyan arama anahtarı.
+    r#"
+    ALTER TABLE projects ADD COLUMN path_key TEXT NOT NULL DEFAULT '';
+    CREATE INDEX projects_path_key ON projects(path_key);
+    "#,
 ];
 
 /// Bekleyen migrasyonları `user_version` üzerinden sırayla uygular.
@@ -82,6 +95,18 @@ pub fn apply(conn: &Connection) -> Result<()> {
         }
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(sql)?;
+        if version == 6 {
+            // SQLite LOWER yalnız ASCII işler; uygulamayla aynı Unicode kuralını kullan.
+            let paths = {
+                let mut stmt = tx.prepare("SELECT id, path FROM projects")?;
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (id, path) in paths {
+                tx.execute("UPDATE projects SET path_key = ?2 WHERE id = ?1",
+                    rusqlite::params![id, super::normalized_project_path(&path)])?;
+            }
+        }
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
     }
@@ -91,6 +116,29 @@ pub fn apply(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_key_migration_backfills_without_changing_existing_projects() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for (idx, sql) in MIGRATIONS.iter().take(4).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", (idx + 1) as i64).unwrap();
+        }
+        for (id, path) in [("p1", r"C:\Work\Alpha\"), ("p2", "c:/work/alpha"), ("p3", "C:/ÖDEME/")] {
+            conn.execute("INSERT INTO projects(id, name, path, aliases_json) VALUES (?1, ?1, ?2, '[\"kept\"]')", rusqlite::params![id, path]).unwrap();
+        }
+        conn.execute("INSERT INTO chats(id, project_id, created_at) VALUES ('chat', 'p2', '2026-01-01T00:00:00Z')", []).unwrap();
+        conn.execute("INSERT INTO import_state(path, byte_offset, updated_at) VALUES ('source', 42, '2026-01-01T00:00:00Z')", []).unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let keys: Vec<String> = conn.prepare("SELECT path_key FROM projects ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(keys, ["c:/work/alpha", "c:/work/alpha", "c:/ödeme"]);
+        let row: (String, String, String) = conn.query_row("SELECT path, aliases_json, project_id FROM projects JOIN chats ON projects.id = chats.project_id", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(row, ("c:/work/alpha".into(), "[\"kept\"]".into(), "p2".into()));
+        let state: (i64, i64, i64) = conn.query_row("SELECT byte_offset, file_size, generation FROM import_state", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(state, (42, 42, 0));
+    }
 
     #[test]
     fn migration_v3_is_additive() {
