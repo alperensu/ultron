@@ -53,6 +53,8 @@ struct State {
     keep: KeepAwake,
     default_engine: EngineId,
     turns: Mutex<JoinSet<()>>,
+    paths: Paths,
+    quota: ultron_core::quota::QuotaService,
 }
 
 /// Çalışan sunucunun tutamacı.
@@ -176,6 +178,8 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
         keep: keep.clone(),
         default_engine: cfg.default_engine,
         turns: Mutex::new(JoinSet::new()),
+        paths: paths.clone(),
+        quota: ultron_core::quota::QuotaService::from_env(),
     });
 
     let cancel = CancellationToken::new();
@@ -317,6 +321,30 @@ async fn ok(writer: &mut Writer, data: Value) -> Result<()> {
 }
 
 /// Sonraki görevlerde gerçeklenecek istekler için dürüst hata (sahte veri yok).
+/// `config.toml` içindeki `[reset_rights]` tablosunu günceller (diğer anahtarlar korunur,
+/// yorumlar korunmaz); geçici dosya + yeniden adlandırma ile yazılır.
+fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
+    if !matches!(pool, "claude" | "codex") {
+        return Err(anyhow!("geçersiz havuz: {pool} (claude|codex)"));
+    }
+    let file = paths.root.join("config.toml");
+    let mut table: toml::Table = if file.exists() {
+        std::fs::read_to_string(&file)?.parse()?
+    } else {
+        toml::Table::new()
+    };
+    let rights = table
+        .entry("reset_rights")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config.toml: reset_rights tablo olmalı"))?;
+    rights.insert(pool.to_string(), toml::Value::Integer(i64::from(count)));
+    let tmp = paths.root.join("config.toml.tmp");
+    std::fs::write(&tmp, toml::to_string(&table)?)?;
+    std::fs::rename(&tmp, &file)?;
+    Ok(())
+}
+
 async fn not_implemented(writer: &mut Writer, task: u8) -> Result<Flow> {
     send_error(writer, format!("henüz uygulanmadı (Aşama 2 Task {task})")).await;
     Ok(Flow::Continue)
@@ -400,8 +428,18 @@ async fn dispatch(
             ok(writer, json!({"chat": chat})).await?;
             Ok(Flow::Continue)
         }
-        Request::GetQuota => not_implemented(writer, 5).await,
-        Request::SetResetRights { .. } => not_implemented(writer, 5).await,
+        Request::GetQuota => {
+            // Her istekte taze okunur: [reset_rights] ve claude_live_quota elle/arayüzden değişebilir.
+            let cfg = ultron_core::Config::load(&st.paths)?;
+            let report = st.quota.report(&cfg, chrono::Utc::now()).await;
+            ok(writer, json!({"quota": report})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::SetResetRights { pool, count } => {
+            set_reset_rights(&st.paths, &pool, count)?;
+            ok(writer, json!({"pool": pool, "count": count})).await?;
+            Ok(Flow::Continue)
+        }
         Request::ImportCatalog { .. } => not_implemented(writer, 3).await,
         Request::ImportClaudeHistory { .. } => not_implemented(writer, 4).await,
         Request::Route { .. } => not_implemented(writer, 3).await,
