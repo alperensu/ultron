@@ -154,6 +154,7 @@ pub async fn run_turn(
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
     let mut quota = false;
+    let mut last_error: Option<String> = None;
     let mut cancelled = false;
     let mut status: Option<std::process::ExitStatus> = None;
     let mut grace_deadline: Option<Instant> = None;
@@ -222,6 +223,9 @@ pub async fn run_turn(
                         if matches!(ev, EngineEvent::QuotaExhausted { .. }) {
                             quota = true;
                         }
+                        if let EngineEvent::Error { message } = &ev {
+                            last_error = Some(message.clone());
+                        }
                         // Alıcı kapandıysa tur yine de sonlanana dek okunur.
                         let _ = sink.send(ev).await;
                     }
@@ -284,11 +288,39 @@ pub async fn run_turn(
     } else {
         Ok(TurnOutcome::Failed {
             exit_code: status.code(),
-            stderr_excerpt: excerpt(
+            stderr_excerpt: failure_excerpt(
                 &String::from_utf8_lossy(&stderr_bytes),
-                DEFAULT_EXCERPT_CHARS,
+                last_error.as_deref(),
             ),
         })
+    }
+}
+
+/// Hata özeti: stderr doluysa o; boşsa (ör. Codex hatayı stdout JSON'unda bildirir) motorun
+/// son `Error` olayının mesajı.
+pub(crate) fn failure_excerpt(stderr: &str, last_error: Option<&str>) -> String {
+    if stderr.trim().is_empty()
+        && let Some(msg) = last_error
+    {
+        return excerpt(msg, DEFAULT_EXCERPT_CHARS);
+    }
+    excerpt(stderr, DEFAULT_EXCERPT_CHARS)
+}
+
+#[cfg(test)]
+mod failure_excerpt_tests {
+    use super::failure_excerpt;
+
+    #[test]
+    fn empty_stderr_falls_back_to_engine_error() {
+        let got = failure_excerpt("", Some("model_not_found: desteklenmiyor"));
+        assert!(got.contains("model_not_found"), "{got}");
+    }
+
+    #[test]
+    fn stderr_wins_when_present() {
+        let got = failure_excerpt("stderr metni", Some("motor hatası"));
+        assert!(got.contains("stderr metni") && !got.contains("motor hatası"), "{got}");
     }
 }
 
