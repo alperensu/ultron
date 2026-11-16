@@ -161,7 +161,11 @@ impl QuotaService {
     /// Tüm havuzların raporu.
     pub async fn report(&self, cfg: &Config, now: DateTime<Utc>) -> QuotaReport {
         let (claude_w, note) = self.claude_windows(cfg, now).await;
-        let codex_w = codex::read_codex_windows(&self.sources.codex_sessions, now);
+        let root = self.sources.codex_sessions.clone();
+        // Dosya taraması bloklayıcı: async çalışma zamanını tutmamak için ayrı iş parçacığında.
+        let codex_w = tokio::task::spawn_blocking(move || codex::read_codex_windows(&root, now))
+            .await
+            .unwrap_or_default();
         let mk = |pool, windows: Vec<QuotaWindow>, rights, note| PoolReport {
             pool,
             mode: budget_mode(&windows, now),
