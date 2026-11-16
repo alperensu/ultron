@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use ultron_core::db::StoredEvent;
-use ultron_core::ipc::{Client, Request, Response};
+use ultron_core::ipc::{ChatInfo, Client, Request, Response};
 
-use crate::bridge::Bridge;
+use crate::bridge::{Bridge, BridgeError};
 
 /// Webview'in dinlediği olay adı.
 pub const EVENT_NAME: &str = "ultron://event";
@@ -27,6 +27,13 @@ impl Default for Backoff {
             max: Duration::from_secs(8),
         }
     }
+}
+
+/// Servis bağlantı durumu; yalnız geçişlerde bildirilir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonStatus {
+    Ready,
+    Unavailable(BridgeError),
 }
 
 /// Sohbet başına iletilen son sıra; tekrarları eler.
@@ -48,6 +55,15 @@ impl Cursors {
     }
 }
 
+/// Köprünün bildiği durum: imleçler ve görülen sohbetler (`id -> updated_at`). İlk başarılı
+/// uzlaşmada eski geçmiş geri yüklenmez; yalnız taban çizgisi alınır.
+#[derive(Default)]
+struct Sync {
+    cursors: Cursors,
+    known: HashMap<String, String>,
+    initialized: bool,
+}
+
 /// Bir sohbetin `after_seq` sonrasını kalıcı günlükten çekip sırayla iletir.
 async fn catch_up<F: FnMut(StoredEvent)>(
     bridge: &Bridge,
@@ -61,6 +77,7 @@ async fn catch_up<F: FnMut(StoredEvent)>(
             chat_id: Some(chat.to_string()),
             follow: false,
             after_seq: cursors.last(chat),
+            limit: None,
         })
         .await?;
     loop {
@@ -76,27 +93,58 @@ async fn catch_up<F: FnMut(StoredEvent)>(
     }
 }
 
-async fn follow_once<F: FnMut(StoredEvent)>(
+/// Yeniden bağlanınca kaçanları tamamlar: imleci olan sohbetler imlecinden, kopukken oluşan veya
+/// değişen sohbetler (`ListChats`) baştan (seq 0). İlk uzlaşmada yalnız taban çizgisi alınır.
+async fn reconcile<F: FnMut(StoredEvent)>(
     bridge: &Bridge,
-    cursors: &mut Cursors,
+    sync: &mut Sync,
     emit: &mut F,
+) -> anyhow::Result<()> {
+    let data = bridge
+        .request(Request::ListChats {
+            project_id: None,
+            include_archived: true,
+        })
+        .await?;
+    let chats: Vec<ChatInfo> = serde_json::from_value(data["chats"].clone())?;
+    for chat in chats {
+        let changed = sync
+            .known
+            .get(&chat.id)
+            .is_none_or(|u| *u != chat.updated_at);
+        let stale = sync.initialized && changed;
+        if sync.cursors.last(&chat.id).is_some() || stale {
+            catch_up(bridge, &chat.id, &mut sync.cursors, emit).await?;
+        }
+        sync.known.insert(chat.id, chat.updated_at);
+    }
+    sync.initialized = true;
+    Ok(())
+}
+
+async fn follow_once<F: FnMut(StoredEvent), G: FnMut(DaemonStatus)>(
+    bridge: &Bridge,
+    sync: &mut Sync,
+    emit: &mut F,
+    on_state: &mut G,
     cancel: &CancellationToken,
     connected: &mut bool,
 ) -> anyhow::Result<()> {
+    // Önce abone ol: bu andan sonraki olaylar akışta (boruda) bekler.
     let mut client: Client = bridge.connect().await?;
     client
         .send(&Request::Events {
             chat_id: None,
             follow: true,
             after_seq: None,
+            limit: None,
         })
         .await?;
     *connected = true;
-    // Kopukken kaçan olayları bilinen sohbetler için tamamla.
-    let known: Vec<String> = cursors.0.keys().cloned().collect();
-    for chat in known {
-        catch_up(bridge, &chat, cursors, emit).await?;
-    }
+    on_state(DaemonStatus::Ready);
+    // Sonra kaçanları günlükten tamamla; ardından bekleyen canlı olaylar tekrarsız akar
+    // (`Cursors::accept` yinelenenleri eler).
+    reconcile(bridge, sync, emit).await?;
     loop {
         let resp = tokio::select! {
             () = cancel.cancelled() => return Ok(()),
@@ -104,13 +152,13 @@ async fn follow_once<F: FnMut(StoredEvent)>(
         };
         match resp {
             Some(Response::Event(ev)) => {
-                // Boşluk (kaçan sıra) varsa günlükten tamamla; sonra bu olayı ilet.
-                if let Some(last) = cursors.last(&ev.chat_id)
-                    && ev.seq > last + 1
-                {
-                    catch_up(bridge, &ev.chat_id, cursors, emit).await?;
+                // Boşluk varsa (bilinen sohbette atlanan sıra ya da ilk olayı seq > 1 olan
+                // sohbet) eksik öneki günlükten tamamla; sonra bu olayı ilet.
+                let last = sync.cursors.last(&ev.chat_id).unwrap_or(0);
+                if ev.seq > last + 1 {
+                    catch_up(bridge, &ev.chat_id, &mut sync.cursors, emit).await?;
                 }
-                if cursors.accept(&ev) {
+                if sync.cursors.accept(&ev) {
                     emit(ev);
                 }
             }
@@ -126,13 +174,40 @@ pub async fn run_follow<F: FnMut(StoredEvent)>(
     bridge: &Bridge,
     backoff: Backoff,
     cancel: CancellationToken,
-    mut emit: F,
+    emit: F,
 ) {
-    let mut cursors = Cursors::default();
+    run_follow_with_state(bridge, backoff, cancel, emit, |_| {}).await;
+}
+
+/// `run_follow` + servis durumu: bağlanınca `Ready`, bağlanamayınca/kopunca `Unavailable`
+/// (yalnız durum değişiminde).
+pub async fn run_follow_with_state<F: FnMut(StoredEvent), G: FnMut(DaemonStatus)>(
+    bridge: &Bridge,
+    backoff: Backoff,
+    cancel: CancellationToken,
+    mut emit: F,
+    mut on_state: G,
+) {
+    let mut sync = Sync::default();
     let mut delay = backoff.initial;
+    let mut last: Option<DaemonStatus> = None;
+    let mut notify = |status: DaemonStatus| {
+        if last.as_ref() != Some(&status) {
+            last = Some(status.clone());
+            on_state(status);
+        }
+    };
     while !cancel.is_cancelled() {
         let mut connected = false;
-        let result = follow_once(bridge, &mut cursors, &mut emit, &cancel, &mut connected).await;
+        let result = follow_once(
+            bridge,
+            &mut sync,
+            &mut emit,
+            &mut notify,
+            &cancel,
+            &mut connected,
+        )
+        .await;
         if cancel.is_cancelled() {
             return;
         }
@@ -141,6 +216,13 @@ pub async fn run_follow<F: FnMut(StoredEvent)>(
         }
         if let Err(e) = result {
             tracing::warn!(error = %format!("{e:#}"), "olay akışı koptu, yeniden denenecek");
+            let err = match e.downcast::<BridgeError>() {
+                Ok(b) => b,
+                Err(e) => BridgeError::DaemonUnavailable {
+                    reason: format!("{e:#}"),
+                },
+            };
+            notify(DaemonStatus::Unavailable(err));
         }
         tokio::select! {
             () = cancel.cancelled() => return,

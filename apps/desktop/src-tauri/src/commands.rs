@@ -129,6 +129,8 @@ pub async fn read_events_page(
             chat_id: Some(chat_id.to_string()),
             follow: false,
             after_seq,
+            // Bir fazla iste: `has_more`'u sayfa sonrası olaydan anlarız, akış temiz kapanır.
+            limit: Some(u32::try_from(limit + 1).unwrap_or(u32::MAX)),
         })
         .await
         .map_err(proto)?;
@@ -171,12 +173,34 @@ pub async fn list_chats(b: Shared<'_>, args: ListChatsArgs) -> Out {
     .await
 }
 
+/// Servis zarfındaki (`{"<anahtar>": ...}`) iç değeri çıkarır; zarf yoksa tipli protokol hatası.
+fn unwrap_field(mut data: Value, key: &str) -> Out {
+    data.get_mut(key)
+        .map(Value::take)
+        .ok_or_else(|| BridgeError::Protocol {
+            message: format!("yanıtta `{key}` alanı yok"),
+        })
+}
+
+/// `GetChat`: servis `{chat: ChatDetail}` döner; webview doğrudan `ChatDetail` alır.
+pub async fn read_chat_detail(bridge: &Bridge, chat_id: &str) -> Out {
+    let data = bridge
+        .request(Request::GetChat {
+            chat_id: chat_id.to_string(),
+        })
+        .await?;
+    unwrap_field(data, "chat")
+}
+
+/// `ImportClaudeHistory`: servis `{report: ImportReport}` döner; webview doğrudan raporu alır.
+pub async fn read_history_import(bridge: &Bridge, root: Option<String>) -> Out {
+    let data = bridge.request(Request::ImportClaudeHistory { root }).await?;
+    unwrap_field(data, "report")
+}
+
 #[tauri::command]
 pub async fn get_chat(b: Shared<'_>, args: ChatIdArgs) -> Out {
-    b.request(Request::GetChat {
-        chat_id: args.chat_id,
-    })
-    .await
+    read_chat_detail(&b, &args.chat_id).await
 }
 
 #[tauri::command]
@@ -262,8 +286,7 @@ pub async fn import_catalog(b: Shared<'_>, args: PathArgs) -> Out {
 
 #[tauri::command]
 pub async fn import_claude_history(b: Shared<'_>, args: HistoryArgs) -> Out {
-    b.request(Request::ImportClaudeHistory { root: args.root })
-        .await
+    read_history_import(&b, args.root).await
 }
 
 #[tauri::command]

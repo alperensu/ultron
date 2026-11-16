@@ -67,3 +67,26 @@ describe("sahte köprü", () => {
     await expect(down.status()).rejects.toMatchObject({ kind: "daemon_unavailable" });
   });
 });
+
+describe("komut JSON sözleşmesi (Rust testindeki alan listeleriyle aynı)", () => {
+  const chat = {
+    id: "c1",
+    title: "t",
+    project_id: null,
+    pinned: false,
+    archived: false,
+    updated_at: "2026-01-01T00:00:00Z",
+    engine: "claude" as const,
+  };
+  const sorted = (o: object) => Object.keys(o).sort();
+
+  it("sahte köprü gerçek servisle aynı biçimleri döndürür", async () => {
+    const b = createFakeBridge({ chats: [chat] });
+    const detail = await b.getChat("c1");
+    expect(sorted(detail)).toEqual(["chat", "last_engine", "work_state"]);
+    expect(sorted(detail.chat)).toEqual(sorted(chat));
+    expect(sorted(await b.importCatalog("x.md"))).toEqual(["imported", "updated"]);
+    expect(sorted(await b.importClaudeHistory())).toEqual(["chats", "files", "masked", "messages", "skipped"]);
+    expect(sorted(await b.status())).toEqual(["default_engine", "pid", "running_turns", "version"]);
+  });
+});

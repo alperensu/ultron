@@ -298,6 +298,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     chat_id: Some(chat),
                     follow,
                     after_seq: None,
+                    limit: None,
                 })
                 .await?;
             stream(&mut client, true).await?;

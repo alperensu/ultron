@@ -106,6 +106,7 @@ async fn events_follow_receives_live_events() {
             chat_id: Some("canli".into()),
             follow: true,
             after_seq: None,
+            limit: None,
         })
         .await
         .unwrap();
@@ -386,6 +387,7 @@ async fn global_follow_catches_up_after_lag() {
             chat_id: None,
             follow: true,
             after_seq: None,
+            limit: None,
         })
         .await
         .unwrap();

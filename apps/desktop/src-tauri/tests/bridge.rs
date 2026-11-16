@@ -119,9 +119,24 @@ async fn bridge_starts_daemon_or_reports_error() {
     let bridge = Bridge::new(paths, Some(exe));
     let status = bridge.request(Request::Status).await.expect("servis başlamalı");
     let pid = status["pid"].as_u64().expect("pid");
-    // Henüz uygulanmamış istek uydurma veri yerine tipli servis hatası verir.
-    match bridge.request(Request::GetQuota).await {
-        Err(BridgeError::Daemon { message }) => assert!(message.contains("uygulanmadı")),
+    // Başlatılan servis diğer komutlara da gerçekten yanıt verir.
+    bridge.request(Request::GetQuota).await.expect("GetQuota yanıtlanmalı");
+    let chats = bridge
+        .request(Request::ListChats {
+            project_id: None,
+            include_archived: false,
+        })
+        .await
+        .expect("ListChats yanıtlanmalı");
+    assert!(chats["chats"].is_array());
+    // Var olmayan sohbet: tipli servis hatası (uydurma veri yok).
+    match bridge
+        .request(Request::GetChat {
+            chat_id: "yok".into(),
+        })
+        .await
+    {
+        Err(BridgeError::Daemon { message }) => assert!(message.contains("bulunamadı")),
         other => panic!("Daemon hatası beklenirdi: {other:?}"),
     }
     let _ = std::process::Command::new("taskkill")
@@ -177,6 +192,306 @@ async fn event_bridge_resumes_after_reconnect() {
 
     cancel.cancel();
     let _ = follower.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn events_page_respects_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bridge = Bridge::new(paths.clone(), None);
+    let server = start_server(&paths, &pipe).await;
+    run_turn(&bridge, &cwd, "c1").await;
+
+    // Servis sınırı kendisi uygular: tam `limit` olay, sonra `done`.
+    let mut client = bridge.connect().await.unwrap();
+    client
+        .send(&Request::Events {
+            chat_id: Some("c1".into()),
+            follow: false,
+            after_seq: None,
+            limit: Some(2),
+        })
+        .await
+        .unwrap();
+    let mut seqs = Vec::new();
+    loop {
+        match client.next().await.unwrap() {
+            Some(ultron_core::ipc::Response::Event(e)) => seqs.push(e.seq),
+            Some(ultron_core::ipc::Response::Ok { data }) => {
+                assert_eq!(data["done"], true);
+                break;
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+    assert_eq!(seqs, vec![1, 2]);
+
+    let page = ultron_desktop::commands::read_events_page(&bridge, "c1", None, 2)
+        .await
+        .unwrap();
+    assert_eq!(page["events"].as_array().unwrap().len(), 2);
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["next_after_seq"], 2);
+    let rest = ultron_desktop::commands::read_events_page(&bridge, "c1", Some(2), 50)
+        .await
+        .unwrap();
+    assert_eq!(rest["has_more"], false);
+    server.shutdown().await;
+}
+
+type Seen = Vec<(String, i64)>;
+
+fn spawn_follower(
+    bridge: &Arc<Bridge>,
+    backoff: Backoff,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<(String, i64)>,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let handle = {
+        let bridge = bridge.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            run_follow(&bridge, backoff, cancel, move |ev| {
+                let _ = tx.send((ev.chat_id.clone(), ev.seq));
+            })
+            .await;
+        })
+    };
+    (rx, cancel, handle)
+}
+
+async fn collect_until(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, i64)>,
+    seen: &mut Seen,
+    done: impl Fn(&Seen) -> bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    while !done(seen) {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(item)) => seen.push(item),
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn seqs_of(seen: &Seen, chat: &str) -> Vec<i64> {
+    seen.iter()
+        .filter(|(c, _)| c == chat)
+        .map(|(_, s)| *s)
+        .collect()
+}
+
+#[tokio::test]
+async fn reconnect_discovers_chat_created_while_offline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let server = start_server(&paths, &pipe).await;
+    // Uzun geri çekilme: servis dönene dek takipçi çevrimdışı kalır.
+    let slow = Backoff {
+        initial: Duration::from_secs(4),
+        max: Duration::from_secs(4),
+    };
+    let (mut rx, cancel, follower) = spawn_follower(&bridge, slow);
+    run_turn(&bridge, &cwd, "c1").await;
+    let mut seen = Seen::new();
+    assert!(collect_until(&mut rx, &mut seen, |s| s.len() >= 3).await);
+
+    server.shutdown().await;
+    let server = start_server(&paths, &pipe).await;
+    // Takipçi uykudayken yeni sohbet oluşur ve tamamlanır.
+    run_turn(&bridge, &cwd, "c2").await;
+    let ok = collect_until(&mut rx, &mut seen, |s| seqs_of(s, "c2").len() >= 3).await;
+    assert!(ok, "çevrimdışıyken oluşan sohbet bulunamadı: {seen:?}");
+    // Baştan, ardışık, tekrarsız (c2 çevrimdışıyken tamamlandı).
+    let c2 = seqs_of(&seen, "c2");
+    assert_eq!(c2, (1..=c2.len() as i64).collect::<Vec<_>>());
+    let c1 = seqs_of(&seen, "c1");
+    assert!(c1.len() >= 3);
+    assert_eq!(c1, (1..=c1.len() as i64).collect::<Vec<_>>());
+
+    cancel.cancel();
+    let _ = follower.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn first_event_gap_fetches_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let server = start_server(&paths, &pipe).await;
+    // Takipçi başlamadan c1'in ilk turu (seq 1..=3) yazılır.
+    run_turn(&bridge, &cwd, "c1").await;
+    let (mut rx, cancel, follower) = spawn_follower(&bridge, Backoff::default());
+    // Taban çizgisi alınana dek bekle, sonra ikinci tur: takipçinin gördüğü ilk canlı olay seq 4.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    run_turn(&bridge, &cwd, "c1").await;
+    let mut seen = Seen::new();
+    let ok = collect_until(&mut rx, &mut seen, |s| s.len() >= 6).await;
+    assert!(ok, "olaylar tamamlanmadı: {seen:?}");
+    assert_eq!(seqs_of(&seen, "c1"), vec![1, 2, 3, 4, 5, 6]);
+
+    cancel.cancel();
+    let _ = follower.await;
+    server.shutdown().await;
+}
+
+async fn next_status(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ultron_desktop::events::DaemonStatus>,
+) -> ultron_desktop::events::DaemonStatus {
+    tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("durum zaman aşımı")
+        .expect("kanal")
+}
+
+#[tokio::test]
+async fn daemon_state_follows_connection() {
+    use ultron_desktop::events::{DaemonStatus, run_follow_with_state};
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let follower = {
+        let bridge = bridge.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let backoff = Backoff {
+                initial: Duration::from_millis(100),
+                max: Duration::from_millis(300),
+            };
+            run_follow_with_state(&bridge, backoff, cancel, |_| {}, move |s| {
+                let _ = tx.send(s);
+            })
+            .await;
+        })
+    };
+    // Servis yok: unavailable (tekrarlar tek bildirimde birleşir).
+    assert!(matches!(next_status(&mut rx).await, DaemonStatus::Unavailable(_)));
+    // Servis sonradan gelir: ready.
+    let server = start_server(&paths, &pipe).await;
+    assert_eq!(next_status(&mut rx).await, DaemonStatus::Ready);
+    // Servis düşer: unavailable.
+    server.shutdown().await;
+    assert!(matches!(next_status(&mut rx).await, DaemonStatus::Unavailable(_)));
+
+    cancel.cancel();
+    let _ = follower.await;
+}
+
+fn keys(v: &serde_json::Value) -> Vec<String> {
+    let mut k: Vec<String> = v.as_object().expect("nesne").keys().cloned().collect();
+    k.sort();
+    k
+}
+
+/// Sözleşme: webview'in aldığı JSON biçimi `src/lib/bridge.ts` tipleriyle birebir (alan kümeleri
+/// ve çekirdek tiplerle tipli ayrıştırma). TS tarafı aynı alan listelerini `bridge.test.ts` sınar.
+#[tokio::test]
+async fn command_json_shapes_match_ts_types() {
+    use ultron_core::ipc::{CatalogImportReport, ChatDetail, ChatInfo, ImportReport, ProjectInfo};
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bridge = Bridge::new(paths.clone(), None);
+    let server = start_server(&paths, &pipe).await;
+    run_turn(&bridge, &cwd, "c1").await;
+
+    // getChat: zarf açılır, doğrudan ChatDetail.
+    let detail = ultron_desktop::commands::read_chat_detail(&bridge, "c1")
+        .await
+        .unwrap();
+    assert_eq!(keys(&detail), ["chat", "last_engine", "work_state"]);
+    assert_eq!(
+        keys(&detail["chat"]),
+        ["archived", "engine", "id", "pinned", "project_id", "title", "updated_at"]
+    );
+    serde_json::from_value::<ChatDetail>(detail).unwrap();
+
+    // listChats / updateChat: {chats: ChatInfo[]} ve {chat: ChatInfo}.
+    let list = bridge
+        .request(Request::ListChats {
+            project_id: None,
+            include_archived: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(keys(&list), ["chats"]);
+    serde_json::from_value::<Vec<ChatInfo>>(list["chats"].clone()).unwrap();
+
+    // importCatalog: ImportReport değil, {imported, updated}.
+    let md = tmp.path().join("projects.md");
+    std::fs::write(
+        &md,
+        include_str!("../../../../crates/ultron-core/tests/fixtures/catalog/projects.md"),
+    )
+    .unwrap();
+    let cat = bridge
+        .request(Request::ImportCatalog {
+            path: md.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(keys(&cat), ["imported", "updated"]);
+    serde_json::from_value::<CatalogImportReport>(cat).unwrap();
+    let projects = bridge.request(Request::ListProjects).await.unwrap();
+    assert_eq!(keys(&projects), ["projects"]);
+    let parsed: Vec<ProjectInfo> = serde_json::from_value(projects["projects"].clone()).unwrap();
+    assert!(!parsed.is_empty());
+
+    // importClaudeHistory: zarf açılır, doğrudan ImportReport.
+    let root = tmp.path().join("claude-projects");
+    std::fs::create_dir_all(&root).unwrap();
+    let report = ultron_desktop::commands::read_history_import(
+        &bridge,
+        Some(root.to_string_lossy().into_owned()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(keys(&report), ["chats", "files", "masked", "messages", "skipped"]);
+    serde_json::from_value::<ImportReport>(report).unwrap();
+
+    // status.
+    let status = bridge.request(Request::Status).await.unwrap();
+    assert_eq!(
+        keys(&status),
+        ["default_engine", "pid", "running_turns", "version"]
+    );
     server.shutdown().await;
 }
 
