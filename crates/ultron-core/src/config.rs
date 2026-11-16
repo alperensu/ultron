@@ -27,16 +27,8 @@ pub struct EngineConfig {
 impl EngineConfig {
     /// Model ve efor kurallarını denetler.
     pub fn validate(&self) -> Result<()> {
-        for arg in &self.extra_args {
-            if arg.to_lowercase().contains("astra") {
-                bail!("'astra' ek argümanlarda desteklenmiyor: {arg}");
-            }
-        }
         if let Some(model) = &self.model {
             let lower = model.to_lowercase();
-            if lower.contains("astra") {
-                bail!("'astra' adlı model desteklenmiyor: {model}");
-            }
             if self.id == EngineId::Codex {
                 match lower.as_str() {
                     "gpt-6.1-sol" | "gpt-6.1-terra" => {
@@ -58,6 +50,21 @@ impl EngineConfig {
         }
         Ok(())
     }
+}
+
+/// Beyin (yalnız üst düzey karar veren) modeli mi? `fable`, `astra` veya `opus` içeren
+/// adlar beyin modelidir ve işçi olarak çalıştırılamaz.
+pub fn is_brain_only(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    ["fable", "astra", "opus"].iter().any(|k| lower.contains(k))
+}
+
+/// Bir modelin işçi (worker) olarak çalıştırılabileceğini denetler.
+pub fn validate_worker_model(model: &str) -> Result<()> {
+    if is_brain_only(model) {
+        bail!("'{model}' beyin modelidir; işçi olarak çalıştırılamaz");
+    }
+    Ok(())
 }
 
 /// Ultron genel yapılandırması (`root\config.toml`).

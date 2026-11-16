@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use ultron_core::config::{is_brain_only, validate_worker_model};
 use ultron_core::{Config, EngineConfig, EngineId, Paths};
 
 /// Ortam değişkeni (ULTRON_HOME) kullanan testleri sıraya koyar.
@@ -35,11 +36,31 @@ fn config_defaults_when_missing() {
 }
 
 #[test]
-fn validate_rejects_astra() {
+fn astra_allowed_in_config_but_not_as_worker() {
+    // Yapılandırmada astra artık reddedilmez (beyin modeli olarak tanımlanabilir).
     let cfg = engine(EngineId::Codex, Some("gpt-6.1-astra"), Some("medium"));
-    assert!(cfg.validate().is_err());
-    let cfg = engine(EngineId::Codex, Some("GPT-6.1-ASTRA"), Some("medium"));
-    assert!(cfg.validate().is_err());
+    assert!(cfg.validate().is_ok());
+    // Ama işçi olarak çalıştırılamaz.
+    assert!(validate_worker_model("gpt-6.1-astra").is_err());
+    assert!(validate_worker_model("GPT-6.1-ASTRA").is_err());
+}
+
+#[test]
+fn opus_and_fable_are_brain_only() {
+    assert!(is_brain_only("claude-opus-4"));
+    assert!(is_brain_only("Claude-OPUS-x"));
+    assert!(is_brain_only("fable-1"));
+    assert!(is_brain_only("gpt-6.1-astra"));
+    assert!(validate_worker_model("claude-opus-4").is_err());
+    assert!(validate_worker_model("fable-1").is_err());
+}
+
+#[test]
+fn sonnet_haiku_luna_are_worker_eligible() {
+    for model in ["claude-sonnet-4", "claude-haiku-5-5", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"] {
+        assert!(!is_brain_only(model), "{model}");
+        assert!(validate_worker_model(model).is_ok(), "{model}");
+    }
 }
 
 #[test]
@@ -63,12 +84,10 @@ fn validate_rejects_non_gemini_agy() {
 }
 
 #[test]
-fn validate_rejects_astra_in_extra_args() {
+fn validate_allows_astra_in_extra_args() {
     let mut cfg = engine(EngineId::Claude, None, None);
     cfg.extra_args = vec!["--model".into(), "claude-astra-1".into()];
-    assert!(cfg.validate().is_err());
-    cfg.extra_args = vec!["--ASTRA-mode".into()];
-    assert!(cfg.validate().is_err());
+    assert!(cfg.validate().is_ok());
     cfg.extra_args = vec!["--verbose".into()];
     assert!(cfg.validate().is_ok());
 }
