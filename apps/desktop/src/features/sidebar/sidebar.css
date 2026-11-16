@@ -1,0 +1,186 @@
+/* Kenar çubuğu: üst gezinme sabit, ortadaki liste sanallaştırılmış ve kayar, alt kısım sabit. */
+.app-sidebar { overflow: hidden; }
+.app-sidebar .ui-sidebar__nav { flex: 1; min-height: 0; }
+.app-sidebar .ui-sidebar__foot { flex: none; }
+
+.virtual-list {
+  flex: 1;
+  min-height: 0;
+  margin: 6px -8px 0;
+  padding: 0 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.virtual-list__space { position: relative; }
+.virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+}
+
+.sidebar-heading {
+  height: 32px;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 10px 4px;
+  font-size: var(--fs-footnote);
+  color: var(--l2);
+}
+.sidebar-empty {
+  height: 32px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px 0 30px;
+  font-size: var(--fs-footnote);
+  color: var(--l3);
+}
+.sidebar-note {
+  padding: 6px 10px;
+  font-size: var(--fs-footnote);
+  color: var(--l2);
+}
+
+.project-row {
+  width: 100%;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 0 6px;
+  border-radius: 8px;
+  text-align: left;
+}
+.project-row:hover { background: rgba(120, 120, 128, 0.16); }
+.project-row .icon { color: var(--blue); }
+.project-row .project-row__chev { color: var(--l3); transition: transform var(--dur-fast) var(--spring); }
+.project-row .project-row__chev.is-open { transform: rotate(90deg); }
+.project-row__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-row__count { font-size: var(--fs-footnote); color: var(--l2); }
+
+.chat-row {
+  position: relative;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  padding-left: 10px;
+  border-radius: 8px;
+  color: var(--l2);
+  font-size: var(--fs-footnote);
+}
+.chat-row.is-nested { padding-left: 30px; }
+.chat-row:hover,
+.chat-row:focus-within { background: rgba(120, 120, 128, 0.16); color: var(--l1); }
+.chat-row.is-active { background: rgba(120, 120, 128, 0.28); color: var(--l1); }
+.chat-row__open {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+}
+.chat-row__title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-row__pin { color: var(--orange); }
+.chat-row__more {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  margin-right: 2px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--l2);
+  opacity: 0;
+}
+.chat-row:hover .chat-row__more,
+.chat-row:focus-within .chat-row__more,
+.chat-row__more[aria-expanded="true"] { opacity: 1; }
+.chat-row__more:hover { color: var(--l1); background: rgba(120, 120, 128, 0.24); }
+.chat-row__more .icon { fill: currentColor; stroke: none; }
+.chat-row__rename {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  margin-right: 6px;
+  padding: 0 8px;
+  background: var(--ter);
+  border: 0.5px solid var(--blue);
+  border-radius: 6px;
+  outline: 0;
+  font-size: var(--fs-footnote);
+}
+
+.sidebar-search { display: flex; flex-direction: column; flex: 1; min-height: 0; margin-top: 6px; }
+.sidebar-search__input {
+  height: 30px;
+  margin: 0 2px 6px;
+  padding: 0 10px;
+  background: var(--ter);
+  border: 0;
+  border-radius: 8px;
+  outline: 0;
+  font-size: var(--fs-footnote);
+}
+.sidebar-search__input:focus-visible { outline: 2px solid var(--blue); outline-offset: 0; }
+.sidebar-search__results { flex: 1; min-height: 0; overflow-y: auto; }
+.sidebar-hit {
+  width: 100%;
+  display: grid;
+  gap: 1px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  text-align: left;
+}
+.sidebar-hit:hover { background: rgba(120, 120, 128, 0.16); }
+.sidebar-hit__title { font-size: var(--fs-footnote); font-weight: 600; }
+.sidebar-hit__text {
+  font-size: 12px;
+  color: var(--l2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.service-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--l2);
+}
+
+/* Bağlam menüsü (gövdeye portal edilir). */
+.chat-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 200px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(44, 44, 46, 0.92);
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 0.5px solid var(--sep);
+  border-radius: var(--r-group);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  animation: menu-in var(--dur-fast) var(--spring) both;
+}
+.chat-menu button {
+  padding: 7px 12px;
+  border-radius: 8px;
+  text-align: left;
+  font-size: var(--fs-body);
+}
+.chat-menu button:hover,
+.chat-menu button:focus-visible { background: var(--blue); outline: 0; }
+.chat-menu button.is-danger { color: var(--red); }
+.chat-menu button.is-danger:hover,
+.chat-menu button.is-danger:focus-visible { color: #fff; background: var(--red); }
+@keyframes menu-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: none; }
+}

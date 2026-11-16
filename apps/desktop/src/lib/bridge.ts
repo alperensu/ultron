@@ -44,8 +44,42 @@ export interface EventsPage {
   has_more: boolean;
 }
 
+/** Tam metin arama sonucu (Rust `SearchHit`). */
 export interface SearchHit {
-  [key: string]: unknown;
+  chat_id: string;
+  event_id: string;
+  text: string;
+}
+
+/** Yerel proje yönlendirmesi sonucu (Rust `RouteResult`); alternatifler proje kimlikleridir. */
+export interface RouteResult {
+  project_id: string | null;
+  confidence: number;
+  reason: string;
+  alternatives: string[];
+}
+
+export type QuotaSource = "Live" | "Estimated" | "Unknown";
+
+export interface QuotaWindow {
+  label: string;
+  used_pct: number | null;
+  resets_at: string | null;
+  window_secs: number;
+  source: QuotaSource;
+}
+
+export interface PoolReport {
+  pool: "claude" | "codex" | "agy";
+  windows: QuotaWindow[];
+  reset_rights: number | null;
+  mode: string;
+  note?: string;
+}
+
+export interface QuotaReport {
+  pools: PoolReport[];
+  fetched_at: string;
 }
 
 export interface ImportReport {
@@ -105,9 +139,9 @@ export interface Bridge {
   cancelTurn(chatId: string): Promise<{ chat_id: string }>;
   eventsPage(chatId: string, afterSeq: number | null, limit: number): Promise<EventsPage>;
   historySearch(query: string, chatId?: string, limit?: number): Promise<{ hits: SearchHit[] }>;
-  getQuota(): Promise<unknown>;
+  getQuota(): Promise<QuotaReport>;
   setResetRights(pool: string, count: number): Promise<unknown>;
-  routeMessage(text: string): Promise<unknown>;
+  routeMessage(text: string): Promise<RouteResult>;
   importCatalog(path: string): Promise<CatalogImportReport>;
   importClaudeHistory(root?: string): Promise<ImportReport>;
   status(): Promise<{ version: string; pid: number; running_turns: number; default_engine: EngineId }>;
@@ -210,6 +244,12 @@ export interface FakeBridgeOptions {
   events?: StoredEvent[];
   /** Verilirse her komut bu hatayla reddedilir (ör. DaemonUnavailable ekranı). */
   failWith?: BridgeError;
+  /** Yönlendirme yanıtı; verilmezse `routeMessage` "uygulanmadı" hatası verir. */
+  route?: (text: string) => RouteResult;
+  /** Kota raporu; verilmezse `getQuota` "uygulanmadı" hatası verir. */
+  quota?: QuotaReport;
+  /** `historySearch` sonuçları (sorguyu içeren metinler süzülür). */
+  searchHits?: SearchHit[];
 }
 
 export interface FakeBridge extends Bridge {
@@ -278,7 +318,7 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
             project_id: req.project_id ?? null,
             pinned: false,
             archived: false,
-            updated_at: new Date(0).toISOString(),
+            updated_at: new Date().toISOString(),
             engine: req.engine ?? "claude",
           });
         }
@@ -300,11 +340,15 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
           has_more: all.length > page.length,
         };
       }),
-    historySearch: (query, id, limit) => run("history_search", [query, id, limit], () => ({ hits: [] })),
-    getQuota: () => run("get_quota", [], () => reject("kota")),
+    historySearch: (query, id, limit) =>
+      run("history_search", [query, id, limit], () => ({
+        hits: (opts.searchHits ?? []).filter((h) => h.text.toLowerCase().includes(query.toLowerCase())),
+      })),
+    getQuota: () => run("get_quota", [], () => opts.quota ?? reject("kota")),
     setResetRights: (pool, count) =>
       run("set_reset_rights", [pool, count], () => reject("kota")),
-    routeMessage: (text) => run("route_message", [text], () => reject("yönlendirme")),
+    routeMessage: (text) =>
+      run("route_message", [text], () => (opts.route ? opts.route(text) : reject("yönlendirme"))),
     // Sahte köprü: gerçek dosya okumaz; boş rapor, gerçek servisle aynı biçimde.
     importCatalog: (path) => run("import_catalog", [path], () => ({ imported: 0, updated: 0 })),
     importClaudeHistory: (root) =>

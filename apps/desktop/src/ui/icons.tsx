@@ -32,6 +32,14 @@ const PATHS = {
   ),
   check: <path d="M5 12.5l4.5 4.5L19 7" />,
   chevron: <path d="M9 5l7 7-7 7" />,
+  send: <path d="M12 19V5M5.5 11.5L12 5l6.5 6.5" />,
+  more: (
+    <>
+      <circle cx="6" cy="12" r="1.2" />
+      <circle cx="12" cy="12" r="1.2" />
+      <circle cx="18" cy="12" r="1.2" />
+    </>
+  ),
 } satisfies Record<string, ReactElement>;
 
 export type IconName = keyof typeof PATHS;

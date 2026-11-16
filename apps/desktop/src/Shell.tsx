@@ -1,26 +1,28 @@
-import { EmptyState, NavBar, Sidebar, SidebarItem } from "./ui";
-import { WindowControls } from "./ui/WindowControls";
+import { useEffect } from "react";
+import { AppSidebar } from "./features/sidebar/AppSidebar";
+import { ChatPlaceholder } from "./screens/ChatPlaceholder";
+import { SettingsPlaceholder } from "./screens/SettingsPlaceholder";
+import { Today } from "./screens/Today";
+import { useRoute } from "./state/router";
+import { useStore } from "./state/store";
 
-/** Uygulama kabuğu. Gerçek ekranlar (Bugün, Sohbet) sonraki görevlerde gelir; servis köprüsü Task 8'de. */
+/** Uygulama kabuğu: kenar çubuğu + rotaya göre ekran. Üstte sekme çubuğu yoktur. */
 export function Shell() {
+  const store = useStore();
+  const route = useRoute();
+
+  useEffect(() => store.start(), [store]);
+
   return (
     <div className="ui-shell">
-      <Sidebar>
-        <SidebarItem icon="sun" active>
-          Bugün
-        </SidebarItem>
-      </Sidebar>
-      <main className="ui-main">
-        <NavBar title="Bugün" controls={<WindowControls />} />
-        <div className="ui-stage">
-          <div className="ui-stage__inner">
-            <EmptyState
-              title="Henüz bir şey yok"
-              description="Projeler ve sohbetler yerel servise bağlanınca burada görünür. Bağlantı Aşama 2'nin sonraki adımında eklenir."
-            />
-          </div>
-        </div>
-      </main>
+      <AppSidebar />
+      {route.name === "chat" ? (
+        <ChatPlaceholder key={route.chatId} chatId={route.chatId} />
+      ) : route.name === "settings" ? (
+        <SettingsPlaceholder />
+      ) : (
+        <Today />
+      )}
     </div>
   );
 }

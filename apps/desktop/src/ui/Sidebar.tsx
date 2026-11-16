@@ -1,9 +1,17 @@
 import type { ReactNode } from "react";
 import { Icon, type IconName } from "./icons";
 
-export function Sidebar({ children, footer }: { children: ReactNode; footer?: ReactNode }) {
+export function Sidebar({
+  children,
+  footer,
+  className,
+}: {
+  children: ReactNode;
+  footer?: ReactNode;
+  className?: string;
+}) {
   return (
-    <aside className="ui-sidebar" aria-label="Kenar çubuğu">
+    <aside className={`ui-sidebar${className ? ` ${className}` : ""}`} aria-label="Kenar çubuğu">
       <div className="ui-sidebar__brand" data-tauri-drag-region>
         Ultron
       </div>
