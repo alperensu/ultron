@@ -7,6 +7,7 @@ Geliştirici oturumlarını, olay günlüğünü (eventlog), durum özetlerini v
 - `crates/ultron-core/AGENTS.md`: Kütüphane çekirdeği, modül haritası, runner limitleri, olay ve motor değişmezleri.
 - `crates/ultrond/AGENTS.md`: Arka plan servisi (daemon), adlandırılmış boru (named pipe) güvenliği, el sıkışma ve yaşam döngüsü.
 - `crates/ultron/AGENTS.md`: CLI istemcisi, komutlar, servis doğrulama ve başlatma kuralları.
+- `apps/desktop/AGENTS.md`: Masaüstü uygulaması (Tauri + React), tasarım sistemi, hareket ve güvenlik kuralları.
 - `docs/AGENTS.md`: Dokümantasyon düzeni, tasarım özellikleri, planlar ve raporlama standartları.
 
 ## Genel Kurallar

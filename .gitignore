@@ -1,3 +1,11 @@
 target/
 *.db
 fixtures-private/
+
+# apps/desktop
+node_modules/
+dist/
+test-results/
+playwright-report/
+apps/desktop/src-tauri/gen/
+apps/desktop/e2e/__screenshots__/
