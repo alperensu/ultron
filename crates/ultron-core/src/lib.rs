@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod paths;
 pub mod projects;
 pub mod prompts;
+pub mod quota;
 pub mod routing;
 pub mod session;
 pub mod summarizer;

@@ -71,6 +71,20 @@ pub struct Config {
     pub engines: Vec<EngineConfig>,
     pub default_engine: EngineId,
     pub context_budget_chars: usize,
+    /// Elle girilen sıfırlama hakları (`[reset_rights]`).
+    pub reset_rights: ResetRights,
+    /// `false` ise Claude kullanım uç noktası hiç çağrılmaz.
+    pub claude_live_quota: bool,
+}
+
+/// Havuz başına kalan sıfırlama hakları; `None` = bilinmiyor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResetRights {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<u32>,
 }
 
 impl Default for Config {
@@ -79,6 +93,8 @@ impl Default for Config {
             engines: default_engines(),
             default_engine: EngineId::Claude,
             context_budget_chars: 24000,
+            reset_rights: ResetRights::default(),
+            claude_live_quota: true,
         }
     }
 }
