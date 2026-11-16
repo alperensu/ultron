@@ -1,8 +1,9 @@
 import { useId, useState, type ReactNode } from "react";
 import type { StoredEvent } from "../../lib/bridge";
 import { field } from "./model";
+import { ChatAgents } from "../agents/AgentList";
 
-/** Task 11 gerçek ajan listesini bu yuvaya bağlar; burada oturum/durum uydurulmaz. */
+/** Sohbete ait ajan oturumları ve dosya değişiklikleri. */
 export function ChatPanel({ files, agents }: { files: StoredEvent[]; agents?: ReactNode }) {
   const [tab, setTab] = useState<"agents" | "changes">("agents");
   const [limit, setLimit] = useState(100);
@@ -34,7 +35,7 @@ export function ChatPanel({ files, agents }: { files: StoredEvent[]; agents?: Re
         ))}
       </div>
       <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-${tab}`} className="chat-panel__body" tabIndex={0}>
-        {tab === "agents" ? agents ?? <p className="chat-panel__empty">Ajan oturumları Aşama 2’nin 11. adımında burada listelenecek.</p> : files.length === 0 ? (
+        {tab === "agents" ? agents ?? <ChatAgents /> : files.length === 0 ? (
           <p className="chat-panel__empty">Henüz dosya değişikliği yok.</p>
         ) : (
           <>
