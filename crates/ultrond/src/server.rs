@@ -329,7 +329,6 @@ async fn ok(writer: &mut Writer, data: Value) -> Result<()> {
     write_msg(writer, &Response::Ok { data }).await
 }
 
-/// Sonraki görevlerde gerçeklenecek istekler için dürüst hata (sahte veri yok).
 /// `config.toml` içindeki `[reset_rights]` tablosunu günceller (diğer anahtarlar korunur,
 /// yorumlar korunmaz); geçici dosya + yeniden adlandırma ile yazılır.
 fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
@@ -365,9 +364,38 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
     Ok(())
 }
 
-async fn not_implemented(writer: &mut Writer, task: u8) -> Result<Flow> {
-    send_error(writer, format!("henüz uygulanmadı (Aşama 2 Task {task})")).await;
-    Ok(Flow::Continue)
+const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
+
+/// IPC'den gelen katalog yolunu sınırlı okur: düzenli dosya, `.md`/`.txt`, en çok 1 MiB.
+async fn read_catalog_file(path: &Path) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"));
+    if !ext_ok {
+        return Err(anyhow!("proje kataloğu .md veya .txt olmalı"));
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .context("proje kataloğu okunamadı")?;
+    let meta = file.metadata().await.context("proje kataloğu okunamadı")?;
+    if !meta.is_file() {
+        return Err(anyhow!("proje kataloğu düzenli bir dosya olmalı"));
+    }
+    if meta.len() > MAX_CATALOG_BYTES {
+        return Err(anyhow!("proje kataloğu çok büyük (en çok 1 MiB)"));
+    }
+    // Dosya okuma sırasında büyüyebilir: okuma da sınırlanır.
+    let mut buf = Vec::new();
+    file.take(MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut buf)
+        .await
+        .context("proje kataloğu okunamadı")?;
+    if buf.len() as u64 > MAX_CATALOG_BYTES {
+        return Err(anyhow!("proje kataloğu çok büyük (en çok 1 MiB)"));
+    }
+    String::from_utf8(buf).map_err(|_| anyhow!("proje kataloğu UTF-8 olmalı"))
 }
 
 async fn dispatch(
@@ -461,9 +489,7 @@ async fn dispatch(
             Ok(Flow::Continue)
         }
         Request::ImportCatalog { path } => {
-            let md = tokio::fs::read_to_string(&path)
-                .await
-                .context("proje kataloğu okunamadı")?;
+            let md = read_catalog_file(Path::new(&path)).await?;
             let report = ultron_core::projects::import_catalog(&st.db, &md)?;
             ok(writer, serde_json::to_value(report)?).await?;
             Ok(Flow::Continue)
@@ -932,6 +958,38 @@ mod tests {
             Response::Error { .. }
         ));
         assert_eq!(data(&h, Request::ListProjects).await, before);
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn import_catalog_rejects_large_or_non_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let h = start_with(&paths, &unique_pipe(), &[STARTED, REPLY, DONE]).await;
+        let path_req = |p: &Path| Request::ImportCatalog {
+            path: p.to_string_lossy().into_owned(),
+        };
+        // Çok büyük dosya.
+        let big = tmp.path().join("big.md");
+        std::fs::write(&big, vec![b'a'; MAX_CATALOG_BYTES as usize + 1]).unwrap();
+        let Response::Error { message } = response(&h, path_req(&big)).await else {
+            panic!("büyük dosya reddedilmeliydi");
+        };
+        assert!(message.contains("büyük"), "{message}");
+        // Düzenli dosya değil (dizin, .md uzantılı).
+        let dir = tmp.path().join("dizin.md");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            response(&h, path_req(&dir)).await,
+            Response::Error { .. }
+        ));
+        // Yanlış uzantı.
+        let wrong = tmp.path().join("katalog.json");
+        std::fs::write(&wrong, "x").unwrap();
+        let Response::Error { message } = response(&h, path_req(&wrong)).await else {
+            panic!("uzantı reddedilmeliydi");
+        };
+        assert!(message.contains(".md"), "{message}");
         h.shutdown().await;
     }
 
