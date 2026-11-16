@@ -354,11 +354,6 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
     Ok(())
 }
 
-async fn not_implemented(writer: &mut Writer, task: u8) -> Result<Flow> {
-    send_error(writer, format!("henüz uygulanmadı (Aşama 2 Task {task})")).await;
-    Ok(Flow::Continue)
-}
-
 async fn dispatch(
     st: &Arc<State>,
     request: Request,
