@@ -70,7 +70,11 @@ pub struct QuotaSources {
 
 impl QuotaSources {
     /// Kullanıcı ev dizininden (`USERPROFILE`/`HOME`, `CODEX_HOME`) türetir.
+    /// `ULTRON_QUOTA_HOME` verilirse tüm yollar yalnız onun altından türetilir (testler için).
     pub fn from_env() -> Self {
+        if let Some(root) = std::env::var_os("ULTRON_QUOTA_HOME").filter(|v| !v.is_empty()) {
+            return Self::from_home(&PathBuf::from(root));
+        }
         let home = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .map(PathBuf::from)
@@ -78,6 +82,15 @@ impl QuotaSources {
         let codex = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
+        Self::with_codex(&home, &codex)
+    }
+
+    /// Verilen ev dizini altındaki varsayılan konumlar (`CODEX_HOME` yok sayılır).
+    pub fn from_home(home: &std::path::Path) -> Self {
+        Self::with_codex(home, &home.join(".codex"))
+    }
+
+    fn with_codex(home: &std::path::Path, codex: &std::path::Path) -> Self {
         QuotaSources {
             claude_credentials: home.join(".claude").join(".credentials.json"),
             claude_json: home.join(".claude.json"),
@@ -148,7 +161,11 @@ impl QuotaService {
     /// Tüm havuzların raporu.
     pub async fn report(&self, cfg: &Config, now: DateTime<Utc>) -> QuotaReport {
         let (claude_w, note) = self.claude_windows(cfg, now).await;
-        let codex_w = codex::read_codex_windows(&self.sources.codex_sessions, now);
+        let root = self.sources.codex_sessions.clone();
+        // Dosya taraması bloklayıcı: async çalışma zamanını tutmamak için ayrı iş parçacığında.
+        let codex_w = tokio::task::spawn_blocking(move || codex::read_codex_windows(&root, now))
+            .await
+            .unwrap_or_default();
         let mk = |pool, windows: Vec<QuotaWindow>, rights, note| PoolReport {
             pool,
             mode: budget_mode(&windows, now),

@@ -18,6 +18,23 @@ async fn reset_rights_persist_and_quota_reports() {
     std::fs::create_dir_all(&paths.root).unwrap();
     // Canlı uç nokta çağrılmasın.
     std::fs::write(paths.root.join("config.toml"), "claude_live_quota = false\n").unwrap();
+    // Gerçek ev dizini yerine sentetik kota kaynakları.
+    let qhome = tmp.path().join("qhome");
+    std::fs::create_dir_all(&qhome).unwrap();
+    let sess = qhome.join(".codex").join("sessions");
+    std::fs::create_dir_all(&sess).unwrap();
+    std::fs::write(
+        sess.join("s.jsonl"),
+        concat!(
+            r#"{"timestamp":"2099-01-01T00:00:00Z","payload":{"rate_limits":{"limit_id":"codex","#,
+            r#""primary":{"used_percent":42.0,"window_minutes":300,"resets_at":4102444800}}}}"#,
+            "
+"
+        ),
+    )
+    .unwrap();
+    // SAFETY: test ikilisinde tek test var; ortam yalnız burada yazılır.
+    unsafe { std::env::set_var("ULTRON_QUOTA_HOME", &qhome) };
     let h = start_with(&paths, &unique_pipe(), &[]).await;
 
     let r = call(&h, Request::SetResetRights { pool: "claude".into(), count: 3 }).await;
@@ -35,6 +52,7 @@ async fn reset_rights_persist_and_quota_reports() {
     let pools = data["quota"]["pools"].as_array().unwrap();
     assert_eq!(pools.len(), 3);
     assert_eq!(pools[0]["reset_rights"], Value::from(3));
+    assert_eq!(pools[1]["windows"][0]["used_pct"], Value::from(42.0));
     assert_eq!(pools[2]["mode"], "Dengeli");
     h.shutdown().await;
 }

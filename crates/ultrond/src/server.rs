@@ -329,18 +329,23 @@ async fn ok(writer: &mut Writer, data: Value) -> Result<()> {
     write_msg(writer, &Response::Ok { data }).await
 }
 
-/// Sonraki görevlerde gerçeklenecek istekler için dürüst hata (sahte veri yok).
 /// `config.toml` içindeki `[reset_rights]` tablosunu günceller (diğer anahtarlar korunur,
 /// yorumlar korunmaz); geçici dosya + yeniden adlandırma ile yazılır.
 fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
     if !matches!(pool, "claude" | "codex") {
         return Err(anyhow!("geçersiz havuz: {pool} (claude|codex)"));
     }
+    // Daemon düzeyinde seri hale getirme; okuma yazmadan hemen önce yapılır ki dışarıdan
+    // yapılan düzenlemeler (ör. `claude_live_quota`) ezilmesin.
+    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = CONFIG_LOCK
+        .lock()
+        .map_err(|_| anyhow!("config kilidi zehirlendi"))?;
     let file = paths.root.join("config.toml");
-    let mut table: toml::Table = if file.exists() {
-        std::fs::read_to_string(&file)?.parse()?
-    } else {
-        toml::Table::new()
+    let mut table: toml::Table = match std::fs::read_to_string(&file) {
+        Ok(text) => text.parse()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(e.into()),
     };
     let rights = table
         .entry("reset_rights")
@@ -348,10 +353,64 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
         .as_table_mut()
         .ok_or_else(|| anyhow!("config.toml: reset_rights tablo olmalı"))?;
     rights.insert(pool.to_string(), toml::Value::Integer(i64::from(count)));
-    let tmp = paths.root.join("config.toml.tmp");
+    let tmp = paths
+        .root
+        .join(format!("config.toml.{}.tmp", uuid::Uuid::new_v4().simple()));
     std::fs::write(&tmp, toml::to_string(&table)?)?;
-    std::fs::rename(&tmp, &file)?;
+    if let Err(e) = std::fs::rename(&tmp, &file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
+}
+
+/// Yol, kullanıcının ev dizini mi (büyük/küçük harf ve sembolik bağdan bağımsız)?
+fn is_user_home(path: &Path) -> bool {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        return false;
+    };
+    let norm = |p: &Path| {
+        std::fs::canonicalize(p)
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    norm(path) == norm(Path::new(&home))
+}
+
+const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
+
+/// IPC'den gelen katalog yolunu sınırlı okur: düzenli dosya, `.md`/`.txt`, en çok 1 MiB.
+async fn read_catalog_file(path: &Path) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"));
+    if !ext_ok {
+        return Err(anyhow!("proje kataloğu .md veya .txt olmalı"));
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .context("proje kataloğu okunamadı")?;
+    let meta = file.metadata().await.context("proje kataloğu okunamadı")?;
+    if !meta.is_file() {
+        return Err(anyhow!("proje kataloğu düzenli bir dosya olmalı"));
+    }
+    if meta.len() > MAX_CATALOG_BYTES {
+        return Err(anyhow!("proje kataloğu çok büyük (en çok 1 MiB)"));
+    }
+    // Dosya okuma sırasında büyüyebilir: okuma da sınırlanır.
+    let mut buf = Vec::new();
+    file.take(MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut buf)
+        .await
+        .context("proje kataloğu okunamadı")?;
+    if buf.len() as u64 > MAX_CATALOG_BYTES {
+        return Err(anyhow!("proje kataloğu çok büyük (en çok 1 MiB)"));
+    }
+    String::from_utf8(buf).map_err(|_| anyhow!("proje kataloğu UTF-8 olmalı"))
 }
 
 async fn dispatch(
@@ -445,9 +504,7 @@ async fn dispatch(
             Ok(Flow::Continue)
         }
         Request::ImportCatalog { path } => {
-            let md = tokio::fs::read_to_string(&path)
-                .await
-                .context("proje kataloğu okunamadı")?;
+            let md = read_catalog_file(Path::new(&path)).await?;
             let report = ultron_core::projects::import_catalog(&st.db, &md)?;
             ok(writer, serde_json::to_value(report)?).await?;
             Ok(Flow::Continue)
@@ -522,10 +579,27 @@ async fn dispatch(
                 ),
                 None => None,
             };
-            let cwd = project.as_ref().map_or(cwd, |p| p.path.clone());
+            let cwd = match &project {
+                Some(p) => p.path.clone(),
+                // Projesiz sohbet kullanıcının ev dizininde çalışmaz: sohbete özel çalışma alanı.
+                None if cwd.trim().is_empty() || is_user_home(Path::new(&cwd)) => {
+                    let dir = st.paths.root.join("workspaces").join(&chat_id);
+                    std::fs::create_dir_all(&dir)
+                        .with_context(|| format!("çalışma alanı oluşturulamadı: {}", dir.display()))?;
+                    dir.to_string_lossy().into_owned()
+                }
+                None => cwd,
+            };
             if !Path::new(&cwd).is_absolute() {
                 return Err(anyhow!("cwd mutlak bir yol olmalı: {cwd}"));
             }
+            // Kabulden önce: motor kayıtlı mı ve sohbette tur çalışıyor mu. Hata burada dönerse
+            // istemci kabul yanıtı görmez; tur kilidi kabul öncesi ayrılır.
+            let pre_engine = match engine {
+                Some(engine) => engine,
+                None => st.db.chat_engine(&chat_id)?.unwrap_or(st.default_engine),
+            };
+            let reservation = st.manager.reserve_turn(&chat_id, pre_engine)?;
             st.db.insert_chat(&chat_id, None, "", chrono::Utc::now())?;
             if let Some(project) = &project {
                 let bound = st.db.get_chat(&chat_id)?.and_then(|c| c.project_id);
@@ -536,10 +610,7 @@ async fn dispatch(
             }
             st.db.touch_chat(&chat_id, &text)?;
             // Motor verilmezse mevcut sohbetin motoru kullanılır (sessiz motor değişimi olmaz).
-            let engine = match engine {
-                Some(engine) => engine,
-                None => st.db.chat_engine(&chat_id)?.unwrap_or(st.default_engine),
-            };
+            let engine = pre_engine;
             let mut last_seq = st.db.next_seq(&chat_id)? - 1;
             let mut wake = st.log.subscribe();
             let guard = st.keep.acquire();
@@ -555,8 +626,28 @@ async fn dispatch(
                 turns.spawn(async move {
                     let result = task_state
                         .manager
-                        .send(&task_chat, Path::new(&cwd), engine, &text, policy.into())
+                        .send_reserved(
+                            reservation,
+                            &task_chat,
+                            Path::new(&cwd),
+                            engine,
+                            &text,
+                            policy.into(),
+                        )
                         .await;
+                    // Kabulden sonraki hata yalnız bu bağlantıya gitmesin: sohbet günlüğüne yazılır,
+                    // böylece her abone görür.
+                    if let Err(e) = &result
+                        && let Err(log_err) = task_state.log.append(
+                            &task_chat,
+                            None,
+                            EngineEvent::Error {
+                                message: format!("{e:#}"),
+                            },
+                        )
+                    {
+                        tracing::error!(error = %log_err, "tur hatası günlüğe yazılamadı");
+                    }
                     drop(guard);
                     let _ = done_tx.send(result);
                 });
@@ -903,6 +994,94 @@ mod tests {
             Response::Error { .. }
         ));
         assert_eq!(data(&h, Request::ListProjects).await, before);
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn projectless_send_uses_scratch_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let h = start_with(&paths, &unique_pipe(), &[STARTED, REPLY, DONE]).await;
+        let home = std::env::var("USERPROFILE").expect("USERPROFILE tanımlı olmalı");
+        for (chat, cwd) in [("kapsam-1", home), ("kapsam-2", String::new())] {
+            let mut client = connect(&h).await;
+            client
+                .send(&Request::Send {
+                    chat_id: Some(chat.into()),
+                    cwd,
+                    engine: Some(EngineId::Claude),
+                    text: "merhaba".into(),
+                    policy: PolicyArg::ReadOnly,
+                    project_id: None,
+                })
+                .await
+                .unwrap();
+            loop {
+                match next(&mut client).await.unwrap() {
+                    Response::Ok { data } if data.get("done").is_some() => break,
+                    Response::Error { message } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                paths.root.join("workspaces").join(chat).is_dir(),
+                "{chat} için çalışma alanı oluşmalı"
+            );
+        }
+        // Ev dizini dışındaki açık bir cwd olduğu gibi kullanılır (çalışma alanı açılmaz).
+        let own = abs_dir(tmp.path());
+        let mut client = connect(&h).await;
+        client
+            .send(&Request::Send {
+                chat_id: Some("kapsam-3".into()),
+                cwd: own.to_string_lossy().into_owned(),
+                engine: Some(EngineId::Claude),
+                text: "merhaba".into(),
+                policy: PolicyArg::ReadOnly,
+                project_id: None,
+            })
+            .await
+            .unwrap();
+        loop {
+            match next(&mut client).await.unwrap() {
+                Response::Ok { data } if data.get("done").is_some() => break,
+                Response::Error { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        assert!(!paths.root.join("workspaces").join("kapsam-3").exists());
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn import_catalog_rejects_large_or_non_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let h = start_with(&paths, &unique_pipe(), &[STARTED, REPLY, DONE]).await;
+        let path_req = |p: &Path| Request::ImportCatalog {
+            path: p.to_string_lossy().into_owned(),
+        };
+        // Çok büyük dosya.
+        let big = tmp.path().join("big.md");
+        std::fs::write(&big, vec![b'a'; MAX_CATALOG_BYTES as usize + 1]).unwrap();
+        let Response::Error { message } = response(&h, path_req(&big)).await else {
+            panic!("büyük dosya reddedilmeliydi");
+        };
+        assert!(message.contains("büyük"), "{message}");
+        // Düzenli dosya değil (dizin, .md uzantılı).
+        let dir = tmp.path().join("dizin.md");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            response(&h, path_req(&dir)).await,
+            Response::Error { .. }
+        ));
+        // Yanlış uzantı.
+        let wrong = tmp.path().join("katalog.json");
+        std::fs::write(&wrong, "x").unwrap();
+        let Response::Error { message } = response(&h, path_req(&wrong)).await else {
+            panic!("uzantı reddedilmeliydi");
+        };
+        assert!(message.contains(".md"), "{message}");
         h.shutdown().await;
     }
 
