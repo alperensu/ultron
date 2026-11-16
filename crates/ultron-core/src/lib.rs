@@ -1,5 +1,6 @@
 //! Ultron çekirdek kütüphanesi.
 
+pub mod client;
 pub mod config;
 pub mod db;
 pub mod engine;

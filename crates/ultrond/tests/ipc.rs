@@ -336,6 +336,7 @@ async fn send_without_engine_keeps_chat_engine() {
         engine: Some(EngineId::Codex),
         text: "ilk".into(),
         policy: ultron_core::ipc::PolicyArg::ReadOnly,
+        project_id: None,
     };
     run_turn(&h, first).await;
 
@@ -346,6 +347,7 @@ async fn send_without_engine_keeps_chat_engine() {
         engine: None,
         text: "ikinci".into(),
         policy: ultron_core::ipc::PolicyArg::ReadOnly,
+        project_id: None,
     };
     let kinds = run_turn(&h, second).await;
     assert!(!kinds.contains(&"engine_switched".to_string()), "{kinds:?}");

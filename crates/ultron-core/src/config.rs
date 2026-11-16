@@ -30,18 +30,15 @@ impl EngineConfig {
         if let Some(model) = &self.model {
             let lower = model.to_lowercase();
             if self.id == EngineId::Codex {
-                match lower.as_str() {
-                    "gpt-6.1-sol" | "gpt-6.1-terra" => {
-                        if let Some(effort) = &self.effort
-                            && !matches!(effort.as_str(), "low" | "medium" | "high")
-                        {
-                            bail!("{model} için efor en fazla high olabilir: {effort}");
-                        }
+                // Sürüm numarasından bağımsız, aile son ekine göre.
+                if lower.ends_with("-sol") || lower.ends_with("-terra") {
+                    if let Some(effort) = &self.effort
+                        && !matches!(effort.as_str(), "low" | "medium" | "high")
+                    {
+                        bail!("{model} için efor en fazla high olabilir: {effort}");
                     }
-                    "gpt-6-luna" if self.effort.as_deref() != Some("max") => {
-                        bail!("gpt-6-luna yalnız 'max' eforla çalışır");
-                    }
-                    _ => {}
+                } else if lower.ends_with("-luna") && self.effort.as_deref() != Some("max") {
+                    bail!("{model} yalnız 'max' eforla çalışır");
                 }
             }
             if self.id == EngineId::Agy && !lower.starts_with("gemini-") {

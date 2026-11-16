@@ -53,6 +53,9 @@ pub enum Request {
         engine: Option<EngineId>,
         text: String,
         policy: PolicyArg,
+        /// Yeni sohbeti bu projeye bağlar; `cwd` projenin yolu olur.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
     },
     Switch {
         chat_id: String,
@@ -72,6 +75,93 @@ pub enum Request {
         limit: usize,
     },
     Status,
+    ListProjects,
+    ListChats {
+        project_id: Option<String>,
+        include_archived: bool,
+    },
+    GetChat {
+        chat_id: String,
+    },
+    UpdateChat {
+        chat_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
+        /// `None`: dokunma; `Some(None)`: projeden ayır; `Some(Some(id))`: projeye bağla.
+        #[serde(
+            default,
+            deserialize_with = "double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        project_id: Option<Option<String>>,
+    },
+    GetQuota,
+    ImportCatalog {
+        path: String,
+    },
+    ImportClaudeHistory {
+        root: Option<String>,
+    },
+    Route {
+        text: String,
+    },
+    SetResetRights {
+        pool: String,
+        count: u32,
+    },
+}
+
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// Proje özeti (yanıt verisi).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub aliases: Vec<String>,
+    pub description: Option<String>,
+    pub last_active_at: Option<String>,
+}
+
+/// Sohbet özeti (yanıt verisi).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatInfo {
+    pub id: String,
+    pub title: String,
+    pub project_id: Option<String>,
+    pub pinned: bool,
+    pub archived: bool,
+    pub updated_at: String,
+    pub engine: Option<EngineId>,
+}
+
+/// Tek sohbetin ayrıntısı: meta, çalışma durumu ve son oturumun motoru.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatDetail {
+    pub chat: ChatInfo,
+    pub work_state: Option<Value>,
+    pub last_engine: Option<EngineId>,
+}
+
+/// İçe aktarma raporu.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub files: usize,
+    pub chats: usize,
+    pub messages: usize,
+    pub skipped: usize,
+    pub masked: usize,
 }
 
 // Token'ı günlüklere sızdırmamak için elle yazılmış Debug.
@@ -106,6 +196,27 @@ impl std::fmt::Debug for Request {
                 .field("chat_id", chat_id)
                 .finish_non_exhaustive(),
             Request::Status => f.write_str("Status"),
+            Request::ListProjects => f.write_str("ListProjects"),
+            Request::ListChats { project_id, .. } => f
+                .debug_struct("ListChats")
+                .field("project_id", project_id)
+                .finish_non_exhaustive(),
+            Request::GetChat { chat_id } => {
+                f.debug_struct("GetChat").field("chat_id", chat_id).finish()
+            }
+            Request::UpdateChat { chat_id, .. } => f
+                .debug_struct("UpdateChat")
+                .field("chat_id", chat_id)
+                .finish_non_exhaustive(),
+            Request::GetQuota => f.write_str("GetQuota"),
+            Request::ImportCatalog { .. } => f.write_str("ImportCatalog"),
+            Request::ImportClaudeHistory { .. } => f.write_str("ImportClaudeHistory"),
+            Request::Route { .. } => f.write_str("Route"),
+            Request::SetResetRights { pool, count } => f
+                .debug_struct("SetResetRights")
+                .field("pool", pool)
+                .field("count", count)
+                .finish(),
         }
     }
 }

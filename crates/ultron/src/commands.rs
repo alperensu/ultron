@@ -1,21 +1,13 @@
 //! `ultron` komutları: istek kurma, servise bağlanma/başlatma ve olay çıktısı.
 
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command as Process;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
-use ultron_core::ipc::{self, Client, PolicyArg, Request, Response};
+use ultron_core::ipc::{Client, PolicyArg, Request, Response};
 use ultron_core::{EngineId, Paths, StoredEvent};
-use windows_sys::Win32::Foundation::{
-    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
-};
-
-/// Servis yokken ultrond'un hazır olması için beklenen en uzun süre.
-const START_WAIT: Duration = Duration::from_secs(5);
 
 /// Görev Zamanlayıcı görev adı.
 const TASK_NAME: &str = r"Ultron\ultrond";
@@ -154,11 +146,7 @@ pub fn schtasks_uninstall_args() -> Vec<String> {
 /// `ultrond.exe`'nin yolu: `ultron.exe`'nin yanında.
 pub fn ultrond_path() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("çalışan ikili bulunamadı")?;
-    let path = exe.with_file_name(format!("ultrond{}", std::env::consts::EXE_SUFFIX));
-    if !path.is_file() {
-        bail!("ultrond bulunamadı: {}", path.display());
-    }
-    Ok(path)
+    ultron_core::client::locate_ultrond(&exe)
 }
 
 /// Bir olayı tek satırlık çıktıya çevirir. `verbose` kapalıyken (sohbet akışı) kullanıcı
@@ -219,83 +207,13 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
-fn is_not_running(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|e| e.kind() == io::ErrorKind::NotFound)
-    })
-}
-
-async fn try_connect(paths: &Paths, pipe: &str) -> Result<Client> {
-    let token = ipc::read_token(paths)?;
-    Client::connect(pipe, &token).await
-}
-
-/// Verilen tutamaçların miras bırakılabilirlik bayrağını kapatır; önceki bayrakları döner.
-fn disable_inherit(handles: &[HANDLE]) -> Vec<(HANDLE, u32)> {
-    let mut saved = Vec::new();
-    for &h in handles {
-        let mut flags = 0u32;
-        // SAFETY: geçersiz tutamaç yalnız hata döndürür.
-        if unsafe { GetHandleInformation(h, &mut flags) } != 0 {
-            // SAFETY: yukarıdaki gerekçe.
-            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
-            saved.push((h, flags & HANDLE_FLAG_INHERIT));
-        }
-    }
-    saved
-}
-
-fn spawn_ultrond() -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    let path = ultrond_path()?;
-    // Bu sürecin standart tutamaçları (ör. `ultron ... | tee` borusu) servise miras kalmamalı;
-    // yoksa servis çalıştığı sürece boru kapanmaz.
-    let saved = disable_inherit(&[
-        io::stdin().as_raw_handle() as HANDLE,
-        io::stdout().as_raw_handle() as HANDLE,
-        io::stderr().as_raw_handle() as HANDLE,
-    ]);
-    let spawned = Process::new(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn();
-    for (h, flag) in saved {
-        // SAFETY: tutamaç hâlâ bu sürecin standart tutamacı.
-        unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, flag) };
-    }
-    spawned.context("ultrond başlatılamadı")?;
-    Ok(())
-}
-
-/// Servise bağlanır; servis çalışmıyorsa `ultrond`'u ayrık süreç olarak başlatıp 5 sn bekler.
+/// Ortak çekirdek istemcisine bağlanır.
 pub async fn connect_or_start() -> Result<Client> {
     let paths = Paths::resolve()?;
-    let pipe = ipc::pipe_name()?;
-    let first = match try_connect(&paths, &pipe).await {
-        Ok(client) => return Ok(client),
-        Err(e) => e,
-    };
-    if !is_not_running(&first) {
-        return Err(first);
-    }
-    spawn_ultrond()?;
-    let deadline = Instant::now() + START_WAIT;
-    let mut last = first;
-    while Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        match try_connect(&paths, &pipe).await {
-            Ok(client) => return Ok(client),
-            Err(e) => last = e,
-        }
-    }
-    Err(last.context("ultrond 5 saniye içinde hazır olmadı"))
+    let exe = std::env::current_exe().context("çalışan ikili bulunamadı")?;
+    let daemon = ultron_core::client::locate_ultrond(&exe)
+        .unwrap_or_else(|_| exe.with_file_name("ultrond.exe"));
+    ultron_core::client::connect_or_start(&paths, &daemon).await
 }
 
 /// Yanıtları, bitiş (`done`) gelene ya da bağlantı kapanana dek yazdırır.
@@ -345,6 +263,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     engine: engine.map(EngineId::from),
                     text: message,
                     policy: policy.into(),
+                    project_id: None,
                 })
                 .await?;
             let done = stream(&mut client, false).await?;

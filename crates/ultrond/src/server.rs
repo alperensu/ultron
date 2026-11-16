@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use ultron_core::engine::{Engine, TurnOutcome};
 use ultron_core::events::{EngineEvent, SwitchReason};
 use ultron_core::ipc::{
-    self, MAX_LINE_BYTES, Request, Response, ct_eq, read_frame, sys, write_msg,
+    self, ChatDetail, MAX_LINE_BYTES, Request, Response, ct_eq, read_frame, sys, write_msg,
 };
 use ultron_core::summarizer::{AgySummarizer, NullSummarizer, Summarizer};
 use ultron_core::{Config, Db, EngineId, EventLog, Paths, SessionManager, SessionStatus};
@@ -316,6 +316,12 @@ async fn ok(writer: &mut Writer, data: Value) -> Result<()> {
     write_msg(writer, &Response::Ok { data }).await
 }
 
+/// Sonraki görevlerde gerçeklenecek istekler için dürüst hata (sahte veri yok).
+async fn not_implemented(writer: &mut Writer, task: u8) -> Result<Flow> {
+    send_error(writer, format!("henüz uygulanmadı (Aşama 2 Task {task})")).await;
+    Ok(Flow::Continue)
+}
+
 async fn dispatch(
     st: &Arc<State>,
     request: Request,
@@ -341,6 +347,64 @@ async fn dispatch(
             .await?;
             Ok(Flow::Continue)
         }
+        Request::ListProjects => {
+            ok(writer, json!({"projects": st.db.list_projects()?})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::ListChats {
+            project_id,
+            include_archived,
+        } => {
+            let chats = st.db.list_chats(project_id.as_deref(), include_archived)?;
+            ok(writer, json!({"chats": chats})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::GetChat { chat_id } => {
+            let chat = st
+                .db
+                .get_chat(&chat_id)?
+                .ok_or_else(|| anyhow!("sohbet bulunamadı: {chat_id}"))?;
+            let detail = ChatDetail {
+                work_state: st.db.get_work_state(&chat_id)?,
+                last_engine: st.db.latest_session(&chat_id)?.map(|s| s.engine),
+                chat,
+            };
+            ok(writer, json!({"chat": detail})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::UpdateChat {
+            chat_id,
+            title,
+            pinned,
+            archived,
+            project_id,
+        } => {
+            let title = match title.as_deref().map(str::trim) {
+                Some("") => return Err(anyhow!("başlık boş olamaz")),
+                Some(t) => Some(t),
+                None => None,
+            };
+            if let Some(Some(pid)) = &project_id
+                && st.db.get_project(pid)?.is_none()
+            {
+                return Err(anyhow!("proje bulunamadı: {pid}"));
+            }
+            let project_arg = project_id.as_ref().map(Option::as_deref);
+            if !st
+                .db
+                .update_chat(&chat_id, title, pinned, archived, project_arg)?
+            {
+                return Err(anyhow!("sohbet bulunamadı: {chat_id}"));
+            }
+            let chat = st.db.get_chat(&chat_id)?;
+            ok(writer, json!({"chat": chat})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::GetQuota => not_implemented(writer, 5).await,
+        Request::SetResetRights { .. } => not_implemented(writer, 5).await,
+        Request::ImportCatalog { .. } => not_implemented(writer, 3).await,
+        Request::ImportClaudeHistory { .. } => not_implemented(writer, 4).await,
+        Request::Route { .. } => not_implemented(writer, 3).await,
         Request::Switch { chat_id, to } => {
             st.manager.switch(&chat_id, to, SwitchReason::User).await?;
             ok(writer, json!({"chat_id": chat_id})).await?;
@@ -368,11 +432,38 @@ async fn dispatch(
             engine,
             text,
             policy,
+            project_id,
         } => {
+            let chat_id = chat_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+            if chat_id.is_empty()
+                || !chat_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(anyhow!("geçersiz sohbet kimliği: {chat_id}"));
+            }
+            // Projeye bağlı gönderimde çalışma dizini projenin yoludur.
+            let project = match &project_id {
+                Some(pid) => Some(
+                    st.db
+                        .get_project(pid)?
+                        .ok_or_else(|| anyhow!("proje bulunamadı: {pid}"))?,
+                ),
+                None => None,
+            };
+            let cwd = project.as_ref().map_or(cwd, |p| p.path.clone());
             if !Path::new(&cwd).is_absolute() {
                 return Err(anyhow!("cwd mutlak bir yol olmalı: {cwd}"));
             }
-            let chat_id = chat_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+            st.db.insert_chat(&chat_id, None, "", chrono::Utc::now())?;
+            if let Some(project) = &project {
+                let bound = st.db.get_chat(&chat_id)?.and_then(|c| c.project_id);
+                if bound.as_ref().is_some_and(|b| *b != project.id) {
+                    return Err(anyhow!("sohbet başka bir projeye bağlı: {chat_id}"));
+                }
+                st.db.bind_chat_project(&chat_id, &project.id)?;
+            }
+            st.db.touch_chat(&chat_id, &text)?;
             // Motor verilmezse mevcut sohbetin motoru kullanılır (sessiz motor değişimi olmaz).
             let engine = match engine {
                 Some(engine) => engine,
