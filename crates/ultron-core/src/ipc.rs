@@ -134,6 +134,22 @@ pub struct ProjectInfo {
     pub last_active_at: Option<String>,
 }
 
+/// Yerel proje yönlendirmesinin sonucu; alternatifler proje kimlikleridir.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouteResult {
+    pub project_id: Option<String>,
+    pub confidence: f32,
+    pub reason: String,
+    pub alternatives: Vec<String>,
+}
+
+/// Katalogdan eklenen ve güncellenen proje sayıları.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogImportReport {
+    pub imported: usize,
+    pub updated: usize,
+}
+
 /// Sohbet özeti (yanıt verisi).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatInfo {
@@ -457,7 +473,10 @@ pub mod sys {
         // SAFETY: boyut sorgusu; null tampon ve sıfır uzunluk.
         unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
         if needed == 0 {
-            bail!("TOKEN_USER boyutu alınamadı: {}", io::Error::last_os_error());
+            bail!(
+                "TOKEN_USER boyutu alınamadı: {}",
+                io::Error::last_os_error()
+            );
         }
         // u64 dizisi, TOKEN_USER için yeterli hizalamayı sağlar.
         let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
@@ -608,7 +627,10 @@ pub mod sys {
         let mut pid = 0u32;
         // SAFETY: tutamaç `client` ile yaşar.
         if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle() as HANDLE, &mut pid) } == 0 {
-            bail!("pipe sunucusu doğrulanamadı: {}", io::Error::last_os_error());
+            bail!(
+                "pipe sunucusu doğrulanamadı: {}",
+                io::Error::last_os_error()
+            );
         }
         if process_user_sid(pid)? != current_user_sid()? {
             bail!("pipe sunucusu başka bir kullanıcıya ait; token gönderilmedi");

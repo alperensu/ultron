@@ -166,6 +166,58 @@ impl Db {
         ))
     }
 
+    /// Kataloğu tek işlemde uygular; mevcut projelerin diğer alanlarına dokunmaz.
+    pub fn upsert_catalog_projects(
+        &self,
+        seeds: &[crate::projects::ProjectSeed],
+    ) -> Result<crate::ipc::CatalogImportReport> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut report = crate::ipc::CatalogImportReport::default();
+        for seed in seeds {
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM projects WHERE path = ?1 ORDER BY id LIMIT 1",
+                    params![seed.path],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                tx.execute(
+                    "UPDATE projects SET name = ?1, description = ?2 WHERE id = ?3",
+                    params![seed.name, seed.description, id],
+                )?;
+                report.updated += 1;
+            } else {
+                tx.execute(
+                    "INSERT INTO projects(id, name, path, description) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        uuid::Uuid::new_v4().simple().to_string(),
+                        seed.name,
+                        seed.path,
+                        seed.description
+                    ],
+                )?;
+                report.imported += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Sohbetlerden bağımsız, proje tablosundaki son etkin proje kimliği.
+    pub fn last_active_project(&self) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT id FROM projects WHERE julianday(last_active_at) IS NOT NULL
+             ORDER BY julianday(last_active_at) DESC, id ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Tek projeyi okur.
     pub fn get_project(&self, id: &str) -> Result<Option<ProjectInfo>> {
         let conn = self.conn()?;

@@ -256,7 +256,7 @@ async fn later_task_requests_report_not_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = paths_in(tmp.path());
     let h = start_with(&paths, &unique_pipe(), &LINES).await;
-    let msg = error_of(&h, Request::Route { text: "x".into() }).await;
+    let msg = error_of(&h, Request::GetQuota).await;
     assert!(msg.contains("henüz uygulanmadı"), "{msg}");
     h.shutdown().await;
 }
