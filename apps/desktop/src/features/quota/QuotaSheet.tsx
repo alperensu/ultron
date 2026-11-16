@@ -51,12 +51,12 @@ export function QuotaSheet({ open, onClose }: { open: boolean; onClose(): void }
       </div>
       {quota.error ? <p className="quota-error" role="alert">Kota okunamadı: {quota.error}</p> : null}
       {!quota.report && !quota.error ? <p className="quota-note">Kota bilgisi bekleniyor.</p> : null}
-      {quota.report?.pools.length === 0 ? <p className="quota-note">Kota penceresi bulunamadı.</p> : null}
-      {quota.report?.pools.map((pool) => (
+      {quota.report && (quota.report.pools ?? []).length === 0 ? <p className="quota-note">Kota penceresi bulunamadı.</p> : null}
+      {(quota.report?.pools ?? []).map((pool) => (
         <GroupedList key={pool.pool} header={ENGINE_LABEL[pool.pool]}>
           <Row title="Bütçe modu" trailing={<span className="ui-chip">{modeLabel(pool.mode)}</span>} />
-          {pool.windows.length === 0 ? <Row title="Pencere yok" meta="Bilinmiyor" /> : null}
-          {pool.windows.map((window, index) => (
+          {(pool.windows ?? []).length === 0 ? <Row title="Pencere yok" meta="Bilinmiyor" /> : null}
+          {(pool.windows ?? []).map((window, index) => (
             <WindowUsage key={`${window.label}-${index}`} window={window} pool={pool.pool} />
           ))}
           {pool.pool !== "agy" ? <ResetRights pool={pool} /> : null}

@@ -103,7 +103,7 @@ export function Composer({ chatId, currentProjectId, disabled = false }: {
         : "Proje seç";
 
   const candidates = question
-    ? [question.project_id, ...question.alternatives].filter((id): id is string => id !== null)
+    ? [question.project_id, ...(question.alternatives ?? [])].filter((id): id is string => id !== null)
     : [];
 
   return (

@@ -44,6 +44,16 @@ async function setup(quota = report) {
   return { bridge, ...view };
 }
 
+it("eksik havuz ve pencere listeleri kota arayüzünü çökertmez", async () => {
+  const { rerender } = await setup({ fetched_at: report.fetched_at } as QuotaReport);
+  await userEvent.setup().click(screen.getByRole("button", { name: "Kota panelini aç" }));
+  expect(await screen.findByText("Kota penceresi bulunamadı.")).toBeInTheDocument();
+  rerender(<></>);
+  await setup({ ...report, pools: [{ pool: "claude", mode: "Dengeli", reset_rights: null } as QuotaReport["pools"][number]] });
+  await userEvent.setup().click(screen.getByRole("button", { name: "Kota panelini aç" }));
+  expect(await screen.findByText("Pencere yok")).toBeInTheDocument();
+});
+
 it("quota_sheet_shows_source_labels", async () => {
   const { bridge } = await setup();
   const user = userEvent.setup();

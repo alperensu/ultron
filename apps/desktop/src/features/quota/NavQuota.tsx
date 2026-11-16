@@ -10,7 +10,7 @@ export function NavQuota() {
   const [open, setOpen] = useState(false);
   const close = useCallback(() => setOpen(false), []);
   if (!quota) return null;
-  const tightest = quota.report?.pools.flatMap((pool) => pool.windows.map((window) => ({ pool, window })))
+  const tightest = (quota.report?.pools ?? []).flatMap((pool) => (pool.windows ?? []).map((window) => ({ pool, window })))
     .filter(({ window }) => window.used_pct !== null && Number.isFinite(window.used_pct))
     .sort((a, b) => b.window.used_pct! - a.window.used_pct!)[0];
 

@@ -82,7 +82,7 @@ export function useChat(bridge: Bridge, chatId: string) {
         while (!stopped) {
           const page = await bridge.eventsPage(chatId, after, 500);
           if (stopped) return;
-          pending.push(...page.events);
+          pending.push(...(page.events ?? []));
           publish();
           if (!page.has_more) break;
           if (page.next_after_seq === null || page.next_after_seq <= (after ?? 0)) {

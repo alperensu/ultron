@@ -2,16 +2,93 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer};
-use serde_json::{Value, json};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use tauri::State;
 use ultron_core::EngineId;
-use ultron_core::ipc::{PolicyArg, Request, Response};
+use ultron_core::db::{SearchHit, StoredEvent};
+use ultron_core::ipc::{
+    CatalogImportReport, ChatDetail, ChatInfo, ImportReport, PolicyArg, ProjectInfo, Request,
+    Response, RouteResult,
+};
+use ultron_core::quota::QuotaReport;
 
 use crate::bridge::{Bridge, BridgeError};
 
 pub type Shared<'a> = State<'a, Arc<Bridge>>;
-type Out = Result<Value, BridgeError>;
+type Out<T> = Result<T, BridgeError>;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProjectsResult {
+    pub projects: Vec<ProjectInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatsResult {
+    pub chats: Vec<ChatInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatResult {
+    pub chat: ChatInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatIdResult {
+    pub chat_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventsPage {
+    pub events: Vec<StoredEvent>,
+    pub next_after_seq: Option<i64>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResetRightsResult {
+    pub pool: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusResult {
+    pub version: String,
+    pub pid: u32,
+    pub running_turns: usize,
+    pub default_engine: EngineId,
+}
+
+#[derive(Deserialize)]
+struct ChatDetailEnvelope {
+    chat: ChatDetail,
+}
+
+#[derive(Deserialize)]
+struct QuotaEnvelope {
+    quota: QuotaReport,
+}
+
+#[derive(Deserialize)]
+struct HistoryImportEnvelope {
+    report: ImportReport,
+}
+
+/// Tür uyuşmazlıkları webview'e bozuk veri yerine `protocol` hatası olarak gider.
+fn decode<T: DeserializeOwned>(data: Value) -> Out<T> {
+    serde_json::from_value(data).map_err(|e| BridgeError::Protocol {
+        message: format!("servis yanıtı beklenen biçimde değil: {e}"),
+    })
+}
+
+async fn request<T: DeserializeOwned>(bridge: &Bridge, req: Request) -> Out<T> {
+    decode(bridge.request(req).await?)
+}
 
 /// `events_page` için sayfa üst sınırı.
 const MAX_PAGE: usize = 1000;
@@ -121,7 +198,7 @@ pub async fn read_events_page(
     chat_id: &str,
     after_seq: Option<i64>,
     limit: usize,
-) -> Out {
+) -> Out<EventsPage> {
     let limit = limit.clamp(1, MAX_PAGE);
     let mut client = bridge.connect().await?;
     client
@@ -150,7 +227,11 @@ pub async fn read_events_page(
         }
     }
     let next_after_seq = events.last().map(|e| e.seq).or(after_seq);
-    Ok(json!({"events": events, "next_after_seq": next_after_seq, "has_more": has_more}))
+    Ok(EventsPage {
+        events,
+        next_after_seq,
+        has_more,
+    })
 }
 
 fn proto(e: anyhow::Error) -> BridgeError {
@@ -160,136 +241,215 @@ fn proto(e: anyhow::Error) -> BridgeError {
 }
 
 #[tauri::command]
-pub async fn list_projects(b: Shared<'_>) -> Out {
-    b.request(Request::ListProjects).await
+pub async fn list_projects(b: Shared<'_>) -> Out<ProjectsResult> {
+    list_projects_impl(&b).await
+}
+
+pub async fn list_projects_impl(bridge: &Bridge) -> Out<ProjectsResult> {
+    request(bridge, Request::ListProjects).await
 }
 
 #[tauri::command]
-pub async fn list_chats(b: Shared<'_>, args: ListChatsArgs) -> Out {
-    b.request(Request::ListChats {
-        project_id: args.project_id,
-        include_archived: args.include_archived,
-    })
-    .await
+pub async fn list_chats(b: Shared<'_>, args: ListChatsArgs) -> Out<ChatsResult> {
+    list_chats_impl(&b, args).await
 }
 
-/// Servis zarfındaki (`{"<anahtar>": ...}`) iç değeri çıkarır; zarf yoksa tipli protokol hatası.
-fn unwrap_field(mut data: Value, key: &str) -> Out {
-    data.get_mut(key)
-        .map(Value::take)
-        .ok_or_else(|| BridgeError::Protocol {
-            message: format!("yanıtta `{key}` alanı yok"),
-        })
+pub async fn list_chats_impl(bridge: &Bridge, args: ListChatsArgs) -> Out<ChatsResult> {
+    request(
+        bridge,
+        Request::ListChats {
+            project_id: args.project_id,
+            include_archived: args.include_archived,
+        },
+    )
+    .await
 }
 
 /// `GetChat`: servis `{chat: ChatDetail}` döner; webview doğrudan `ChatDetail` alır.
-pub async fn read_chat_detail(bridge: &Bridge, chat_id: &str) -> Out {
-    let data = bridge
-        .request(Request::GetChat {
+pub async fn read_chat_detail(bridge: &Bridge, chat_id: &str) -> Out<ChatDetail> {
+    let data: ChatDetailEnvelope = request(
+        bridge,
+        Request::GetChat {
             chat_id: chat_id.to_string(),
-        })
-        .await?;
-    unwrap_field(data, "chat")
+        },
+    )
+    .await?;
+    Ok(data.chat)
 }
 
 /// `ImportClaudeHistory`: servis `{report: ImportReport}` döner; webview doğrudan raporu alır.
-pub async fn read_history_import(bridge: &Bridge, root: Option<String>) -> Out {
-    let data = bridge.request(Request::ImportClaudeHistory { root }).await?;
-    unwrap_field(data, "report")
+pub async fn read_history_import(bridge: &Bridge, root: Option<String>) -> Out<ImportReport> {
+    let data: HistoryImportEnvelope =
+        request(bridge, Request::ImportClaudeHistory { root }).await?;
+    Ok(data.report)
 }
 
 #[tauri::command]
-pub async fn get_chat(b: Shared<'_>, args: ChatIdArgs) -> Out {
-    read_chat_detail(&b, &args.chat_id).await
+pub async fn get_chat(b: Shared<'_>, args: ChatIdArgs) -> Out<ChatDetail> {
+    get_chat_impl(&b, args).await
+}
+
+pub async fn get_chat_impl(bridge: &Bridge, args: ChatIdArgs) -> Out<ChatDetail> {
+    read_chat_detail(bridge, &args.chat_id).await
 }
 
 #[tauri::command]
-pub async fn update_chat(b: Shared<'_>, args: UpdateChatArgs) -> Out {
-    b.request(Request::UpdateChat {
-        chat_id: args.chat_id,
-        title: args.title,
-        pinned: args.pinned,
-        archived: args.archived,
-        project_id: args.project_id,
-    })
+pub async fn update_chat(b: Shared<'_>, args: UpdateChatArgs) -> Out<ChatResult> {
+    update_chat_impl(&b, args).await
+}
+
+pub async fn update_chat_impl(bridge: &Bridge, args: UpdateChatArgs) -> Out<ChatResult> {
+    request(
+        bridge,
+        Request::UpdateChat {
+            chat_id: args.chat_id,
+            title: args.title,
+            pinned: args.pinned,
+            archived: args.archived,
+            project_id: args.project_id,
+        },
+    )
     .await
 }
 
 #[tauri::command]
-pub async fn send_message(b: Shared<'_>, args: SendArgs) -> Out {
-    b.request_detached(Request::Send {
-        chat_id: args.chat_id,
-        cwd: default_cwd(),
-        engine: args.engine,
-        text: args.text,
-        policy: PolicyArg::Workspace,
-        project_id: args.project_id,
-    })
+pub async fn send_message(b: Shared<'_>, args: SendArgs) -> Out<ChatIdResult> {
+    send_message_impl(&b, args).await
+}
+
+pub async fn send_message_impl(bridge: &Bridge, args: SendArgs) -> Out<ChatIdResult> {
+    decode(
+        bridge
+            .request_detached(Request::Send {
+                chat_id: args.chat_id,
+                cwd: default_cwd(),
+                engine: args.engine,
+                text: args.text,
+                policy: PolicyArg::Workspace,
+                project_id: args.project_id,
+            })
+            .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn switch_engine(b: Shared<'_>, args: SwitchArgs) -> Out<ChatIdResult> {
+    switch_engine_impl(&b, args).await
+}
+
+pub async fn switch_engine_impl(bridge: &Bridge, args: SwitchArgs) -> Out<ChatIdResult> {
+    request(
+        bridge,
+        Request::Switch {
+            chat_id: args.chat_id,
+            to: args.to,
+        },
+    )
     .await
 }
 
 #[tauri::command]
-pub async fn switch_engine(b: Shared<'_>, args: SwitchArgs) -> Out {
-    b.request(Request::Switch {
-        chat_id: args.chat_id,
-        to: args.to,
-    })
+pub async fn cancel_turn(b: Shared<'_>, args: ChatIdArgs) -> Out<ChatIdResult> {
+    cancel_turn_impl(&b, args).await
+}
+
+pub async fn cancel_turn_impl(bridge: &Bridge, args: ChatIdArgs) -> Out<ChatIdResult> {
+    request(
+        bridge,
+        Request::Cancel {
+            chat_id: args.chat_id,
+        },
+    )
     .await
 }
 
 #[tauri::command]
-pub async fn cancel_turn(b: Shared<'_>, args: ChatIdArgs) -> Out {
-    b.request(Request::Cancel {
-        chat_id: args.chat_id,
-    })
+pub async fn events_page(b: Shared<'_>, args: EventsPageArgs) -> Out<EventsPage> {
+    events_page_impl(&b, args).await
+}
+
+pub async fn events_page_impl(bridge: &Bridge, args: EventsPageArgs) -> Out<EventsPage> {
+    read_events_page(bridge, &args.chat_id, args.after_seq, args.limit).await
+}
+
+#[tauri::command]
+pub async fn history_search(b: Shared<'_>, args: SearchArgs) -> Out<SearchResult> {
+    history_search_impl(&b, args).await
+}
+
+pub async fn history_search_impl(bridge: &Bridge, args: SearchArgs) -> Out<SearchResult> {
+    request(
+        bridge,
+        Request::HistorySearch {
+            chat_id: args.chat_id,
+            query: args.query,
+            limit: args.limit,
+        },
+    )
     .await
 }
 
 #[tauri::command]
-pub async fn events_page(b: Shared<'_>, args: EventsPageArgs) -> Out {
-    read_events_page(&b, &args.chat_id, args.after_seq, args.limit).await
+pub async fn get_quota(b: Shared<'_>) -> Out<QuotaReport> {
+    get_quota_impl(&b).await
+}
+
+pub async fn get_quota_impl(bridge: &Bridge) -> Out<QuotaReport> {
+    let data: QuotaEnvelope = request(bridge, Request::GetQuota).await?;
+    Ok(data.quota)
 }
 
 #[tauri::command]
-pub async fn history_search(b: Shared<'_>, args: SearchArgs) -> Out {
-    b.request(Request::HistorySearch {
-        chat_id: args.chat_id,
-        query: args.query,
-        limit: args.limit,
-    })
+pub async fn set_reset_rights(b: Shared<'_>, args: ResetRightsArgs) -> Out<ResetRightsResult> {
+    set_reset_rights_impl(&b, args).await
+}
+
+pub async fn set_reset_rights_impl(
+    bridge: &Bridge,
+    args: ResetRightsArgs,
+) -> Out<ResetRightsResult> {
+    request(
+        bridge,
+        Request::SetResetRights {
+            pool: args.pool,
+            count: args.count,
+        },
+    )
     .await
 }
 
 #[tauri::command]
-pub async fn get_quota(b: Shared<'_>) -> Out {
-    b.request(Request::GetQuota).await
+pub async fn route_message(b: Shared<'_>, args: TextArgs) -> Out<RouteResult> {
+    route_message_impl(&b, args).await
+}
+
+pub async fn route_message_impl(bridge: &Bridge, args: TextArgs) -> Out<RouteResult> {
+    request(bridge, Request::Route { text: args.text }).await
 }
 
 #[tauri::command]
-pub async fn set_reset_rights(b: Shared<'_>, args: ResetRightsArgs) -> Out {
-    b.request(Request::SetResetRights {
-        pool: args.pool,
-        count: args.count,
-    })
-    .await
+pub async fn import_catalog(b: Shared<'_>, args: PathArgs) -> Out<CatalogImportReport> {
+    import_catalog_impl(&b, args).await
+}
+
+pub async fn import_catalog_impl(bridge: &Bridge, args: PathArgs) -> Out<CatalogImportReport> {
+    request(bridge, Request::ImportCatalog { path: args.path }).await
 }
 
 #[tauri::command]
-pub async fn route_message(b: Shared<'_>, args: TextArgs) -> Out {
-    b.request(Request::Route { text: args.text }).await
+pub async fn import_claude_history(b: Shared<'_>, args: HistoryArgs) -> Out<ImportReport> {
+    import_claude_history_impl(&b, args).await
+}
+
+pub async fn import_claude_history_impl(bridge: &Bridge, args: HistoryArgs) -> Out<ImportReport> {
+    read_history_import(bridge, args.root).await
 }
 
 #[tauri::command]
-pub async fn import_catalog(b: Shared<'_>, args: PathArgs) -> Out {
-    b.request(Request::ImportCatalog { path: args.path }).await
+pub async fn status(b: Shared<'_>) -> Out<StatusResult> {
+    status_impl(&b).await
 }
 
-#[tauri::command]
-pub async fn import_claude_history(b: Shared<'_>, args: HistoryArgs) -> Out {
-    read_history_import(&b, args.root).await
-}
-
-#[tauri::command]
-pub async fn status(b: Shared<'_>) -> Out {
-    b.request(Request::Status).await
+pub async fn status_impl(bridge: &Bridge) -> Out<StatusResult> {
+    request(bridge, Request::Status).await
 }

@@ -46,7 +46,10 @@ fn ensure_bin(package: &str, bin: &str) -> PathBuf {
 }
 
 fn fake_engines(dir: &Path) -> HashMap<EngineId, Arc<dyn Engine>> {
-    set_env("ULTRON_FAKE_CLI", ensure_bin("ultron-core", "ultron-fake-cli"));
+    set_env(
+        "ULTRON_FAKE_CLI",
+        ensure_bin("ultron-core", "ultron-fake-cli"),
+    );
     let fixture = dir.join("fixture.jsonl");
     std::fs::write(&fixture, [STARTED, REPLY, DONE].join("\n") + "\n").unwrap();
     let mut map: HashMap<EngineId, Arc<dyn Engine>> = HashMap::new();
@@ -112,7 +115,10 @@ async fn bridge_starts_daemon_or_reports_error() {
     );
 
     // Servis yok ve başlatılamıyor: tipli DaemonUnavailable.
-    let missing = Bridge::new(paths.clone(), Some(tmp.path().join("yok").join("ultrond.exe")));
+    let missing = Bridge::new(
+        paths.clone(),
+        Some(tmp.path().join("yok").join("ultrond.exe")),
+    );
     match missing.request(Request::Status).await {
         Err(BridgeError::DaemonUnavailable { reason }) => assert!(!reason.is_empty()),
         other => panic!("DaemonUnavailable beklenirdi: {other:?}"),
@@ -121,10 +127,16 @@ async fn bridge_starts_daemon_or_reports_error() {
     // Servis yok ama başlatılabiliyor: köprü ultrond'u açar ve Status yanıtlar.
     let exe = ensure_bin("ultrond", "ultrond");
     let bridge = Bridge::new(paths, Some(exe));
-    let status = bridge.request(Request::Status).await.expect("servis başlamalı");
+    let status = bridge
+        .request(Request::Status)
+        .await
+        .expect("servis başlamalı");
     let pid = status["pid"].as_u64().expect("pid");
     // Başlatılan servis diğer komutlara da gerçekten yanıt verir.
-    bridge.request(Request::GetQuota).await.expect("GetQuota yanıtlanmalı");
+    bridge
+        .request(Request::GetQuota)
+        .await
+        .expect("GetQuota yanıtlanmalı");
     let chats = bridge
         .request(Request::ListChats {
             project_id: None,
@@ -240,13 +252,13 @@ async fn events_page_respects_limit() {
     let page = ultron_desktop::commands::read_events_page(&bridge, "c1", None, 2)
         .await
         .unwrap();
-    assert_eq!(page["events"].as_array().unwrap().len(), 2);
-    assert_eq!(page["has_more"], true);
-    assert_eq!(page["next_after_seq"], 2);
+    assert_eq!(page.events.len(), 2);
+    assert!(page.has_more);
+    assert_eq!(page.next_after_seq, Some(2));
     let rest = ultron_desktop::commands::read_events_page(&bridge, "c1", Some(2), 50)
         .await
         .unwrap();
-    assert_eq!(rest["has_more"], false);
+    assert!(!rest.has_more);
     server.shutdown().await;
 }
 
@@ -394,20 +406,32 @@ async fn daemon_state_follows_connection() {
                 initial: Duration::from_millis(100),
                 max: Duration::from_millis(300),
             };
-            run_follow_with_state(&bridge, backoff, cancel, |_| {}, move |s| {
-                let _ = tx.send(s);
-            })
+            run_follow_with_state(
+                &bridge,
+                backoff,
+                cancel,
+                |_| {},
+                move |s| {
+                    let _ = tx.send(s);
+                },
+            )
             .await;
         })
     };
     // Servis yok: unavailable (tekrarlar tek bildirimde birleşir).
-    assert!(matches!(next_status(&mut rx).await, DaemonStatus::Unavailable(_)));
+    assert!(matches!(
+        next_status(&mut rx).await,
+        DaemonStatus::Unavailable(_)
+    ));
     // Servis sonradan gelir: ready.
     let server = start_server(&paths, &pipe).await;
     assert_eq!(next_status(&mut rx).await, DaemonStatus::Ready);
     // Servis düşer: unavailable.
     server.shutdown().await;
-    assert!(matches!(next_status(&mut rx).await, DaemonStatus::Unavailable(_)));
+    assert!(matches!(
+        next_status(&mut rx).await,
+        DaemonStatus::Unavailable(_)
+    ));
 
     cancel.cancel();
     let _ = follower.await;
@@ -577,40 +601,262 @@ fn keys(v: &serde_json::Value) -> Vec<String> {
 /// ve çekirdek tiplerle tipli ayrıştırma). TS tarafı aynı alan listelerini `bridge.test.ts` sınar.
 #[tokio::test]
 async fn command_json_shapes_match_ts_types() {
-    use ultron_core::ipc::{CatalogImportReport, ChatDetail, ChatInfo, ImportReport, ProjectInfo};
+    use ultron_desktop::commands::*;
+    fn json(value: impl serde::Serialize) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+    const CHAT_KEYS: [&str; 7] = [
+        "archived",
+        "engine",
+        "id",
+        "pinned",
+        "project_id",
+        "title",
+        "updated_at",
+    ];
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::from_root(tmp.path().join("ultron"));
     paths.ensure().unwrap();
     let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
     set_env("ULTRON_HOME", &paths.root);
     set_env("ULTRON_PIPE_NAME", &pipe);
+    // GetQuota yalnız sentetik ev dizinine bakar: gerçek kimlik bilgileri ve HTTP yok.
+    struct RestoreQuotaHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreQuotaHome {
+        fn drop(&mut self) {
+            // SAFETY: bu süreç testleri --test-threads=1 ile çalıştırır.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("ULTRON_QUOTA_HOME", value),
+                    None => std::env::remove_var("ULTRON_QUOTA_HOME"),
+                }
+            }
+        }
+    }
+    let _restore_quota = RestoreQuotaHome(std::env::var_os("ULTRON_QUOTA_HOME"));
+    set_env("ULTRON_QUOTA_HOME", tmp.path().join("quota-home"));
     let cwd = tmp.path().join("proje");
     std::fs::create_dir_all(&cwd).unwrap();
-    let bridge = Bridge::new(paths.clone(), None);
-    let server = start_server(&paths, &pipe).await;
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let mut engines = fake_engines(&paths.root);
+    // İptal yanıtı hızlı replay motorunun bitişiyle yarışmasın.
+    engines.insert(
+        EngineId::Codex,
+        Arc::new(FakeEngine::with_mode(&["hold"], false)),
+    );
+    let server = server::start(ServerConfig {
+        paths: paths.clone(),
+        pipe_name: pipe.clone(),
+        cfg: Config::default(),
+        engines,
+    })
+    .await
+    .unwrap();
+    // Gerçek komut fonksiyonlarını çağır: ham Bridge::request kullanmak zarf hatasını kaçırır.
+    // Tauri runtime olmadan aynı komut gövdeleri gerçek ultrond sunucusuna bağlanır.
+
+    assert_eq!(
+        json(list_projects_impl(&bridge).await.unwrap()),
+        serde_json::json!({"projects": []})
+    );
+    let empty_chats = list_chats_impl(
+        &bridge,
+        ListChatsArgs {
+            project_id: None,
+            include_archived: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(json(empty_chats), serde_json::json!({"chats": []}));
     run_turn(&bridge, &cwd, "c1").await;
 
     // getChat: zarf açılır, doğrudan ChatDetail.
-    let detail = ultron_desktop::commands::read_chat_detail(&bridge, "c1")
+    let detail = json(
+        get_chat_impl(
+            &bridge,
+            ChatIdArgs {
+                chat_id: "c1".into(),
+            },
+        )
         .await
-        .unwrap();
-    assert_eq!(keys(&detail), ["chat", "last_engine", "work_state"]);
-    assert_eq!(
-        keys(&detail["chat"]),
-        ["archived", "engine", "id", "pinned", "project_id", "title", "updated_at"]
+        .unwrap(),
     );
-    serde_json::from_value::<ChatDetail>(detail).unwrap();
+    assert_eq!(keys(&detail), ["chat", "last_engine", "work_state"]);
+    assert_eq!(keys(&detail["chat"]), CHAT_KEYS);
 
     // listChats / updateChat: {chats: ChatInfo[]} ve {chat: ChatInfo}.
-    let list = bridge
-        .request(Request::ListChats {
-            project_id: None,
-            include_archived: false,
-        })
+    let list = json(
+        list_chats_impl(
+            &bridge,
+            ListChatsArgs {
+                project_id: None,
+                include_archived: false,
+            },
+        )
         .await
-        .unwrap();
+        .unwrap(),
+    );
     assert_eq!(keys(&list), ["chats"]);
-    serde_json::from_value::<Vec<ChatInfo>>(list["chats"].clone()).unwrap();
+    assert_eq!(keys(&list["chats"][0]), CHAT_KEYS);
+    let updated = json(
+        update_chat_impl(
+            &bridge,
+            UpdateChatArgs {
+                chat_id: "c1".into(),
+                title: Some("Yeni başlık".into()),
+                pinned: Some(true),
+                archived: None,
+                project_id: Some(None),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(keys(&updated), ["chat"]);
+    assert_eq!(keys(&updated["chat"]), CHAT_KEYS);
+    assert_eq!(updated["chat"]["title"], "Yeni başlık");
+    assert_eq!(updated["chat"]["pinned"], true);
+
+    let switched = json(
+        switch_engine_impl(
+            &bridge,
+            SwitchArgs {
+                chat_id: "c1".into(),
+                to: EngineId::Codex,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(keys(&switched), ["chat_id"]);
+    assert_eq!(switched["chat_id"], "c1");
+    let sent = json(
+        send_message_impl(
+            &bridge,
+            SendArgs {
+                chat_id: Some("c2".into()),
+                text: "sentetik arama mesajı".into(),
+                engine: Some(EngineId::Codex),
+                project_id: None,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(keys(&sent), ["chat_id"]);
+    assert_eq!(sent["chat_id"], "c2");
+    let canceled = json(
+        cancel_turn_impl(
+            &bridge,
+            ChatIdArgs {
+                chat_id: "c2".into(),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(keys(&canceled), ["chat_id"]);
+    assert_eq!(canceled["chat_id"], "c2");
+
+    let page = json(
+        events_page_impl(
+            &bridge,
+            EventsPageArgs {
+                chat_id: "c1".into(),
+                after_seq: None,
+                limit: 2,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(keys(&page), ["events", "has_more", "next_after_seq"]);
+    assert_eq!(page["events"].as_array().unwrap().len(), 2);
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["next_after_seq"], 2);
+    assert_eq!(
+        keys(&page["events"][0]),
+        [
+            "chat_id",
+            "id",
+            "kind",
+            "payload",
+            "seq",
+            "session_id",
+            "ts"
+        ]
+    );
+    let empty_page = json(
+        events_page_impl(
+            &bridge,
+            EventsPageArgs {
+                chat_id: "c1".into(),
+                after_seq: Some(i64::MAX),
+                limit: 0,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(empty_page["events"], serde_json::json!([]));
+    assert_eq!(empty_page["has_more"], false);
+
+    let hits = json(
+        history_search_impl(
+            &bridge,
+            SearchArgs {
+                chat_id: Some("c1".into()),
+                query: "merhaba".into(),
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(keys(&hits), ["hits"]);
+    assert!(!hits["hits"].as_array().unwrap().is_empty());
+    assert_eq!(keys(&hits["hits"][0]), ["chat_id", "event_id", "text"]);
+
+    let quota = json(get_quota_impl(&bridge).await.unwrap());
+    assert_eq!(keys(&quota), ["fetched_at", "pools"]);
+    assert_eq!(quota["pools"].as_array().unwrap().len(), 3);
+    for pool in quota["pools"].as_array().unwrap() {
+        let mut pool_keys = keys(pool);
+        pool_keys.retain(|key| key != "note"); // TS note?: string
+        assert_eq!(pool_keys, ["mode", "pool", "reset_rights", "windows"]);
+        assert!(pool["mode"].is_string());
+        for window in pool["windows"].as_array().unwrap() {
+            assert_eq!(
+                keys(window),
+                ["label", "resets_at", "source", "used_pct", "window_secs"]
+            );
+        }
+    }
+    let rights = json(
+        set_reset_rights_impl(
+            &bridge,
+            ResetRightsArgs {
+                pool: "claude".into(),
+                count: 2,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(keys(&rights), ["count", "pool"]);
+    assert_eq!(rights, serde_json::json!({"pool": "claude", "count": 2}));
+    assert!(
+        set_reset_rights_impl(
+            &bridge,
+            ResetRightsArgs {
+                pool: "agy".into(),
+                count: 2
+            }
+        )
+        .await
+        .is_err()
+    );
 
     // importCatalog: ImportReport değil, {imported, updated}.
     let md = tmp.path().join("projects.md");
@@ -619,33 +865,67 @@ async fn command_json_shapes_match_ts_types() {
         include_str!("../../../../crates/ultron-core/tests/fixtures/catalog/projects.md"),
     )
     .unwrap();
-    let cat = bridge
-        .request(Request::ImportCatalog {
-            path: md.to_string_lossy().into_owned(),
-        })
+    let cat = json(
+        import_catalog_impl(
+            &bridge,
+            PathArgs {
+                path: md.to_string_lossy().into_owned(),
+            },
+        )
         .await
-        .unwrap();
+        .unwrap(),
+    );
     assert_eq!(keys(&cat), ["imported", "updated"]);
-    serde_json::from_value::<CatalogImportReport>(cat).unwrap();
-    let projects = bridge.request(Request::ListProjects).await.unwrap();
+    let projects = json(list_projects_impl(&bridge).await.unwrap());
     assert_eq!(keys(&projects), ["projects"]);
-    let parsed: Vec<ProjectInfo> = serde_json::from_value(projects["projects"].clone()).unwrap();
-    assert!(!parsed.is_empty());
+    assert!(!projects["projects"].as_array().unwrap().is_empty());
+    assert_eq!(
+        keys(&projects["projects"][0]),
+        [
+            "aliases",
+            "description",
+            "id",
+            "last_active_at",
+            "name",
+            "path"
+        ]
+    );
+    let route = json(
+        route_message_impl(
+            &bridge,
+            TextArgs {
+                text: "devam".into(),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        keys(&route),
+        ["alternatives", "confidence", "project_id", "reason"]
+    );
+    assert!(route["alternatives"].is_array());
 
     // importClaudeHistory: zarf açılır, doğrudan ImportReport.
     let root = tmp.path().join("claude-projects");
     std::fs::create_dir_all(&root).unwrap();
-    let report = ultron_desktop::commands::read_history_import(
-        &bridge,
-        Some(root.to_string_lossy().into_owned()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(keys(&report), ["chats", "files", "masked", "messages", "skipped"]);
-    serde_json::from_value::<ImportReport>(report).unwrap();
+    let report = json(
+        import_claude_history_impl(
+            &bridge,
+            HistoryArgs {
+                root: Some(root.to_string_lossy().into_owned()),
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        keys(&report),
+        ["chats", "files", "masked", "messages", "skipped"]
+    );
 
     // status.
-    let status = bridge.request(Request::Status).await.unwrap();
+    let status = json(status_impl(&bridge).await.unwrap());
     assert_eq!(
         keys(&status),
         ["default_engine", "pid", "running_turns", "version"]

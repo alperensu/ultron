@@ -6,7 +6,7 @@ export const ROUTE_DEBOUNCE_MS = 300;
 export const ROUTE_CONFIDENCE_FLOOR = 0.6;
 
 export function isAmbiguous(route: RouteResult | null): boolean {
-  return route !== null && route.confidence < ROUTE_CONFIDENCE_FLOOR && route.alternatives.length > 0;
+  return route !== null && route.confidence < ROUTE_CONFIDENCE_FLOOR && (route.alternatives ?? []).length > 0;
 }
 
 /**

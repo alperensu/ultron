@@ -36,7 +36,7 @@ export function SidebarSearch({
     setState({ phase: "loading" });
     const timer = window.setTimeout(() => {
       bridge.historySearch(trimmed, undefined, 20).then(
-        ({ hits }) => !stale && setState({ phase: "done", hits }),
+        ({ hits }) => !stale && setState({ phase: "done", hits: hits ?? [] }),
         (err: unknown) => !stale && setState({ phase: "error", message: describeBridgeError(err) }),
       );
     }, SEARCH_DEBOUNCE_MS);

@@ -100,6 +100,11 @@ export interface SendResult {
   chat_id: string;
 }
 
+export interface ResetRightsResult {
+  pool: string;
+  count: number;
+}
+
 /** Köprü hataları (Rust `BridgeError`). Servis hatası mesajı aynen gelir. */
 export type BridgeError =
   | { kind: "daemon_unavailable"; reason: string }
@@ -140,7 +145,7 @@ export interface Bridge {
   eventsPage(chatId: string, afterSeq: number | null, limit: number): Promise<EventsPage>;
   historySearch(query: string, chatId?: string, limit?: number): Promise<{ hits: SearchHit[] }>;
   getQuota(): Promise<QuotaReport>;
-  setResetRights(pool: string, count: number): Promise<unknown>;
+  setResetRights(pool: string, count: number): Promise<ResetRightsResult>;
   routeMessage(text: string): Promise<RouteResult>;
   importCatalog(path: string): Promise<CatalogImportReport>;
   importClaudeHistory(root?: string): Promise<ImportReport>;
@@ -257,6 +262,8 @@ export interface FakeBridgeOptions {
   searchHits?: SearchHit[];
   /** Yalnız testler: ilk abonelikle zamanlayıcıdan yayınlanan olaylar. */
   stream?: { events: StoredEvent[]; eventsPerSecond?: number; delayMs?: number };
+  /** Yalnız sentetik test verisi: sohbetleri ve olayları bu localStorage anahtarında saklar. */
+  persistenceKey?: string;
 }
 
 export interface FakeBridge extends Bridge {
@@ -270,8 +277,24 @@ export interface FakeBridge extends Bridge {
 
 export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
   const quota = opts.quota ? structuredClone(opts.quota) : undefined;
-  const chats = new Map((opts.chats ?? []).map((c) => [c.id, { ...c }]));
-  const events = [...(opts.events ?? [])];
+  let saved: { version: 1; chats: ChatInfo[]; events: StoredEvent[] } | undefined;
+  if (opts.persistenceKey) {
+    const raw = localStorage.getItem(opts.persistenceKey);
+    if (raw) {
+      // Eski ya da bozuk bir test kaydı başlangıç fikstürünün yüklenmesini engellemez.
+      try {
+        const parsed = JSON.parse(raw) as typeof saved;
+        if (parsed?.version === 1 && Array.isArray(parsed.chats) && Array.isArray(parsed.events)) saved = parsed;
+      } catch { /* Geçersiz JSON: sentetik başlangıç verisine dön. */ }
+    }
+  }
+  const chats = new Map((saved?.chats ?? opts.chats ?? []).map((c) => [c.id, { ...c }]));
+  const events = [...(saved?.events ?? opts.events ?? [])];
+  const persist = () => {
+    if (opts.persistenceKey) {
+      localStorage.setItem(opts.persistenceKey, JSON.stringify({ version: 1, chats: [...chats.values()], events }));
+    }
+  };
   const activeChats = new Set<string>();
   const trackTurn = (event: StoredEvent) => {
     if (["user_text", "session_started", "assistant_text"].includes(event.kind)) activeChats.add(event.chat_id);
@@ -287,6 +310,7 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
   const emit = (event: StoredEvent) => {
     events.push(event);
     trackTurn(event);
+    persist();
     eventHandlers.forEach((handler) => handler(event));
   };
   const append = (chatId: string, kind: string, payload: Record<string, unknown>) => {
@@ -298,6 +322,10 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
   };
   const scheduleStream = () => {
     const stream = opts.stream;
+    // Yeniden yüklemede saklanmış olayları zamanlayıcıdan ikinci kez yayınlama.
+    if (stream && saved) {
+      while (streamIndex < stream.events.length && events.some((event) => event.id === stream.events[streamIndex]!.id)) streamIndex++;
+    }
     if (!stream || streamTimer !== undefined || streamIndex >= stream.events.length || eventHandlers.size === 0) return;
     const rate = Math.max(1, Math.min(1000, stream.eventsPerSecond ?? 50));
     const delay = streamStarted ? 1000 / rate : Math.max(0, stream.delayMs ?? 1000 / rate);
@@ -353,6 +381,7 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
         if (patch.pinned !== undefined) c.pinned = patch.pinned;
         if (patch.archived !== undefined) c.archived = patch.archived;
         if (patch.project_id !== undefined) c.project_id = patch.project_id;
+        persist();
         return { chat: { ...c } };
       }),
     sendMessage: (req) =>
@@ -390,7 +419,7 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
     eventsPage: (id, after, limit) =>
       run("events_page", [id, after, limit], () => {
         const all = events.filter((e) => e.chat_id === id && e.seq > (after ?? 0)).sort((a, b) => a.seq - b.seq);
-        const page = all.slice(0, limit);
+        const page = all.slice(0, Math.max(1, Math.min(1000, limit)));
         return {
           events: page,
           next_after_seq: page.length ? page[page.length - 1]!.seq : after,
@@ -399,7 +428,9 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
       }),
     historySearch: (query, id, limit) =>
       run("history_search", [query, id, limit], () => ({
-        hits: (opts.searchHits ?? []).filter((h) => h.text.toLowerCase().includes(query.toLowerCase())),
+        hits: (opts.searchHits ?? []).filter((h) =>
+          (id === undefined || h.chat_id === id) && h.text.toLowerCase().includes(query.toLowerCase()),
+        ).slice(0, Math.max(1, Math.min(limit ?? 20, 100))),
       })),
     getQuota: () => run("get_quota", [], () => quota ? structuredClone(quota) : reject("kota")),
     setResetRights: (pool, count) =>
@@ -410,7 +441,7 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
         const target = quota?.pools.find((item) => item.pool === pool);
         if (!target) return reject("kota");
         target.reset_rights = count;
-        return {};
+        return { pool, count };
       }),
     routeMessage: (text) =>
       run("route_message", [text], () => (opts.route ? opts.route(text) : reject("yönlendirme"))),

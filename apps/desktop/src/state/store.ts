@@ -88,7 +88,7 @@ export function createAppStore(bridge: Bridge, now: () => number = Date.now): Ap
 
   async function refreshChats(): Promise<void> {
     const { chats } = await bridge.listChats();
-    set({ chats });
+    set({ chats: chats ?? [] });
   }
 
   async function scanTurns(chats: ChatInfo[]): Promise<CompletedTurn[]> {
@@ -102,7 +102,7 @@ export function createAppStore(bridge: Bridge, now: () => number = Date.now): Ap
       let userTs: string | null = null;
       for (let page = 0; page < SCAN_PAGES; page++) {
         const res = await bridge.eventsPage(chat.id, after, SCAN_PAGE_SIZE);
-        for (const ev of res.events) {
+        for (const ev of res.events ?? []) {
           if (ev.kind === "user_text") userTs = ev.ts;
           if (ev.kind === "turn_completed") found.push(toTurn(chat, ev, userTs));
         }
@@ -150,8 +150,8 @@ export function createAppStore(bridge: Bridge, now: () => number = Date.now): Ap
       set({
         loaded: true,
         daemon: { state: "ready", version: status.version, runningTurns: status.running_turns },
-        projects: projects.projects,
-        chats: chats.chats,
+        projects: projects.projects ?? [],
+        chats: chats.chats ?? [],
       });
     } catch (err) {
       set({ loaded: true, daemon: { state: "unavailable", reason: describeBridgeError(err) } });

@@ -87,7 +87,7 @@ function QuotaStrip() {
     <section className="ui-section">
       <h2 className="ui-section__header">Kota</h2>
       <div className="quota-strip">
-        {quota.pools.map((pool) => (
+        {(quota.pools ?? []).map((pool) => (
           <QuotaTile key={pool.pool} pool={pool} />
         ))}
       </div>
