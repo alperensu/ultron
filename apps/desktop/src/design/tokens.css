@@ -1,0 +1,142 @@
+/* Ultron tasarım token'ları: yalnızca koyu tema (iOS karanlık mod). */
+:root {
+  color-scheme: dark;
+
+  /* yüzeyler */
+  --bg: #000000;
+  --sec: #1c1c1e;
+  --ter: #2c2c2e;
+  --fill: #3a3a3c;
+  --glass: rgba(30, 30, 30, 0.72);
+  --sep: rgba(84, 84, 88, 0.65);
+
+  /* etiketler */
+  --l1: #ffffff;
+  --l2: rgba(235, 235, 245, 0.6);
+  --l3: rgba(235, 235, 245, 0.3);
+
+  /* vurgu ve durum */
+  --blue: #0a84ff;
+  --green: #30d158;
+  --orange: #ff9f0a;
+  --red: #ff453a;
+
+  /* tipografi */
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI",
+    system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+  --fs-large-title: 34px;
+  --lh-large-title: 41px;
+  --fs-title: 22px;
+  --fs-headline: 17px;
+  --fs-body: 15px;
+  --fs-footnote: 13px;
+
+  /* hareket */
+  --spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur-fast: 0.2s;
+  --dur: 0.42s;
+
+  /* yarıçaplar */
+  --r-group: 12px;
+  --r-sheet: 14px;
+  --r-pill: 999px;
+
+  --sidebar-w: 248px;
+  --navbar-h: 52px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--l1);
+  font: 400 var(--fs-body) / 1.4 var(--font);
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+p,
+h1,
+h2,
+h3 {
+  margin: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.press {
+  transition: transform var(--dur-fast) var(--spring), background-color var(--dur-fast);
+}
+.press:active {
+  transform: scale(0.97);
+}
+
+.icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--l3);
+  flex: none;
+  display: inline-block;
+}
+.dot.ok { background: var(--green); }
+.dot.wait { background: var(--orange); }
+.dot.err { background: var(--red); }
+.dot.run { background: var(--blue); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* prefers-reduced-motion (WebView2'de Windows "animasyonları azalt" ayarı buraya yansır) */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
