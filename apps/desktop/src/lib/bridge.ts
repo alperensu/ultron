@@ -56,6 +56,12 @@ export interface ImportReport {
   masked: number;
 }
 
+/** `importCatalog` sonucu (Rust `CatalogImportReport`). */
+export interface CatalogImportReport {
+  imported: number;
+  updated: number;
+}
+
 export interface SendResult {
   chat_id: string;
 }
@@ -102,7 +108,7 @@ export interface Bridge {
   getQuota(): Promise<unknown>;
   setResetRights(pool: string, count: number): Promise<unknown>;
   routeMessage(text: string): Promise<unknown>;
-  importCatalog(path: string): Promise<ImportReport>;
+  importCatalog(path: string): Promise<CatalogImportReport>;
   importClaudeHistory(root?: string): Promise<ImportReport>;
   status(): Promise<{ version: string; pid: number; running_turns: number; default_engine: EngineId }>;
   /** `ultron://event` aboneliği; dönen işlev aboneliği bırakır. */
@@ -252,7 +258,7 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
             (args?.project_id === undefined || c.project_id === args.project_id),
         ),
       })),
-    getChat: (id) => run("get_chat", [id], () => ({ chat: getChat(id), work_state: null, last_engine: getChat(id).engine })),
+    getChat: (id) => run("get_chat", [id], () => ({ chat: { ...getChat(id) }, work_state: null, last_engine: getChat(id).engine })),
     updateChat: (id, patch) =>
       run("update_chat", [id, patch], () => {
         const c = getChat(id);
@@ -299,9 +305,10 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
     setResetRights: (pool, count) =>
       run("set_reset_rights", [pool, count], () => reject("kota")),
     routeMessage: (text) => run("route_message", [text], () => reject("yönlendirme")),
-    importCatalog: (path) => run("import_catalog", [path], () => reject("içe aktarma")),
+    // Sahte köprü: gerçek dosya okumaz; boş rapor, gerçek servisle aynı biçimde.
+    importCatalog: (path) => run("import_catalog", [path], () => ({ imported: 0, updated: 0 })),
     importClaudeHistory: (root) =>
-      run("import_claude_history", [root], () => reject("içe aktarma")),
+      run("import_claude_history", [root], () => ({ files: 0, chats: 0, messages: 0, skipped: 0, masked: 0 })),
     status: () =>
       run("status", [], () => ({ version: "test", pid: 0, running_turns: 0, default_engine: "claude" as const })),
     onEvent: async (h) => {
