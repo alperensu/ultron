@@ -1,13 +1,28 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Ana pencere: çekirdek izinler ve özel başlık çubuğu için pencere düğmeleri. fs/shell/http/dialog eklentisi yok.",
+  "description": "Ana pencere: çekirdek izinler, özel başlık çubuğu için pencere düğmeleri ve ultrond köprü komutları. fs/shell/http/dialog eklentisi yok.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "allow-list-projects",
+    "allow-list-chats",
+    "allow-get-chat",
+    "allow-update-chat",
+    "allow-send-message",
+    "allow-switch-engine",
+    "allow-cancel-turn",
+    "allow-events-page",
+    "allow-history-search",
+    "allow-get-quota",
+    "allow-set-reset-rights",
+    "allow-route-message",
+    "allow-import-catalog",
+    "allow-import-claude-history",
+    "allow-status"
   ]
 }

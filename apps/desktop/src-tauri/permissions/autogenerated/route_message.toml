@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-route-message"
+description = "Enables the route_message command without any pre-configured scope."
+commands.allow = ["route_message"]
+
+[[permission]]
+identifier = "deny-route-message"
+description = "Denies the route_message command without any pre-configured scope."
+commands.deny = ["route_message"]

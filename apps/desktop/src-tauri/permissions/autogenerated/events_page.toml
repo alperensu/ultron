@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-events-page"
+description = "Enables the events_page command without any pre-configured scope."
+commands.allow = ["events_page"]
+
+[[permission]]
+identifier = "deny-events-page"
+description = "Denies the events_page command without any pre-configured scope."
+commands.deny = ["events_page"]
