@@ -706,7 +706,11 @@ async fn dispatch(
                     ok(writer, json!({"done": true})).await?;
                     return Ok(Flow::Continue);
                 }
-                let mut wake = st.log.subscribe();
+                let mut wake = if follow {
+                    subscribe_and_ack(st, writer, Some(&chat)).await?
+                } else {
+                    st.log.subscribe()
+                };
                 loop {
                     flush_events(st, &chat, &mut last_seq, writer).await?;
                     if !follow {
@@ -730,7 +734,7 @@ async fn dispatch(
                 }
             }
             None if follow => {
-                let mut wake = st.log.subscribe();
+                let mut wake = subscribe_and_ack(st, writer, None).await?;
                 // Sohbet başına son iletilen sıra. Yayın kanalı taşarsa (Lagged) kaçan olaylar
                 // bu imleçlerden itibaren veritabanından tamamlanır.
                 let mut cursors: HashMap<String, i64> = HashMap::new();
@@ -763,6 +767,82 @@ async fn dispatch(
             }
             None => Err(anyhow!("follow olmadan chat_id gerekli")),
         },
+    }
+}
+
+/// Entegrasyon testlerinde aboneliği ve onayı ayrı ayrı bekleten bariyer.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub struct SubscribeGate {
+    pub root: std::path::PathBuf,
+    /// Sunucu kapıya ulaşınca bildirilir.
+    pub reached: tokio::sync::Notify,
+    /// Abonelik, bir izin verilene dek başlamaz.
+    pub release: tokio::sync::Semaphore,
+    pub subscribed: tokio::sync::Notify,
+    /// Abonelik kurulduktan sonra onayı ayrıca bekletir.
+    pub acknowledge: tokio::sync::Semaphore,
+}
+
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub static SUBSCRIBE_GATE: Mutex<Option<Arc<SubscribeGate>>> = Mutex::new(None);
+
+/// `follow` akışları için tek abonelik noktası: (varsa test kapısını bekler,) abone olur ve
+/// aboneliğin kurulduğunu bildiren ilk kareyi (`{"subscribed":true,...}`) yazar.
+async fn subscribe_and_ack(
+    st: &State,
+    writer: &mut Writer,
+    chat_id: Option<&str>,
+) -> Result<broadcast::Receiver<ultron_core::db::StoredEvent>> {
+    #[cfg(feature = "test-hooks")]
+    let gate = SUBSCRIBE_GATE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|g| g.root == st.paths.root);
+    #[cfg(feature = "test-hooks")]
+    if let Some(gate) = &gate {
+        gate.reached.notify_one();
+        gate.release.acquire().await?.forget();
+    }
+    // Günlük yalnız eklenir: aboneliğin iki yanında aynı başlar okunursa bu başlar
+    // subscribe() anında da geçerlidir. Ayrı Db sorgularının arasına yazım girebilir;
+    // bu durumda alıcıyı bırakıp yeniden dene. Sürekli yazımda yanlış bir onay verme.
+    let mut snapshot = None;
+    for _ in 0..8 {
+        let before = subscription_heads(st, chat_id)?;
+        let wake = st.log.subscribe();
+        let after = subscription_heads(st, chat_id)?;
+        if before == after {
+            snapshot = Some((wake, after));
+            break;
+        }
+        drop(wake);
+        tokio::task::yield_now().await;
+    }
+    let (wake, head_seq) = snapshot.context("abonelik başları sabitlenemedi; yeniden bağlanın")?;
+    #[cfg(feature = "test-hooks")]
+    if let Some(gate) = &gate {
+        gate.subscribed.notify_one();
+        gate.acknowledge.acquire().await?.forget();
+    }
+    ok(writer, json!({"subscribed": true, "head_seq": head_seq})).await?;
+    Ok(wake)
+}
+
+/// Kalıcı max(seq); genel akışta {chat_id: seq}, tek sohbette sayı. Onay beklenirken
+/// yazılan olaylar bu görüntüyü değiştirmez, yalnız canlı kuyruğa girer.
+fn subscription_heads(st: &State, chat_id: Option<&str>) -> Result<Value> {
+    if let Some(chat) = chat_id {
+        Ok(json!(st.db.last_event(chat)?.map_or(0, |ev| ev.seq)))
+    } else {
+        let mut heads = serde_json::Map::new();
+        for chat in st.db.list_chats(None, true)? {
+            let seq = st.db.last_event(&chat.id)?.map_or(0, |ev| ev.seq);
+            heads.insert(chat.id, json!(seq));
+        }
+        Ok(Value::Object(heads))
     }
 }
 

@@ -2,7 +2,6 @@ mod common;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::*;
 use ultron_core::engine::{Engine, FakeEngine};
@@ -110,7 +109,7 @@ async fn events_follow_receives_live_events() {
         })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    expect_ack(&mut watcher).await;
 
     let mut sender = connect(&h).await;
     sender
@@ -391,7 +390,7 @@ async fn global_follow_catches_up_after_lag() {
         })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    expect_ack(&mut watcher).await;
 
     let req = send_req(&cwd, Some("lag-1"), "merhaba");
     run_turn(&h, req).await;
@@ -406,5 +405,168 @@ async fn global_follow_catches_up_after_lag() {
         }
     }
     assert_eq!(seqs, (1..=2501).collect::<Vec<i64>>());
+    h.shutdown().await;
+}
+
+/// Follow akışının ilk karesi abonelik onayıdır.
+async fn expect_ack(c: &mut ultron_core::ipc::Client) -> serde_json::Value {
+    match next(c).await.expect("akış kapandı") {
+        Response::Ok { data } if data["subscribed"] == true => data,
+        other => panic!("ilk kare abonelik onayı olmalı: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn follow_stream_starts_with_subscription_ack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let h = start_with(&paths, &unique_pipe(), &LINES).await;
+
+    let mut global = connect(&h).await;
+    global
+        .send(&Request::Events {
+            chat_id: None,
+            follow: true,
+            after_seq: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_ack(&mut global).await["head_seq"],
+        serde_json::json!({})
+    );
+
+    let mut chat = connect(&h).await;
+    chat.send(&Request::Events {
+        chat_id: Some("yok-sohbet".into()),
+        follow: true,
+        after_seq: None,
+        limit: None,
+    })
+    .await
+    .unwrap();
+    let data = expect_ack(&mut chat).await;
+    assert_eq!(data["head_seq"], 0);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn subscription_ack_precedes_replay_and_reports_chat_heads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let cwd = abs_dir(tmp.path());
+    let h = start_with(&paths, &unique_pipe(), &LINES).await;
+    let first = run_turn(&h, send_req(&cwd, Some("c1"), "ilk")).await;
+    assert_eq!(
+        first,
+        [
+            "user_text",
+            "session_started",
+            "assistant_text",
+            "turn_completed"
+        ]
+    );
+    let second = run_turn(&h, send_req(&cwd, Some("c1"), "ikinci")).await;
+    let other = run_turn(&h, send_req(&cwd, Some("c2"), "ilk")).await;
+    let c1_head = (first.len() + second.len()) as i64;
+    let c2_head = other.len() as i64;
+
+    let mut global = connect(&h).await;
+    global
+        .send(&Request::Events {
+            chat_id: None,
+            follow: true,
+            after_seq: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_ack(&mut global).await["head_seq"],
+        serde_json::json!({"c1": c1_head, "c2": c2_head})
+    );
+
+    let mut chat = connect(&h).await;
+    chat.send(&Request::Events {
+        chat_id: Some("c1".into()),
+        follow: true,
+        after_seq: Some(4),
+        limit: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(expect_ack(&mut chat).await["head_seq"], c1_head);
+    for seq in 5..=c1_head {
+        match next(&mut chat).await {
+            Some(Response::Event(ev)) => assert_eq!((ev.chat_id.as_str(), ev.seq), ("c1", seq)),
+            other => panic!("onaydan sonra replay bekleniyordu: {other:?}"),
+        }
+    }
+    h.shutdown().await;
+}
+
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn subscription_heads_are_frozen_before_ack_is_written() {
+    use ultrond::server::{SUBSCRIBE_GATE, SubscribeGate};
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let cwd = abs_dir(tmp.path());
+    let h = start_with(&paths, &unique_pipe(), &LINES).await;
+    run_turn(&h, send_req(&cwd, Some("c1"), "ilk")).await;
+    let gate = Arc::new(SubscribeGate {
+        root: paths.root.clone(),
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+        subscribed: tokio::sync::Notify::new(),
+        acknowledge: tokio::sync::Semaphore::new(0),
+    });
+    *SUBSCRIBE_GATE.lock().unwrap() = Some(gate.clone());
+    struct ResetGate;
+    impl Drop for ResetGate {
+        fn drop(&mut self) {
+            *SUBSCRIBE_GATE.lock().unwrap() = None;
+        }
+    }
+    let _reset = ResetGate;
+    let mut watcher = connect(&h).await;
+    watcher
+        .send(&Request::Events {
+            chat_id: None,
+            follow: true,
+            after_seq: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), gate.reached.notified())
+        .await
+        .expect("abonelik kapıya ulaşmadı");
+    // subscribe() öncesi yazım başa dahildir; onay öncesi ama abonelik sonrası yazım değildir.
+    run_turn(&h, send_req(&cwd, Some("c1"), "ikinci")).await;
+    gate.release.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        gate.subscribed.notified(),
+    )
+    .await
+    .expect("abonelik kurulmadı");
+    run_turn(&h, send_req(&cwd, Some("c1"), "üçüncü")).await;
+    run_turn(&h, send_req(&cwd, Some("c2"), "ilk")).await;
+    gate.acknowledge.add_permits(1);
+    assert_eq!(
+        expect_ack(&mut watcher).await["head_seq"],
+        serde_json::json!({"c1": 8})
+    );
+    for (chat, seq) in (9..=12)
+        .map(|seq| ("c1", seq))
+        .chain((1..=4).map(|seq| ("c2", seq)))
+    {
+        match next(&mut watcher).await {
+            Some(Response::Event(ev)) => assert_eq!((ev.chat_id.as_str(), ev.seq), (chat, seq)),
+            other => panic!("onaydan sonra canlı olay bekleniyordu: {other:?}"),
+        }
+    }
     h.shutdown().await;
 }

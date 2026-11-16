@@ -98,6 +98,7 @@ async fn catch_up<F: FnMut(StoredEvent)>(
 async fn reconcile<F: FnMut(StoredEvent)>(
     bridge: &Bridge,
     sync: &mut Sync,
+    heads: &HashMap<String, i64>,
     emit: &mut F,
 ) -> anyhow::Result<()> {
     let data = bridge
@@ -118,8 +119,52 @@ async fn reconcile<F: FnMut(StoredEvent)>(
         }
         sync.known.insert(chat.id, chat.updated_at);
     }
+    // İlk bağlantıda geçmişi yeniden oynatma kuralı korunur. Sonraki bağlantılarda zaman
+    // damgası değişmemiş olsa bile onaydaki başa kadar tamamla; canlı kopyaları imleç eler.
+    for (chat, head) in heads {
+        if (sync.initialized || sync.cursors.last(chat).is_some())
+            && sync.cursors.last(chat).unwrap_or(0) < *head
+        {
+            catch_up(bridge, chat, &mut sync.cursors, emit).await?;
+            anyhow::ensure!(
+                sync.cursors.last(chat).unwrap_or(0) >= *head,
+                "abonelik başına kadar olaylar tamamlanamadı"
+            );
+        }
+    }
     sync.initialized = true;
     Ok(())
+}
+
+/// Yalnız bu bağlantının geçerli onayından sonra istemciyi ve abonelik başlarını döndürür.
+/// İlk bağlantı, yeniden bağlantı ve hata sonrası deneme aynı kapıdan geçer.
+async fn subscribe(bridge: &Bridge) -> anyhow::Result<(Client, HashMap<String, i64>)> {
+    let mut client: Client = bridge.connect().await?;
+    client
+        .send(&Request::Events {
+            chat_id: None,
+            follow: true,
+            after_seq: None,
+            limit: None,
+        })
+        .await?;
+    // `send` aboneliği kanıtlamaz: sunucunun `{"subscribed":true}` onayını bekle. Bundan önce
+    // uzlaşma/Ready yok; onaydan sonraki her olay akışta bekler.
+    let resp = tokio::time::timeout(Duration::from_secs(30), client.next()).await??;
+    let heads: HashMap<String, i64> = match resp {
+        Some(Response::Ok { data }) if data["subscribed"] == true => {
+            let heads: HashMap<String, i64> = serde_json::from_value(data["head_seq"].clone())?;
+            anyhow::ensure!(
+                heads.values().all(|seq| *seq >= 0),
+                "geçersiz abonelik başı"
+            );
+            heads
+        }
+        Some(Response::Error { message }) => anyhow::bail!(message),
+        None => anyhow::bail!("olay akışı abonelik onayından önce kapandı"),
+        _ => anyhow::bail!("ilk akış yanıtı abonelik onayı olmalı"),
+    };
+    Ok((client, heads))
 }
 
 async fn follow_once<F: FnMut(StoredEvent), G: FnMut(DaemonStatus)>(
@@ -130,21 +175,18 @@ async fn follow_once<F: FnMut(StoredEvent), G: FnMut(DaemonStatus)>(
     cancel: &CancellationToken,
     connected: &mut bool,
 ) -> anyhow::Result<()> {
-    // Önce abone ol: bu andan sonraki olaylar akışta (boruda) bekler.
-    let mut client: Client = bridge.connect().await?;
-    client
-        .send(&Request::Events {
-            chat_id: None,
-            follow: true,
-            after_seq: None,
-            limit: None,
-        })
-        .await?;
+    let (mut client, heads) = tokio::select! {
+        () = cancel.cancelled() => return Ok(()),
+        result = subscribe(bridge) => result?,
+    };
+    // Onaylanmış bu bağlantıdan sonra kaçanları tamamla; bekleyen canlı olaylar tekrarsız akar
+    // (`Cursors::accept` yinelenenleri eler).
+    tokio::select! {
+        () = cancel.cancelled() => return Ok(()),
+        result = reconcile(bridge, sync, &heads, emit) => result?,
+    }
     *connected = true;
     on_state(DaemonStatus::Ready);
-    // Sonra kaçanları günlükten tamamla; ardından bekleyen canlı olaylar tekrarsız akar
-    // (`Cursors::accept` yinelenenleri eler).
-    reconcile(bridge, sync, emit).await?;
     loop {
         let resp = tokio::select! {
             () = cancel.cancelled() => return Ok(()),

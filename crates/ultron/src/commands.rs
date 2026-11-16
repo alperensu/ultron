@@ -227,6 +227,10 @@ async fn stream(client: &mut Client, verbose: bool) -> Result<Option<Value>> {
                 }
             }
             Some(Response::Ok { data }) => {
+                // Follow abonelik onayı çıktı ya da bitiş değildir.
+                if data.get("subscribed") == Some(&Value::Bool(true)) {
+                    continue;
+                }
                 if data.get("done") == Some(&Value::Bool(true)) {
                     return Ok(Some(data));
                 }

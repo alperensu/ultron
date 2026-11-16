@@ -79,16 +79,20 @@ fn send(cwd: &Path, chat: &str) -> Request {
 }
 
 /// Bir turu başlatıp bitene dek bekler (olaylar günlüğe yazılır).
-async fn run_turn(bridge: &Bridge, cwd: &Path, chat: &str) {
+async fn run_turn(bridge: &Bridge, cwd: &Path, chat: &str) -> i64 {
     let mut client = bridge.connect().await.unwrap();
     client.send(&send(cwd, chat)).await.unwrap();
+    let mut head = 0;
     loop {
         let r = tokio::time::timeout(Duration::from_secs(20), client.next())
             .await
             .expect("tur zaman aşımı")
             .unwrap();
         match r {
-            Some(ultron_core::ipc::Response::Ok { data }) if data.get("done").is_some() => return,
+            Some(ultron_core::ipc::Response::Ok { data }) if data.get("done").is_some() => {
+                return head;
+            }
+            Some(ultron_core::ipc::Response::Event(ev)) => head = ev.seq,
             Some(ultron_core::ipc::Response::Error { message }) => panic!("{message}"),
             None => panic!("akış erken kapandı"),
             _ => {}
@@ -407,6 +411,160 @@ async fn daemon_state_follows_connection() {
 
     cancel.cancel();
     let _ = follower.await;
+}
+
+#[tokio::test]
+async fn bridge_waits_for_subscription_ack_before_ready() {
+    use ultron_desktop::events::{DaemonStatus, run_follow_with_state};
+    use ultrond::server::{SUBSCRIBE_GATE, SubscribeGate};
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let make_gate = || {
+        Arc::new(SubscribeGate {
+            root: paths.root.clone(),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            subscribed: tokio::sync::Notify::new(),
+            acknowledge: tokio::sync::Semaphore::new(0),
+        })
+    };
+    let gate = make_gate();
+    *SUBSCRIBE_GATE.lock().unwrap() = Some(gate.clone());
+    struct ResetGate;
+    impl Drop for ResetGate {
+        fn drop(&mut self) {
+            *SUBSCRIBE_GATE.lock().unwrap() = None;
+        }
+    }
+    let _reset = ResetGate;
+    let server = start_server(&paths, &pipe).await;
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let follower = {
+        let bridge = bridge.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            run_follow_with_state(
+                &bridge,
+                Backoff::default(),
+                cancel,
+                move |ev| {
+                    let _ = event_tx.send((ev.chat_id, ev.seq));
+                },
+                move |s| {
+                    let _ = tx.send(s);
+                },
+            )
+            .await;
+        })
+    };
+    // İlk bağlantı da onay gelmeden Ready veya olay iletemez.
+    tokio::time::timeout(Duration::from_secs(20), gate.reached.notified())
+        .await
+        .expect("ilk bağlantı kapıya ulaşmadı");
+    assert!(rx.try_recv().is_err(), "abonelikten önce durum bildirildi");
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(20), gate.subscribed.notified())
+        .await
+        .expect("ilk abonelik kurulmadı");
+    let first_head = run_turn(&bridge, &cwd, "c1").await;
+    assert_eq!(first_head, 4, "kullanıcı mesajı ve üç fixture olayı");
+    assert!(rx.try_recv().is_err(), "ilk onaydan önce Ready bildirildi");
+    assert!(
+        event_rx.try_recv().is_err(),
+        "ilk onaydan önce olay iletildi"
+    );
+    gate.acknowledge.add_permits(1);
+    assert_eq!(next_status(&mut rx).await, DaemonStatus::Ready);
+    let mut seen = Seen::new();
+    // Turun TÜM olaylarını tüket: kanalda kalan turn_completed erken uzlaşma değildir.
+    assert!(collect_until(&mut event_rx, &mut seen, |s| s.len() >= first_head as usize).await);
+    assert_eq!(seqs_of(&seen, "c1"), (1..=first_head).collect::<Vec<_>>());
+    server.shutdown().await;
+    assert!(matches!(
+        next_status(&mut rx).await,
+        DaemonStatus::Unavailable(_)
+    ));
+
+    // Yeniden bağlantıda hem subscribe() hem de onay ayrı bariyerlerde bekletilir.
+    let server = start_server(&paths, &pipe).await;
+    tokio::time::timeout(Duration::from_secs(20), gate.reached.notified())
+        .await
+        .expect("sunucu kapıya ulaşmadı");
+    // Önceki imleci olan ve yeni oluşturulan iki sohbet de abonelikten önce tamamlanır.
+    run_turn(&bridge, &cwd, "c1").await;
+    let c2_head = run_turn(&bridge, &cwd, "c2").await;
+    while let Ok(status) = rx.try_recv() {
+        assert_ne!(status, DaemonStatus::Ready, "onaydan önce Ready bildirildi");
+    }
+    assert!(event_rx.try_recv().is_err(), "onaydan önce uzlaşma yapıldı");
+    gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(20), gate.subscribed.notified())
+        .await
+        .expect("abonelik kurulmadı");
+    // Bu tur onaydaki sabit baştan sonradır; yalnız canlı kuyruğa girer.
+    run_turn(&bridge, &cwd, "c1").await;
+    assert!(rx.try_recv().is_err(), "abonelik tek başına Ready olmamalı");
+    assert!(event_rx.try_recv().is_err(), "onaydan önce olay iletildi");
+    // Onay beklerken hata: bir sonraki deneme eski aboneliğin onayını kullanamaz.
+    let retry_gate = make_gate();
+    *SUBSCRIBE_GATE.lock().unwrap() = Some(retry_gate.clone());
+    gate.acknowledge.close();
+    assert!(matches!(
+        next_status(&mut rx).await,
+        DaemonStatus::Unavailable(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(20), retry_gate.reached.notified())
+        .await
+        .expect("hata sonrası deneme kapıya ulaşmadı");
+    assert!(
+        rx.try_recv().is_err(),
+        "hata sonrası onaydan önce Ready bildirildi"
+    );
+    assert!(
+        event_rx.try_recv().is_err(),
+        "hata sonrası onaydan önce uzlaşma yapıldı"
+    );
+    retry_gate.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(20), retry_gate.subscribed.notified())
+        .await
+        .expect("hata sonrası abonelik kurulmadı");
+    let c1_head = run_turn(&bridge, &cwd, "c1").await;
+    assert!(rx.try_recv().is_err(), "yeni bağlantının onayı beklenmedi");
+    assert!(
+        event_rx.try_recv().is_err(),
+        "yeni onaydan önce olay iletildi"
+    );
+    retry_gate.acknowledge.add_permits(1);
+    assert_eq!(next_status(&mut rx).await, DaemonStatus::Ready);
+    // Ready geldiğinde onaydaki başa kadar uzlaşma tamamlanmış olmalı.
+    while let Ok(event) = event_rx.try_recv() {
+        seen.push(event);
+    }
+    assert_eq!(seqs_of(&seen, "c1"), (1..=c1_head).collect::<Vec<_>>());
+    assert_eq!(seqs_of(&seen, "c2"), (1..=c2_head).collect::<Vec<_>>());
+
+    // Sonraki canlı tur, kuyruktaki kopyalar tüketildikten sonra da sıralı ve tekrarsızdır.
+    let live_head = run_turn(&bridge, &cwd, "c1").await;
+    assert!(
+        collect_until(&mut event_rx, &mut seen, |s| s.len()
+            >= (live_head + c2_head) as usize)
+        .await
+    );
+    assert_eq!(seqs_of(&seen, "c1"), (1..=live_head).collect::<Vec<_>>());
+    assert_eq!(seqs_of(&seen, "c2"), (1..=c2_head).collect::<Vec<_>>());
+
+    cancel.cancel();
+    let _ = follower.await;
+    server.shutdown().await;
 }
 
 fn keys(v: &serde_json::Value) -> Vec<String> {

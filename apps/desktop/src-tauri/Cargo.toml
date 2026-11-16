@@ -20,7 +20,7 @@ ultron-core = { path = "../../../crates/ultron-core" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-ultrond = { path = "../../../crates/ultrond" }
+ultrond = { path = "../../../crates/ultrond", features = ["test-hooks"] }
 uuid = { workspace = true }
 
 [lints]
