@@ -18,6 +18,7 @@ pub mod quota;
 pub mod routing;
 pub mod session;
 pub mod summarizer;
+pub mod trash;
 pub mod workstate;
 
 pub use config::{Config, EngineConfig, EngineId};
