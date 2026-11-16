@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::EngineId;
+use crate::ipc::{ChatInfo, ProjectInfo};
+
+/// Otomatik sohbet başlığı üst sınırı (karakter).
+pub const TITLE_MAX_CHARS: usize = 60;
 
 /// Devir paketi ve çalışma durumu türetimi için bir sohbetten okunan en fazla olay sayısı.
 /// Daha eski geçmiş yalnız tam metin aramasıyla (`ultron history search`) erişilebilir.
@@ -123,6 +127,214 @@ impl Db {
             "INSERT OR IGNORE INTO chats(id, project_id, title, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![id, project_id, title, created_at.to_rfc3339()],
         )?;
+        Ok(())
+    }
+
+    /// Projeyi ekler veya günceller (kimliğe göre).
+    pub fn upsert_project(&self, p: &ProjectInfo) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO projects(id, name, path, aliases_json, description, last_active_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name, path = excluded.path,
+                aliases_json = excluded.aliases_json, description = excluded.description,
+                last_active_at = COALESCE(excluded.last_active_at, projects.last_active_at)",
+            params![
+                p.id,
+                p.name,
+                p.path,
+                serde_json::to_string(&p.aliases)?,
+                p.description,
+                p.last_active_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn project_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ProjectInfo, String)> {
+        Ok((
+            ProjectInfo {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                path: r.get(2)?,
+                aliases: Vec::new(),
+                description: r.get(4)?,
+                last_active_at: r.get(5)?,
+            },
+            r.get(3)?,
+        ))
+    }
+
+    /// Tek projeyi okur.
+    pub fn get_project(&self, id: &str) -> Result<Option<ProjectInfo>> {
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, name, path, aliases_json, description, last_active_at
+                 FROM projects WHERE id = ?1",
+                params![id],
+                Self::project_row,
+            )
+            .optional()?;
+        row.map(|(mut p, aliases)| {
+            p.aliases = serde_json::from_str(&aliases)?;
+            Ok(p)
+        })
+        .transpose()
+    }
+
+    /// Tüm projeler: son etkinliğe göre yeniden eskiye, sonra ada göre.
+    pub fn list_projects(&self) -> Result<Vec<ProjectInfo>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, path, aliases_json, description, last_active_at
+             FROM projects ORDER BY last_active_at IS NULL, last_active_at DESC, name ASC",
+        )?;
+        let rows = stmt.query_map([], Self::project_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mut p, aliases) = row?;
+            p.aliases = serde_json::from_str(&aliases)?;
+            out.push(p);
+        }
+        Ok(out)
+    }
+
+    fn chat_info_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ChatInfo, Option<String>)> {
+        Ok((
+            ChatInfo {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                project_id: r.get(2)?,
+                pinned: r.get::<_, i64>(3)? != 0,
+                archived: r.get::<_, i64>(4)? != 0,
+                updated_at: r.get(5)?,
+                engine: None,
+            },
+            r.get(6)?,
+        ))
+    }
+
+    fn finish_chat_info((mut c, engine): (ChatInfo, Option<String>)) -> Result<ChatInfo> {
+        c.engine = engine.as_deref().map(engine_parse).transpose()?;
+        Ok(c)
+    }
+
+    const CHAT_COLS: &'static str = "id, title, project_id, pinned, archived,
+         COALESCE(updated_at, created_at), current_engine";
+
+    /// Sohbetler: önce sabitlenenler, sonra en son güncellenenler.
+    pub fn list_chats(
+        &self,
+        project_id: Option<&str>,
+        include_archived: bool,
+    ) -> Result<Vec<ChatInfo>> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT {} FROM chats
+             WHERE (?1 IS NULL OR project_id = ?1) AND (?2 = 1 OR archived = 0)
+             ORDER BY pinned DESC, COALESCE(updated_at, created_at) DESC, rowid DESC",
+            Self::CHAT_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![project_id, i64::from(include_archived)],
+            Self::chat_info_row,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(Self::finish_chat_info(row?)?);
+        }
+        Ok(out)
+    }
+
+    /// Tek sohbetin meta verisi.
+    pub fn get_chat(&self, chat_id: &str) -> Result<Option<ChatInfo>> {
+        let conn = self.conn()?;
+        let sql = format!("SELECT {} FROM chats WHERE id = ?1", Self::CHAT_COLS);
+        let row = conn
+            .query_row(&sql, params![chat_id], Self::chat_info_row)
+            .optional()?;
+        row.map(Self::finish_chat_info).transpose()
+    }
+
+    /// Sohbet alanlarını günceller; verilen başlık kullanıcı başlığı olur (`title_source='user'`).
+    /// Sohbet yoksa `false` döner.
+    pub fn update_chat(
+        &self,
+        chat_id: &str,
+        title: Option<&str>,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        project_id: Option<Option<&str>>,
+    ) -> Result<bool> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
+            params![chat_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+        if let Some(title) = title {
+            tx.execute(
+                "UPDATE chats SET title = ?2, title_source = 'user' WHERE id = ?1",
+                params![chat_id, title],
+            )?;
+        }
+        if let Some(pinned) = pinned {
+            tx.execute(
+                "UPDATE chats SET pinned = ?2 WHERE id = ?1",
+                params![chat_id, i64::from(pinned)],
+            )?;
+        }
+        if let Some(archived) = archived {
+            tx.execute(
+                "UPDATE chats SET archived = ?2 WHERE id = ?1",
+                params![chat_id, i64::from(archived)],
+            )?;
+        }
+        if let Some(project_id) = project_id {
+            tx.execute(
+                "UPDATE chats SET project_id = ?2 WHERE id = ?1",
+                params![chat_id, project_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Sohbeti projeye bağlar (yalnız henüz projesi yoksa) ve projenin son etkinliğini işler.
+    pub fn bind_chat_project(&self, chat_id: &str, project_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE chats SET project_id = ?2 WHERE id = ?1 AND project_id IS NULL",
+            params![chat_id, project_id],
+        )?;
+        conn.execute(
+            "UPDATE projects SET last_active_at = ?2 WHERE id = ?1",
+            params![project_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Sohbetin güncellenme zamanını yazar; başlık boş ve otomatikse ilk mesajdan başlık üretir.
+    pub fn touch_chat(&self, chat_id: &str, first_message: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE chats SET updated_at = ?2 WHERE id = ?1",
+            params![chat_id, Utc::now().to_rfc3339()],
+        )?;
+        let title = auto_title(first_message);
+        if !title.is_empty() {
+            conn.execute(
+                "UPDATE chats SET title = ?2 WHERE id = ?1 AND title = '' AND title_source = 'auto'",
+                params![chat_id, title],
+            )?;
+        }
         Ok(())
     }
 
@@ -459,6 +671,21 @@ impl Db {
             }
         };
         Ok(hits)
+    }
+}
+
+/// En fazla [`TITLE_MAX_CHARS`] karakterlik, sözcük sınırında kesilmiş tek satır başlık.
+pub fn auto_title(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= TITLE_MAX_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(TITLE_MAX_CHARS).collect();
+    // Kesim bir sözcüğün ortasına düştüyse son boşluğa geri çekilir.
+    let at_boundary = flat.chars().nth(TITLE_MAX_CHARS) == Some(' ');
+    match cut.rfind(' ') {
+        Some(i) if !at_boundary && i > 0 => cut[..i].to_string(),
+        _ => cut.trim_end().to_string(),
     }
 }
 

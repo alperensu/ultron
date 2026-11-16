@@ -263,6 +263,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     engine: engine.map(EngineId::from),
                     text: message,
                     policy: policy.into(),
+                    project_id: None,
                 })
                 .await?;
             let done = stream(&mut client, false).await?;
