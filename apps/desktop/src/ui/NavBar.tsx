@@ -1,4 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
+import { NavQuota } from "../features/quota/NavQuota";
 
 /**
  * Üst çubuk. Tauri penceresinde özel başlık alanıdır: boş yüzeyi sürükleme bölgesidir
@@ -25,6 +26,7 @@ export function NavBar({
       </div>
       <div className="ui-navbar__tools">
         {tools}
+        <NavQuota />
         {controls}
       </div>
     </header>

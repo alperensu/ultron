@@ -248,6 +248,11 @@ export interface FakeBridgeOptions {
   route?: (text: string) => RouteResult;
   /** Kota raporu; verilmezse `getQuota` "uygulanmadı" hatası verir. */
   quota?: QuotaReport;
+  /** Sentetik içe aktarma sonuçları; gerçek dosya okunmaz. */
+  catalogImportReport?: CatalogImportReport;
+  historyImportReport?: ImportReport;
+  /** Testlerde servis ayarlarının salt okunur görünümü. */
+  defaultEngine?: EngineId;
   /** `historySearch` sonuçları (sorguyu içeren metinler süzülür). */
   searchHits?: SearchHit[];
   /** Yalnız testler: ilk abonelikle zamanlayıcıdan yayınlanan olaylar. */
@@ -264,6 +269,7 @@ export interface FakeBridge extends Bridge {
 }
 
 export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
+  const quota = opts.quota ? structuredClone(opts.quota) : undefined;
   const chats = new Map((opts.chats ?? []).map((c) => [c.id, { ...c }]));
   const events = [...(opts.events ?? [])];
   const activeChats = new Set<string>();
@@ -395,17 +401,25 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
       run("history_search", [query, id, limit], () => ({
         hits: (opts.searchHits ?? []).filter((h) => h.text.toLowerCase().includes(query.toLowerCase())),
       })),
-    getQuota: () => run("get_quota", [], () => opts.quota ?? reject("kota")),
+    getQuota: () => run("get_quota", [], () => quota ? structuredClone(quota) : reject("kota")),
     setResetRights: (pool, count) =>
-      run("set_reset_rights", [pool, count], () => reject("kota")),
+      run("set_reset_rights", [pool, count], () => {
+        if (!["claude", "codex"].includes(pool) || !Number.isInteger(count) || count < 0 || count > 4_294_967_295) {
+          throw { kind: "daemon", message: "geçersiz sıfırlama hakkı" } satisfies BridgeError;
+        }
+        const target = quota?.pools.find((item) => item.pool === pool);
+        if (!target) return reject("kota");
+        target.reset_rights = count;
+        return {};
+      }),
     routeMessage: (text) =>
       run("route_message", [text], () => (opts.route ? opts.route(text) : reject("yönlendirme"))),
     // Sahte köprü: gerçek dosya okumaz; boş rapor, gerçek servisle aynı biçimde.
-    importCatalog: (path) => run("import_catalog", [path], () => ({ imported: 0, updated: 0 })),
+    importCatalog: (path) => run("import_catalog", [path], () => ({ ...(opts.catalogImportReport ?? { imported: 0, updated: 0 }) })),
     importClaudeHistory: (root) =>
-      run("import_claude_history", [root], () => ({ files: 0, chats: 0, messages: 0, skipped: 0, masked: 0 })),
+      run("import_claude_history", [root], () => ({ ...(opts.historyImportReport ?? { files: 0, chats: 0, messages: 0, skipped: 0, masked: 0 }) })),
     status: () =>
-      run("status", [], () => ({ version: "test", pid: 0, running_turns: activeChats.size, default_engine: "claude" as const })),
+      run("status", [], () => ({ version: "test", pid: 0, running_turns: activeChats.size, default_engine: opts.defaultEngine ?? "claude" })),
     onEvent: async (h) => {
       eventHandlers.add(h);
       scheduleStream();

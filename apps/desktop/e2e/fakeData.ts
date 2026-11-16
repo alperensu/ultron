@@ -51,19 +51,19 @@ export function sampleBridge(): FakeBridgeOptions {
       pools: [
         {
           pool: "claude",
-          mode: "normal",
+          mode: "Tam",
           reset_rights: null,
           windows: [{ label: "5 saat", used_pct: 42, resets_at: null, window_secs: 18000, source: "Live" }],
         },
         {
           pool: "codex",
-          mode: "normal",
+          mode: "Eko",
           reset_rights: null,
           windows: [{ label: "Haftalık", used_pct: 87, resets_at: null, window_secs: 604800, source: "Estimated" }],
         },
         {
           pool: "agy",
-          mode: "normal",
+          mode: "Dengeli",
           reset_rights: null,
           windows: [{ label: "Günlük", used_pct: null, resets_at: null, window_secs: 86400, source: "Unknown" }],
         },

@@ -1,9 +1,9 @@
 export type QuotaTone = "ok" | "warn" | "crit";
 
-/** Eşikler: %80 altı normal (yeşil), %80-99 uyarı (turuncu), %100 ve üstü kritik (kırmızı). */
+/** Eşikler: %70 altı yeşil, %70–89 turuncu, %90 ve üstü kırmızı. */
 export function quotaTone(percent: number): QuotaTone {
-  if (percent >= 100) return "crit";
-  if (percent >= 80) return "warn";
+  if (percent >= 90) return "crit";
+  if (percent >= 70) return "warn";
   return "ok";
 }
 

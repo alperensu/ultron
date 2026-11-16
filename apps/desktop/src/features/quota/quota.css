@@ -1,0 +1,68 @@
+.quota-trigger {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  min-height: 44px;
+  border-radius: var(--r-pill);
+}
+.quota-trigger:hover { background: var(--ter); }
+.quota-trigger__unknown {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--fill);
+  border-radius: 50%;
+  color: var(--l2);
+}
+.quota-sheet__intro,
+.quota-sheet__refresh,
+.quota-window__heading,
+.quota-rights__controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.quota-sheet__intro,
+.quota-sheet__refresh { justify-content: space-between; }
+.quota-sheet__intro p,
+.quota-sheet__refresh { font-size: var(--fs-footnote); color: var(--l2); }
+.quota-sheet__refresh { margin-top: 8px; }
+.quota-window { padding: 12px 16px; }
+.quota-window__heading strong { margin-left: auto; font-weight: 600; }
+.quota-window__bar {
+  height: 5px;
+  margin-top: 10px;
+  border-radius: var(--r-pill);
+  background: var(--fill);
+  overflow: hidden;
+}
+.quota-window__bar span { display: block; height: 100%; background: var(--green); }
+.quota-window__bar[data-tone="warn"] span { background: var(--orange); }
+.quota-window__bar[data-tone="crit"] span { background: var(--red); }
+.quota-window__reset,
+.quota-note { color: var(--l2); font-size: var(--fs-footnote); overflow-wrap: anywhere; }
+.quota-window__reset { margin-top: 6px; }
+.quota-note { padding: 12px 16px; }
+.quota-error { color: var(--red); font-size: var(--fs-footnote); overflow-wrap: anywhere; }
+.quota-rights { padding: 12px 16px; }
+.quota-rights label { display: block; margin-bottom: 8px; }
+.quota-rights__controls .quota-input { width: 100px; flex: 1; min-width: 80px; }
+.quota-rights > p { padding: 8px 0 0; }
+.quota-input {
+  display: block;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid var(--sep);
+  border-radius: 8px;
+  background: var(--ter);
+}
+.settings-import { padding: 16px; display: grid; gap: 12px; }
+.settings-import label { font-size: var(--fs-footnote); color: var(--l2); }
+.settings-import .ui-capsule { justify-self: start; }
+.settings-report { margin: 0; }
+.settings-report > div { display: flex; justify-content: space-between; gap: 16px; padding: 6px 0; }
+.settings-report dt { color: var(--l2); }
+.settings-report dd { margin: 0; font-weight: 600; }

@@ -1,7 +1,8 @@
 import { useEffect } from "react";
 import { AppSidebar } from "./features/sidebar/AppSidebar";
 import { Chat } from "./screens/Chat";
-import { SettingsPlaceholder } from "./screens/SettingsPlaceholder";
+import { Settings } from "./screens/Settings";
+import { QuotaProvider } from "./features/quota/QuotaProvider";
 import { Today } from "./screens/Today";
 import { useRoute } from "./state/router";
 import { useStore } from "./state/store";
@@ -14,15 +15,17 @@ export function Shell() {
   useEffect(() => store.start(), [store]);
 
   return (
-    <div className="ui-shell">
-      <AppSidebar />
-      {route.name === "chat" ? (
-        <Chat key={route.chatId} chatId={route.chatId} />
-      ) : route.name === "settings" ? (
-        <SettingsPlaceholder />
-      ) : (
-        <Today />
-      )}
-    </div>
+    <QuotaProvider>
+      <div className="ui-shell">
+        <AppSidebar />
+        {route.name === "chat" ? (
+          <Chat key={route.chatId} chatId={route.chatId} />
+        ) : route.name === "settings" ? (
+          <Settings />
+        ) : (
+          <Today />
+        )}
+      </div>
+    </QuotaProvider>
   );
 }

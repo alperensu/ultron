@@ -22,20 +22,24 @@ function mockReducedMotion(matches: boolean) {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("QuotaRing", () => {
-  it("renders percent and color thresholds", () => {
+  it("quota_ring_color_thresholds", () => {
     expect(quotaTone(0)).toBe("ok");
-    expect(quotaTone(79.9)).toBe("ok");
-    expect(quotaTone(80)).toBe("warn");
-    expect(quotaTone(99)).toBe("warn");
+    expect(quotaTone(69.9)).toBe("ok");
+    expect(quotaTone(70)).toBe("warn");
+    expect(quotaTone(89.9)).toBe("warn");
+    expect(quotaTone(90)).toBe("crit");
     expect(quotaTone(100)).toBe("crit");
 
     const { rerender } = render(<QuotaRing percent={42} label="Claude" />);
     let ring = screen.getByRole("img", { name: "Claude: %42" });
     expect(ring).toHaveAttribute("data-tone", "ok");
 
+    rerender(<QuotaRing percent={70} label="Claude" />);
+    expect(screen.getByRole("img", { name: "Claude: %70" })).toHaveAttribute("data-tone", "warn");
+
     rerender(<QuotaRing percent={95} label="Claude" />);
     ring = screen.getByRole("img", { name: "Claude: %95" });
-    expect(ring).toHaveAttribute("data-tone", "warn");
+    expect(ring).toHaveAttribute("data-tone", "crit");
     const arc = ring.querySelector(".ui-ring__arc")!;
     const c = 2 * Math.PI * 11;
     expect(Number(arc.getAttribute("stroke-dashoffset"))).toBeCloseTo(c * 0.05, 3);
