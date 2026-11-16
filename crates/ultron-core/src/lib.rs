@@ -11,6 +11,7 @@ pub mod handoff;
 pub mod import;
 pub mod ipc;
 pub mod paths;
+pub mod policy;
 pub mod projects;
 pub mod prompts;
 pub mod quota;
