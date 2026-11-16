@@ -14,6 +14,7 @@ use super::{
     Capabilities, CommandSpec, Engine, RestrictionLevel, ToolPolicy, TurnRequest, is_quota_message,
 };
 use crate::config::{EngineConfig, EngineId};
+use crate::eventlog::{DEFAULT_EXCERPT_CHARS, excerpt};
 use crate::events::EngineEvent;
 
 /// Varsayılan agy modeli (yalnız Gemini modelleri kabul edilir).
@@ -138,7 +139,8 @@ fn parse_value(raw: &Value) -> Vec<EngineEvent> {
 }
 
 fn step_events(raw: &Value, step: &Value) -> Vec<EngineEvent> {
-    match step.get("step_type").and_then(Value::as_str).unwrap_or_default() {
+    let step_type = str_or_empty(step, "step_type");
+    match step_type.as_str() {
         "user_input" => Vec::new(),
         "agent_response" => {
             let delta = str_or_empty(step, "text_delta");
@@ -150,7 +152,44 @@ fn step_events(raw: &Value, step: &Value) -> Vec<EngineEvent> {
                 vec![EngineEvent::AssistantText { text: delta }]
             }
         }
+        // Araç adımı: step_type "tool" içerir ya da `tool_info` taşır. Gerçek yakalamada alan
+        // adları doğrulanmamıştır; bu yüzden ham girdi/çıktı korunur ve eksik alanlar boş bırakılır.
+        other if other.to_lowercase().contains("tool") || step.get("tool_info").is_some() => {
+            tool_step_events(step, other)
+        }
         _ => unknown(raw),
+    }
+}
+
+/// Araç adımını çağrı (`ToolCall`) ya da sonuç (`ToolResult`) olarak eşler. Adımda `output`
+/// alanı varsa sonuçtur; yoksa çağrıdır.
+fn tool_step_events(step: &Value, step_type: &str) -> Vec<EngineEvent> {
+    let info = step.get("tool_info").cloned().unwrap_or(Value::Null);
+    let tool = str_field(&info, "name")
+        .or_else(|| str_field(&info, "tool"))
+        .unwrap_or_else(|| step_type.to_string());
+    match step.get("output") {
+        Some(output) => {
+            let text = match output {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let is_error = str_field(step, "state").as_deref() == Some("FAILED")
+                || info.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            vec![EngineEvent::ToolResult {
+                tool,
+                output_excerpt: excerpt(&text, DEFAULT_EXCERPT_CHARS),
+                is_error,
+            }]
+        }
+        None => {
+            let input = match info.get("input") {
+                Some(input) => input.clone(),
+                None if !info.is_null() => info,
+                None => step.clone(),
+            };
+            vec![EngineEvent::ToolCall { tool, input }]
+        }
     }
 }
 

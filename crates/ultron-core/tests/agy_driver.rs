@@ -231,6 +231,51 @@ fn agy_prompt_is_truncated_to_cmdline_limit() {
 }
 
 #[test]
+fn agy_tool_step_maps_to_tool_call() {
+    let eng = AgyEngine::new(cfg());
+    // Sentetik araç adımı: çıktı yok, yalnız tool_info (çağrı).
+    let call = json!({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": "conv-0001",
+            "step_index": 2,
+            "state": "ACTIVE",
+            "step_type": "tool_call",
+            "tool_info": { "name": "read_file", "input": { "path": "C:/proj/notes.txt" } }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        eng.parse_line(&call),
+        vec![EngineEvent::ToolCall {
+            tool: "read_file".into(),
+            input: json!({ "path": "C:/proj/notes.txt" }),
+        }]
+    );
+
+    // Aynı adımın çıktısı taşındığında sonuç olarak eşlenir.
+    let result = json!({
+        "event": "step_update",
+        "step_update": {
+            "step_index": 2,
+            "state": "DONE",
+            "step_type": "tool_result",
+            "tool_info": { "name": "read_file" },
+            "output": "yanit-2"
+        }
+    })
+    .to_string();
+    assert_eq!(
+        eng.parse_line(&result),
+        vec![EngineEvent::ToolResult {
+            tool: "read_file".into(),
+            output_excerpt: "yanit-2".into(),
+            is_error: false,
+        }]
+    );
+}
+
+#[test]
 fn agy_whitespace_delta_is_kept_but_empty_is_dropped() {
     let eng = AgyEngine::new(cfg());
     let line = |delta: &str| {
