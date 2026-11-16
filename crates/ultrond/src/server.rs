@@ -336,11 +336,17 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
     if !matches!(pool, "claude" | "codex") {
         return Err(anyhow!("geçersiz havuz: {pool} (claude|codex)"));
     }
+    // Daemon düzeyinde seri hale getirme; okuma yazmadan hemen önce yapılır ki dışarıdan
+    // yapılan düzenlemeler (ör. `claude_live_quota`) ezilmesin.
+    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = CONFIG_LOCK
+        .lock()
+        .map_err(|_| anyhow!("config kilidi zehirlendi"))?;
     let file = paths.root.join("config.toml");
-    let mut table: toml::Table = if file.exists() {
-        std::fs::read_to_string(&file)?.parse()?
-    } else {
-        toml::Table::new()
+    let mut table: toml::Table = match std::fs::read_to_string(&file) {
+        Ok(text) => text.parse()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(e.into()),
     };
     let rights = table
         .entry("reset_rights")
@@ -348,9 +354,14 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
         .as_table_mut()
         .ok_or_else(|| anyhow!("config.toml: reset_rights tablo olmalı"))?;
     rights.insert(pool.to_string(), toml::Value::Integer(i64::from(count)));
-    let tmp = paths.root.join("config.toml.tmp");
+    let tmp = paths
+        .root
+        .join(format!("config.toml.{}.tmp", uuid::Uuid::new_v4().simple()));
     std::fs::write(&tmp, toml::to_string(&table)?)?;
-    std::fs::rename(&tmp, &file)?;
+    if let Err(e) = std::fs::rename(&tmp, &file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
