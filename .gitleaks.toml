@@ -1,0 +1,10 @@
+title = "Ultron gitleaks yapılandırması"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Gizli bilgi maskeleme testlerindeki bilerek yazılmış sentetik örnekler (gerçek anahtar değildir)."
+paths = [
+  '''crates/ultron-core/tests/import\.rs''',
+]
