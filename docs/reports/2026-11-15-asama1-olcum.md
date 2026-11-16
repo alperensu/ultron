@@ -8,7 +8,7 @@ Test dosyası: `crates/ultrond/tests/live_acceptance.rs`. Tüm canlı testler `#
 | Test | Sonuç |
 |---|---|
 | `live_claude_to_agy_handoff` (Claude haiku → agy) | **Geçti** (tek çalıştırma) |
-| `live_claude_to_codex_handoff` | **Çalıştırılmadı**: Codex kotası nedeniyle (koordinatör kararı). Kod derlenir, `#[ignore]` ile tutulur. |
+| `live_claude_to_codex_handoff` | **Başarısız** (tek çalıştırma, 2026-11-16): tur 2 tamamlanmadı; Codex çıkış kodu 1 döndü, hata metni kota ya da `model_not_found` değil. Yeniden denenmedi. |
 | `live_tool_restriction_probe` | **Ölçüm tamamlandı**. Kabul kapısı değil. Her iki motorda dosya korundu. |
 
 Aşama 1 devir çekirdeği canlı olarak doğrulandı: Claude'da alınan karar, motor değişiminden sonra agy tarafından doğru özetlendi.
@@ -74,7 +74,11 @@ Sonuç: Metin beş ayrı parça olarak geldi, ancak bütün cevap yaklaşık 130
 
 ## Codex durumu
 
-Codex kotası %90 üzerinde olduğu için `live_claude_to_codex_handoff` çalıştırılmadı. Test kodu Codex motoruyla aynı senaryo olarak derleniyor ve `#[ignore]` ile tutuluyor. Codex devir doğrulaması bu raporda yapılmış sayılmaz.
+Önceki turda Codex kotası %90 üzerinde olduğu için test çalıştırılmamıştı. 2026-11-16 tarihinde tek bir çalıştırma yapıldı (`gpt-6.1-sol`, efor medium, varsayılan yapılandırma):
+
+- Tur 1 (Claude) tamamlandı; tur 2 (Codex) tamamlanmadı. Motor çıkış kodu 1 döndü ve stderr'de yalnızca dahili bir bellek aşaması günlüğü satırı vardı.
+- Hata sınıfı: motor çıkış hatası (kota ya da `model_not_found` değil). Yeniden denenmedi.
+- Codex devir doğrulaması bu nedenle geçmedi. Kök neden (kota ya da Codex CLI bellek aşaması) ayrıca incelenmelidir.
 
 ## Bilinen sınırlar
 
