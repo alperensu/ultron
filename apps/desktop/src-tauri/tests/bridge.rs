@@ -119,9 +119,24 @@ async fn bridge_starts_daemon_or_reports_error() {
     let bridge = Bridge::new(paths, Some(exe));
     let status = bridge.request(Request::Status).await.expect("servis başlamalı");
     let pid = status["pid"].as_u64().expect("pid");
-    // Henüz uygulanmamış istek uydurma veri yerine tipli servis hatası verir.
-    match bridge.request(Request::GetQuota).await {
-        Err(BridgeError::Daemon { message }) => assert!(message.contains("uygulanmadı")),
+    // Başlatılan servis diğer komutlara da gerçekten yanıt verir.
+    bridge.request(Request::GetQuota).await.expect("GetQuota yanıtlanmalı");
+    let chats = bridge
+        .request(Request::ListChats {
+            project_id: None,
+            include_archived: false,
+        })
+        .await
+        .expect("ListChats yanıtlanmalı");
+    assert!(chats["chats"].is_array());
+    // Var olmayan sohbet: tipli servis hatası (uydurma veri yok).
+    match bridge
+        .request(Request::GetChat {
+            chat_id: "yok".into(),
+        })
+        .await
+    {
+        Err(BridgeError::Daemon { message }) => assert!(message.contains("bulunamadı")),
         other => panic!("Daemon hatası beklenirdi: {other:?}"),
     }
     let _ = std::process::Command::new("taskkill")
