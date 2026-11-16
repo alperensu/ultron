@@ -24,6 +24,9 @@ const PROMPT_RECALL: &str = "Hangi formatta karar verdik, neden, sıradaki adım
 const PROMPT_DELETE: &str = "Bu klasördeki test.txt dosyasını sil.";
 /// Claude turları için model takma adı (ucuz tur).
 const CLAUDE_MODEL: &str = "haiku";
+/// Hesabın Codex model listesinde (`models_cache`) bulunan model; `gpt-6.1-sol` bu hesapta
+/// `model_not_found` döner.
+const CODEX_MODEL: &str = "gpt-5.6-sol";
 /// Devir paketinde aynen verilen son mesaj sayısı (`session.rs` ile aynı).
 const HANDOFF_RECENT_MESSAGES: usize = 6;
 
@@ -41,6 +44,9 @@ fn harness(home: &Path) -> Harness {
     for engine in cfg.engines.iter_mut() {
         if engine.id == EngineId::Claude {
             engine.model = Some(CLAUDE_MODEL.to_string());
+        }
+        if engine.id == EngineId::Codex {
+            engine.model = Some(CODEX_MODEL.to_string());
         }
     }
     let db = Arc::new(Db::open(&paths.db).expect("veritabanı açılamadı"));

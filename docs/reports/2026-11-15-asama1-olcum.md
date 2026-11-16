@@ -8,7 +8,7 @@ Test dosyası: `crates/ultrond/tests/live_acceptance.rs`. Tüm canlı testler `#
 | Test | Sonuç |
 |---|---|
 | `live_claude_to_agy_handoff` (Claude haiku → agy) | **Geçti** (tek çalıştırma) |
-| `live_claude_to_codex_handoff` | **Başarısız** (tek çalıştırma, 2026-11-16): tur 2 tamamlanmadı; Codex çıkış kodu 1 döndü, hata metni kota ya da `model_not_found` değil. Yeniden denenmedi. |
+| `live_claude_to_codex_handoff` | **Geçti** (gpt-5.6-sol). Ayrıntı: Codex durumu bölümü. |
 | `live_tool_restriction_probe` | **Ölçüm tamamlandı**. Kabul kapısı değil. Her iki motorda dosya korundu. |
 
 Aşama 1 devir çekirdeği canlı olarak doğrulandı: Claude'da alınan karar, motor değişiminden sonra agy tarafından doğru özetlendi.
@@ -74,11 +74,7 @@ Sonuç: Metin beş ayrı parça olarak geldi, ancak bütün cevap yaklaşık 130
 
 ## Codex durumu
 
-Önceki turda Codex kotası %90 üzerinde olduğu için test çalıştırılmamıştı. 2026-11-16 tarihinde tek bir çalıştırma yapıldı (`gpt-6.1-sol`, efor medium, varsayılan yapılandırma):
-
-- Tur 1 (Claude) tamamlandı; tur 2 (Codex) tamamlanmadı. Motor çıkış kodu 1 döndü ve stderr'de yalnızca dahili bir bellek aşaması günlüğü satırı vardı.
-- Hata sınıfı: motor çıkış hatası (kota ya da `model_not_found` değil). Yeniden denenmedi.
-- Codex devir doğrulaması bu nedenle geçmedi. Kök neden (kota ya da Codex CLI bellek aşaması) ayrıca incelenmelidir.
+`live_claude_to_codex_handoff` geçti (model gpt-5.6-sol, efor medium). Tur 2 cevabı kısaca: "CSV; Excel'de açılacağı için seçtik, sıradaki adım export fonksiyonunu yazmak." Önceki başarısızlığın sebebi motor değil modeldi: `gpt-6.1-sol` bu hesapta `model_not_found` (400) döndürüyordu ve Ultron bu hatayı stdout JSON'unda gördüğü halde özete yansıtmıyordu (stderr boştu). Hata özeti artık motorun son hata mesajına düşer. Varsayılan `gpt-6.1-sol` adı `config.rs`'te kaldı; hesapta çalışan ad doğrulanmadan değiştirilmedi.
 
 ## Bilinen sınırlar
 
