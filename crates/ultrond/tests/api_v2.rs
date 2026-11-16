@@ -289,7 +289,7 @@ async fn every_request_variant_is_implemented() {
         send_req(&cwd, Some("kapsam"), "merhaba"),
         Request::Switch { chat_id: "kapsam".into(), to: EngineId::Claude },
         Request::Cancel { chat_id: "kapsam".into() },
-        Request::Events { chat_id: Some("kapsam".into()), follow: false, after_seq: None },
+        Request::Events { chat_id: Some("kapsam".into()), follow: false, after_seq: None, limit: None },
         Request::HistorySearch { chat_id: None, query: "merhaba".into(), limit: 5 },
         Request::Status,
         Request::ListProjects,

@@ -119,6 +119,7 @@ async fn post_accept_failure_is_visible_as_event() {
             chat_id: Some("hata-1".into()),
             follow: false,
             after_seq: None,
+            limit: None,
         })
         .await
         .unwrap();
