@@ -2,7 +2,7 @@
 
 - Tarih: 2026-11-15
 - Durum: Onaylandı (2026-11-15). Kullanıcı kalan kararları Claude'a bıraktı; bu kararlar [Ö] ile işaretli.
-- Ad: **Ultron** [K]: proje, repo ve asistan persona adı. Belgede geçen "harness" kelimesi sistemin türünü anlatır. Servis adı `ultrond`, CLI `ultron` [Ö]; belgedeki `harnessd` ifadeleri `ultrond` olarak okunur. Üçüncü kişilerle konuşurken varsayılan tanıtım "Alperen'in asistanı"dır; ayardan değiştirilebilir [Ö].
+- Ad: **Ultron** [K]: proje, repo ve asistan persona adı. Belgede geçen "harness" kelimesi sistemin türünü anlatır. Servis adı `ultrond`, CLI `ultron` [Ö]; belgedeki `harnessd` ifadeleri `ultrond` olarak okunur. Üçüncü kişilerle konuşurken varsayılan tanıtım "kullanıcının asistanı"dır; ayardan değiştirilebilir [Ö].
 - Kapsam: Tüm sistemin mimarisi + Aşama 1 (Çekirdek) ve Aşama 2 (Masaüstü v1) ayrıntılı tasarımı. Sonraki aşamalar kendi tasarım turlarıyla ayrıntılandırılır.
 
 Bu belgede **[K]** kullanıcının konuşmada verdiği kararları, **[Ö]** Claude'un önerip kullanıcının itiraz etmediği ya da kendi verdiği kararları gösterir. [Ö] maddeleri kullanıcı okurken değiştirebilir.
@@ -11,13 +11,13 @@ Bu belgede **[K]** kullanıcının konuşmada verdiği kararları, **[Ö]** Clau
 
 ## 1. Amaç ve neden
 
-Tek bir geliştiricinin (Windows, öğrenci, Claude Pro + ChatGPT Plus + Google AI Plus) kendi çalışma biçimine göre şekillenen, kişisel bir AI harness'i. Jarvis benzeri bir kişisel asistan: kullanıcıyı, projelerini, evindeki cihazları ve kullandığı araçları bilir, onun yerine düşünür ve iş yapar. [K]
+Tek bir geliştiricinin (Windows, üç motorun üyeliğini kullanan) kendi çalışma biçimine göre şekillenen, kişisel bir AI harness'i. Jarvis benzeri bir kişisel asistan: kullanıcıyı, projelerini, evindeki cihazları ve kullandığı araçları bilir, onun yerine düşünür ve iş yapar. [K]
 
 Bugünkü sorunlar:
 - Proje bir motorla (Claude) başlıyor, kota bitince başka bir motora (Codex) geçmek bağlam kaybı yüzünden zor. Proje durumu tek bir motorun oturumuna gömülü.
-- Kurallar, hafıza ve orkestrasyon (`CLAUDE.md`, `codex-fleet` skill'i, `lane.py`, Claude hafıza klasörü) Claude Code'un içine dağılmış durumda. Kullanıcıya ait, motordan bağımsız bir yerde değiller.
+- Kurallar, hafıza ve orkestrasyon (`CLAUDE.md`, kullanıcının orkestrasyon skill'i ve betikleri, Claude hafıza klasörü) Claude Code'un içine dağılmış durumda. Kullanıcıya ait, motordan bağımsız bir yerde değiller.
 - ChatGPT masaüstü uygulamasındaki proje ve sohbet geçmişi rahatlığı CLI'da yok.
-- Kullanıcı okuldayken evdeki bilgisayarda iş yaptıramıyor.
+- Kullanıcı evde değilken evdeki bilgisayarda iş yaptıramıyor.
 
 Temel ilke: **Model gider, hafıza ve durum kalır.** Motorlar değiştirilebilir işçilerdir. Hafıza, proje durumu, kurallar ve geçmiş harness'e aittir. [K]
 
@@ -38,7 +38,7 @@ Esin kaynakları: Mert Çobanov / Onur Tirpan sohbeti ("herkes kendi harness'ın
 10. Kota ve sıfırlanma görünürlüğü (sıfırlama hakları dahil); kota yenilenince otomatik devam. [K]
 11. Token tasarrufu temel ilke. [K]
 12. Üç orkestrasyon modu (Tam, Dengeli, Eko), görsel yönlendirme ekranı, canlı alt ajan izleme. [K]
-13. Kullanıcı görevlendirdiğinde, onun adına üçüncü kişilerle (anne, müşteri) konuşup isteği anlayıp yerine getirmek. [K]
+13. Kullanıcı görevlendirdiğinde, onun adına üçüncü kişilerle (aile üyesi, müşteri) konuşup isteği anlayıp yerine getirmek. [K]
 
 ### Hedef olmayanlar
 - Başkaları için genelleştirilmiş bir ürün, eklenti pazarı ya da kurulum sihirbazı. Kod açık kaynak olur ama kişisel ihtiyaca göre yazılır. [K]
@@ -51,12 +51,12 @@ Esin kaynakları: Mert Çobanov / Onur Tirpan sohbeti ("herkes kendi harness'ın
 - Üçüncü kişi mesajlarının (anne, müşteri, web sayfası) komut olarak çalışması.
 - Kullanıcının kişisel bilgilerinin bir müşteriye ya da izinsiz bir uzak modele sızması.
 - Claude'un üyelik giriş bilgisini çıkarıp resmi CLI dışında kullanmak (Anthropic kurallarına aykırı).
-- Pro/Plus kotasını gereksiz yere yakan bir tasarım.
+- üyelik kotasını gereksiz yere yakan bir tasarım.
 
 ## 3. Kısıtlar
 
-- **İşletim sistemi:** Windows 11. Donanım: Ryzen 5 7600, 32 GB RAM, RTX 4060 8 GB.
-- **Üyelikler:** Claude Pro, ChatGPT Plus (Codex), Google AI Plus (Antigravity). Varsayılan yolda API anahtarı yok. [K]
+- **İşletim sistemi:** Windows 11. Donanım: orta sınıf bir Windows masaüstü (8 GB VRAM'li GPU).
+- **Üyelikler:** Kullanıcının mevcut üyelikleri (Claude, Codex, Antigravity). Varsayılan yolda API anahtarı yok. [K]
 - **Antigravity:** Kullanıcının mevcut kuralı yalnızca Gemini ve Flash-low. Bu kural harness'e motor ayarı olarak taşınır, kullanıcı değiştirebilir. Sağlayıcı riski kullanıcı tarafından kabul edilmiş (6 Kasım 2026). [K]
 - **Claude kullanımı:** Model çağrıları yalnızca resmi `claude` CLI'ı üzerinden, kullanıcının bilgisayarında kişisel kullanım için. OAuth token'ı başka bir araçta model çağırmak için kullanılmaz. Kota okuma için token kullanımı ayrı bir karardır (§9, madde 9).
 - **Codex:** `codex exec` içinden bilgisayar kontrolü (CUA) doğrulanmış değil. Bilgisayar kontrolü harness'in kendi araçlarıyla yapılır.
@@ -118,7 +118,7 @@ Esin kaynakları: Mert Çobanov / Onur Tirpan sohbeti ("herkes kendi harness'ın
   - `~/harness-brain/` (yapılandırılabilir) — Markdown hafıza kasası (vault), Git ile sürümlenebilir. [Ö]
   - `%LOCALAPPDATA%\harness\transcripts\` — ham motor akışları (JSONL). [Ö]
   - Gizli bilgiler: Windows Credential Manager. Repoda ve düz dosyada tutulmaz. [Ö]
-- **Bilgisayarı uyanık tutma:** Aktif ya da bekleyen bir iş varken sistemin uykuya geçmesini engeller (`SetThreadExecutionState`; `codex-fleet`'teki `Invoke-KeepAwake.ps1` mantığı). [Ö]
+- **Bilgisayarı uyanık tutma:** Aktif ya da bekleyen bir iş varken sistemin uykuya geçmesini engeller (`SetThreadExecutionState`; kullanıcının mevcut orkestrasyon betiklerindeki uyanık tutma mantığı). [Ö]
 - **Olay günlüğü:** Her motor çağrısı, araç çağrısı, onay kararı, dosya değişikliği ve geçiş tek bir olay akışına yazılır. Arayüz ve Telegram bu akıştan beslenir.
 
 ### 6.2 Motor katmanı
@@ -140,7 +140,7 @@ trait Engine {
 **Üyelik CLI'ları** [K]:
 - **Claude Code:** `claude -p` + JSON akış çıktısı ve girdisi (`--output-format stream-json`, `--input-format stream-json`), oturum devamı (`--resume`), araç ve MCP kısıtlama, izin modu. Kesin bayraklar CLI sürümüne göre builder tarafından doğrulanır.
 - **Codex:** `codex exec --json`, `codex exec resume`, sandbox ve onay politikası. Model ve efor kullanıcının mevcut politikasındaki adlarla: `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-luna`. Astra adlı modeller kullanılmaz (kullanıcı politikası).
-- **Antigravity (agy):** Mevcut `lane.py` entegrasyonu referans alınır. Varsayılan model kuralı: Gemini, Flash-low. JSON/akış desteği belirsiz: Aşama 1'de test edilir, yoksa satır tabanlı akış ayrıştırılır ve arayüzde "sınırlı canlı görünüm" etiketi gösterilir.
+- **Antigravity (agy):** Kullanıcının mevcut agy betiğindeki entegrasyon referans alınır. Varsayılan model kuralı: Gemini, Flash-low. JSON/akış desteği belirsiz: Aşama 1'de test edilir, yoksa satır tabanlı akış ayrıştırılır ve arayüzde "sınırlı canlı görünüm" etiketi gösterilir.
 
 **Yerel modeller:** Ollama (ya da eşdeğeri) üzerinden. Varsayılan roller: proje tahmini, onay sınıflandırması, hafıza önerisi, başlık üretimi, log özeti, embedding. Model seçimi Aşama 3'te kullanıcının gerçek geçmişi üzerinde ölçülerek yapılır. [Ö]
 
@@ -180,11 +180,11 @@ Hafıza motorda değil, harness'te tutulur. Üç katman var [Ö]:
 **Kasa yapısı** [Ö]:
 ```
 harness-brain/
-  me/            # kullanıcı: tercihler, kurallar, okul, çalışma biçimi
+  me/            # kullanıcı: tercihler, kurallar, çalışma biçimi
   projects/<ad>/ # proje notu, kararlar, talimatlar (AGENTS.md/CLAUDE.md bağlantısı)
   home/          # cihaz envanteri: cihaz, IP/MAC, port, servis, nasıl erişilir
   tools/         # kullanılan araçlar, hesaplar (gizli bilgi değil, yalnız adı ve amacı)
-  people/        # anne, müşteriler: tercih edilen kanal, yetki seviyesi, notlar
+  people/        # aile üyeleri, müşteriler: tercih edilen kanal, yetki seviyesi, notlar
   daily/         # günlük iş defteri (Daily Done)
   receipts/      # değiştirilemez kaynak makbuzları
   inbox/         # hızlı yakalama kartları
@@ -210,17 +210,17 @@ harness-brain/
 8. **Hafıza bakımı:** Periyodik birleştirme (tekrarlar tek nota), `review_at` süresi geçen ve uzun süre kullanılmayan notların arşive alınması. Kasa zamanla şişmez.
 9. **Ölçüm:** Gönderilen notlardan hangilerinin cevapta gerçekten kullanıldığı (atıf ya da `memory_get`) kaydedilir. Hiç kullanılmayan notların sıralaması düşer; işe yarayanlarınki yükselir.
 
-**Uzun vadeli hatırlama: az yükle ama unutma** [Ö] (kullanıcı isteği, 2026-11-15). Örnek: kullanıcı aylar önce "evde boşta duran şu özellikte bir laptopum var" demiştir; aylar sonra bir sunucu ya da deneme makinesi gerektiğinde harness bunu hatırlatmalıdır.
+**Uzun vadeli hatırlama: az yükle ama unutma** [Ö] (kullanıcı isteği, 2026-11-15). Örnek: kullanıcı aylar önce "evde boşta duran eski bir laptopum var" demiştir; aylar sonra bir sunucu ya da deneme makinesi gerektiğinde harness bunu hatırlatmalıdır.
 1. **Kalıcı bilgiler sohbetin içinde kaybolmaz:** Hafıza önerisi adımı, sohbet arasında geçen kalıcı bilgileri yapılandırılmış notlara çıkarır: cihaz → `home/`, tercih → `me/`, kişi → `people/`. Laptop örneği `home/` altında `facts: {model, ram, cpu, durum: boşta}` alanlarıyla bir cihaz notu olur ve kaynak makbuzu o sohbete bağlanır.
 2. **Kalıcı türler eskimez:** Kullanılmama nedeniyle sıralama düşürme ve arşive alma yalnızca geçici türlere (oturum notu, günlük kaydı, geçici karar) uygulanır. `home`, `me`, `people`, `rule`, `tool` türleri yaşlanmaz. Bunlar yalnızca kullanıcı onayıyla ya da daha yeni bir bilgiyle değişir ("laptopu sattım").
 3. **Arşiv unutmak değildir:** Arşivdeki notlar ve tüm sohbet dökümü aranabilir kalır. İlk aramada bulunamazsa ikinci kademe olarak tüm geçmişte (`history_search`) aranır.
 4. **İlgi tabanlı, zaman tabanlı değil:** Arama yeniliğe değil anlama bakar. Aylar önceki bir bilgi, bugünkü bir konuşmayla eşleşirse sıralamada öne çıkar.
 5. **Varlık ve yetenek indeksi:** Yapılandırılmış bilgiler küçük bir indekste tutulur (cihazlar, araçlar, hesaplar, kişiler → ne işe yarar). Bir ihtiyaç sezildiğinde ("sunucu lazım", "bir şey 7/24 çalışmalı", "test makinesi") yönlendirici bu indeksi ucuza tarar ve eşleşen bilgiyi tek satır olarak pakete ekler. Bütün notu basmaz.
-6. **Proaktif hatırlatma:** Eşleşme güçlüyse asistan kendisi söyler: "Evde boşta duran Lenovo Z50-70'in var, bunun için kullanabiliriz." Kullanıcının sorması beklenmez.
+6. **Proaktif hatırlatma:** Eşleşme güçlüyse asistan kendisi söyler: "Evde boşta duran eski laptopun var, bunun için kullanabiliriz." Kullanıcının sorması beklenmez.
 
 **Hızlı yakalama:** Global kısayolla açılan küçük pencere; link, metin, dosya ya da ekran görüntüsünü `inbox/`'a kart olarak atar. [Ö]
 
-**Başlangıç verisi:** `~/.claude/projects-catalog.md`, Claude hafıza dosyaları ve proje notları kasaya aktarılır. Claude Code oturum geçmişi (`~/.claude/projects/**/*.jsonl`) sohbet olarak içe aktarılır. ChatGPT dışa aktarımı sonradan eklenebilir. [Ö — varsayılan, kullanıcı itiraz etmedi]
+**Başlangıç verisi:** kullanıcının proje katalog dosyası, Claude hafıza dosyaları ve proje notları kasaya aktarılır. Claude Code oturum geçmişi (yerel oturum JSONL dosyaları) sohbet olarak içe aktarılır. ChatGPT dışa aktarımı sonradan eklenebilir. [Ö — varsayılan, kullanıcı itiraz etmedi]
 
 ### 6.5 Projeler ve sohbetler
 
@@ -232,7 +232,7 @@ ChatGPT/Codex masaüstü uygulamasının düzeni referans alınır, ama marka ve
 - **Otomatik başlık;** her sohbet herhangi bir motorla devam ettirilebilir (§6.3).
 
 **Tek kutudan otomatik proje yönlendirme** [K]:
-- Ana ekrandaki kutuya yazılan mesaj için yönlendirici (yerel model + günlük defter + embedding) projeyi tahmin eder. Sıra: mesajdaki açık işaretler (proje, dosya ya da özellik adı) → son aktif proje → emin değilse tek satırlık soru ("Masora mı, VibeAudit mi?").
+- Ana ekrandaki kutuya yazılan mesaj için yönlendirici (yerel model + günlük defter + embedding) projeyi tahmin eder. Sıra: mesajdaki açık işaretler (proje, dosya ya da özellik adı) → son aktif proje → emin değilse tek satırlık soru ("Örnek proje A mı, örnek proje B mi?").
 - Seçilen projenin talimatları, hafızası ve çalışma durumu yüklenir. Asistan o projenin ajanı gibi davranır. Sohbet arka planda o projenin altına kaydedilir.
 - Yanlış tahmin, "hayır, X projesi" ile düzeltilir ve yönlendirici bundan öğrenir.
 
@@ -247,12 +247,12 @@ ChatGPT/Codex masaüstü uygulamasının düzeni referans alınır, ama marka ve
 | Eko | Sonnet / Terra | Sol medium (gerekirse) | Luna / Flash | Yerel | Sol medium |
 
 - İnceleme hücreleri kullanıcının bugünkü kuralı gereği Sol'dur. Kullanıcı değiştirebilir.
-- Pro pakette Tam mod Claude kotasını hızlı bitirir. Harness bu modda kotayı daha sık gösterir ve eşikte Dengeli'ye geçmeyi önerir.
+- Üyelik paketinde Tam mod Claude kotasını hızlı bitirir. Harness bu modda kotayı daha sık gösterir ve eşikte Dengeli'ye geçmeyi önerir.
 - Model ve efor sınırları kullanıcı politikasından gelir: Sol/Terra en fazla high, Luna yalnız max, Astra yok.
 
 **Görsel yönlendirme ekranı** [K]: Satırlarda iş türleri (mimari, kod, test, araştırma, inceleme, görsel, doküman, hafıza işleri), sütunlarda modlar, hücrelerde açılır menüden model ve efor. Her hücrenin yanında haftalık kota tüketimi ve başarısızlık sayısı. Bu ekran zamanla gelişecek; v1'de tablo yeterli.
 
-**Mevcut orkestrasyon skill'lerinden miras yok** [K] (2026-11-15): `codex-fleet`, `lane.py` ve benzeri mevcut kurallar Ultron'a taşınmaz. Ultron'un orkestrasyon politikası ve talimatları sıfırdan yazılır. (§6.4'teki skill kütüphanesi ayrı bir konudur: kullanıcının skill'leri araç olarak kullanılabilir, ama orkestrasyon politikası olarak değil.)
+**Mevcut orkestrasyon skill'lerinden miras yok** [K] (2026-11-15): kullanıcının mevcut orkestrasyon skill'leri, betikleri ve kuralları Ultron'a taşınmaz. Ultron'un orkestrasyon politikası ve talimatları sıfırdan yazılır. (§6.4'teki skill kütüphanesi ayrı bir konudur: kullanıcının skill'leri araç olarak kullanılabilir, ama orkestrasyon politikası olarak değil.)
 
 **Talimat katmanı (Ultron'un kendi sistem talimatları)** [K + Ö] (2026-11-15):
 - Katmanlar (`prompts/` altında sürümlü dosyalar): 1) kimlik, 2) değişmez kurallar, 3) rol bloğu (şef / işçi / inceleyici / temsilci), 4) çekirdek kart (yalnızca şef ve sohbet), 5) araç ve hafıza kullanımı, 6) proje kartı + devir paketi (en sonda). Sabit kısımlar başta, değişenler sonda.
@@ -274,7 +274,7 @@ ChatGPT/Codex masaüstü uygulamasının düzeni referans alınır, ama marka ve
 ### 6.7 Kota, token tasarrufu ve otomatik devam
 
 **Kota paneli** [K]: Motor başına 5 saatlik ve haftalık pencereler, sıfırlanma saatleri, kalan **sıfırlama hakları** (haftalık limiti bir kereye mahsus sıfırlama), API harcaması. Ana ekranda kısa hali, Telegram'da `/limit`.
-- Kaynak: Mevcut `limit` skill'inin veri yolları başlangıç noktası. Sıfırlama haklarının nereden okunacağı bilinmiyor; Aşama 2'de araştırılır. Otomatik okunamazsa kullanıcı elle girer. Harness uydurma bir sayı göstermez.
+- Kaynak: Mevcut kullanıcı kota okuma betiğinin veri yolları başlangıç noktası. Sıfırlama haklarının nereden okunacağı bilinmiyor; Aşama 2'de araştırılır. Otomatik okunamazsa kullanıcı elle girer. Harness uydurma bir sayı göstermez.
 - Sıfırlama hakkını harness asla kendi başına kullanmaz. Yalnızca öneri verir ("haftalık %95, sıfırlanmaya 4 gün var").
 
 **Otomatik devam** [K]: Kota dolunca görev "kota bekliyor" durumuna geçer. [Ö] Sıfırlanmaya kısa süre (ayarlanabilir, varsayılan 45 dk) kaldıysa bekler, o saatte uyanır ve kaldığı adımdan devam eder. Daha uzunsa kullanıcının belirlediği sıradaki motora devreder (bildirimle). Gece kendiliğinden devam ederken yalnızca daha önce onaylanmış işe devam edilir; yeni riskli bir adım gelirse durur ve onay Telegram'a düşer.
@@ -291,7 +291,7 @@ ChatGPT/Codex masaüstü uygulamasının düzeni referans alınır, ama marka ve
 9. Ekonomik mod düğmesi (Eko orkestrasyon + küçük bağlam bütçesi + daha az otomatik kontrol).
 10. **Rol bazlı çıktı üslubu** (kullanıcının `caveman` skill'i): Alt ajanların şefe yazdığı raporlar, ajanlar arası mesajlar, özetler ve hafıza önerileri kısa ve teknik üslupta yazılır, çünkü bunları insan değil model okuyor. Kullanıcıya giden cevaplar normal üslupta kalır. Kullanıcı isterse kendi sohbeti için de açabilir. [Ö]
 11. **Güncel doküman araçları isteğe bağlı** (ör. Context7): Yalnızca kod işlerinde ve bir kütüphane ya da API söz konusu olduğunda o çalıştırmaya eklenir. Yanlış sürüm bilgisi yüzünden boşa giden denemeleri azaltır, ama her çalıştırmaya yüklenirse araç tanımları kota yer. [Ö]
-12. **Mevcut skill'lerin taşınması:** `~/.claude/skills` ve plugin skill'leri harness'in skill kütüphanesine aktarılır. Skill'ler bağlama toptan basılmaz; yalnızca ad ve kısa açıklamaları gider, gövdesi ihtiyaç olunca yüklenir (§6.4 kademeli yükleme ile aynı ilke). Hangi motorun skill desteği olduğuna göre skill ya motorun kendi mekanizmasıyla ya da devir paketine eklenerek verilir. [Ö]
+12. **Mevcut skill'lerin taşınması:** kullanıcının mevcut skill klasörü ve plugin skill'leri harness'in skill kütüphanesine aktarılır. Skill'ler bağlama toptan basılmaz; yalnızca ad ve kısa açıklamaları gider, gövdesi ihtiyaç olunca yüklenir (§6.4 kademeli yükleme ile aynı ilke). Hangi motorun skill desteği olduğuna göre skill ya motorun kendi mekanizmasıyla ya da devir paketine eklenerek verilir. [Ö]
 
 ### 6.8 Güvenlik ve onay
 
@@ -304,7 +304,7 @@ Dört katman [K]:
 **Kapsam notu:** Motorlar kendi yerleşik kabuk araçlarıyla da silme yapabilir. Bu yüzden harness motorları, yerleşik yıkıcı araçları kısıtlanmış şekilde başlatır ve dosya işlemlerini kendi MCP araçlarına yönlendirir. Hangi motorda bunun ne kadar mümkün olduğu Aşama 1'de doğrulanır. Mümkün olmayan yerde sınır belgelenir ve o motor riskli görevlerde kullanılmaz. [Ö]
 
 **Diğer kurallar:**
-- Üçüncü kişi içeriği (web sayfası, e-posta, anne/müşteri mesajı, araç çıktısı) güvenilmez girdi olarak işaretlenir ve asla yetki vermez.
+- Üçüncü kişi içeriği (web sayfası, e-posta, aile üyesi/müşteri mesajı, araç çıktısı) güvenilmez girdi olarak işaretlenir ve asla yetki vermez.
 - Gizli bilgiler Credential Manager'da durur, loglara ve hafızaya yazılmaz. Push öncesi gizli anahtar taraması yapılır.
 - Telegram botu yalnızca kullanıcının Telegram ID'sine yanıt verir. Bot token'ı Credential Manager'dadır.
 - Doğrulama ilkesi: ajanın "bitti" demesi kanıt değildir. Kabul için test çıktısı, diff ve kontrol gerekir.
@@ -334,10 +334,10 @@ Ekranlar:
 
 ### 6.10 Temsilci: üçüncü kişi konuşmaları
 
-[K] Yalnızca kullanıcı görevlendirdiğinde çalışır ("müşteri yazdı, uygulama çerçevesinde ne istiyorsa hallet", "annem yazdı, bak ne istiyorsa hallet").
+[K] Yalnızca kullanıcı görevlendirdiğinde çalışır ("müşteri yazdı, uygulama çerçevesinde ne istiyorsa hallet", "aile üyem yazdı, bak ne istiyorsa hallet").
 - **Görev:** Kişi + kanal + kullanıcının çizdiği kapsam. Kapsam dışı istekler (fiyat, söz, ödeme, teslim tarihi, başka iş) kullanıcıya sorulur.
-- **Kimlik:** "Alperen'in asistanı" olarak tanıtır, kendini kullanıcı gibi göstermez. [Ö]
-- **Yetki:** Kişinin mesajı komut çalıştırtamaz. Asistan yalnızca görevin gerektirdiği araçları kullanır (ör. anne için video indirip gönderme). Kullanıcının özel hafızası `audience=third_party` filtresiyle gizlenir.
+- **Kimlik:** "kullanıcının asistanı" olarak tanıtır, kendini kullanıcı gibi göstermez. [Ö]
+- **Yetki:** Kişinin mesajı komut çalıştırtamaz. Asistan yalnızca görevin gerektirdiği araçları kullanır (ör. aile üyesi için video indirip gönderme). Kullanıcının özel hafızası `audience=third_party` filtresiyle gizlenir.
 - **Kapanış:** İş bitince görev kapanır ve kullanıcıya tek satır özet gider. Kişi sonradan yine yazarsa asistan cevap vermez, kullanıcıya haber verir.
 - **Canlı izleme:** Konuşma alt ajan penceresi gibi izlenebilir; kullanıcı istediği an devralabilir.
 - **Kanallar:**
@@ -382,13 +382,13 @@ Kabul ölçütleri:
 7. **Temsilci:** Telegram (Bot API / TDLib), WhatsApp kararı.
 8. **Sonra:** Android, GPUI, çok makine.
 
-Not: Kullanıcı mevcut Claude Code + `codex-fleet` düzenini harness Aşama 4'e gelene kadar kullanmaya devam eder.
+Not: Kullanıcı mevcut Claude Code ve orkestrasyon betiklerinin düzenini harness Aşama 4'e gelene kadar kullanmaya devam eder.
 
 ## 8. Kararlar özeti
 
 **Kullanıcının kararları [K]:** Kişisel, açık kaynak; Tauri + Rust çekirdek + React; ana arayüz masaüstü, Telegram uzaktan erişim, mobil uygulama yok; üyelik CLI'ları (Claude, Codex, Antigravity), varsayılan olarak API yok, isteğe bağlı model eklenebilir ve her rolde kullanılabilir; ortak hafıza; bağlam kaybı olmadan devir; ChatGPT tarzı projeler/sohbetler ve arayüz; tek kutudan otomatik proje; tam bilgisayar kontrolü; istenmeyen silme yok; yerel Jev tarzı onay modeli; kota, sıfırlanma ve sıfırlama hakları görünürlüğü; otomatik devam; token tasarrufu; üç orkestrasyon modu, görsel yönlendirme, canlı alt ajan izleme; görevlendirmeyle üçüncü kişi temsilciliği.
 
-**Claude'un kararları [Ö] (değiştirilebilir):** harnessd'nin kullanıcı bağlamında çalışması; depolama yerleri; Markdown kasa + SQLite FTS5 + yerel embedding; kaynak makbuzları; harness tarafından çıkarılan hafıza önerileri; günlük iş defteri; ev envanteri notu; sessiz geçiş yasağı; dışarıdan değişiklik bildirimi; sabit kuralların daemon içinde durması; dört katmanlı güvenlik; mod tablosundaki ilk dağılım; otomatik devam eşiği (45 dk); "Alperen'in asistanı" kimliği; aşama sırası; ad "harness"; Claude Code geçmişinin içe aktarılması.
+**Claude'un kararları [Ö] (değiştirilebilir):** harnessd'nin kullanıcı bağlamında çalışması; depolama yerleri; Markdown kasa + SQLite FTS5 + yerel embedding; kaynak makbuzları; harness tarafından çıkarılan hafıza önerileri; günlük iş defteri; ev envanteri notu; sessiz geçiş yasağı; dışarıdan değişiklik bildirimi; sabit kuralların daemon içinde durması; dört katmanlı güvenlik; mod tablosundaki ilk dağılım; otomatik devam eşiği (45 dk); "kullanıcının asistanı" kimliği; aşama sırası; ad "harness"; Claude Code geçmişinin içe aktarılması.
 
 ## 9. Açık sorular ve riskler
 
@@ -397,11 +397,11 @@ Not: Kullanıcı mevcut Claude Code + `codex-fleet` düzenini harness Aşama 4'e
 3. **Antigravity akış desteği** belirsiz (Aşama 1 testi).
 4. **Yerleşik yıkıcı araçların kısıtlanabilirliği** motorlara göre değişir (Aşama 1 ölçümü). Kısıtlanamayan motor riskli görevlerden çıkarılır.
 5. **Sağlayıcı kuralları:** Claude için yalnızca resmi CLI ve kişisel kullanım. Antigravity için kullanıcı riski kabul etmiş. Kurallar değişirse motor ayarı kapatılabilir olmalı.
-6. **Pro/Plus kotası:** Tam mod ve uzun döngüler kotayı hızla tüketir. Varsayılan mod Dengeli. [Ö]
+6. **Üyelik kotası:** Tam mod ve uzun döngüler kotayı hızla tüketir. Varsayılan mod Dengeli. [Ö]
 7. **Yerel model kalitesi** 8 GB VRAM'de sınırlı. Yalnızca dar işler; onay modelinde kararsızlık durumunda kullanıcıya sorulur.
 8. **Codex bilgisayar kontrolü** `codex exec` içinden doğrulanmamış; harness kendi araçlarını kullanır.
 10. **Ad ve marka:** "Ultron" Marvel/Disney'in tescilli karakter adı. Kullanıcı riski bilerek seçti (2026-11-15). Açık kaynak yayında yeniden adlandırma ya da kaldırma talebi gelebilir. Bu yüzden ad kodda tek bir sabitte tutulur (uygulama adı, servis adı, persona) ve değiştirilmesi kolay olur; Marvel görselleri ve logoları kullanılmaz. [K + Ö]
-9. **Claude kota verisi:** Mevcut `limit` skill'i Claude kotasını `~/.claude/.credentials.json` içindeki OAuth token'ıyla `api.anthropic.com/api/oauth/usage` uç noktasından okuyor. Bu belgelenmemiş bir uç nokta. **Karar [Ö]:** Token yalnızca bu okuma için kullanılır, model çağrısı için asla. Token belleğe alınmaz, loglanmaz, başka bir yere kopyalanmaz. Özellik ayarlarda "Claude kotasını canlı oku" anahtarıyla kapatılabilir; kapalıyken §11 madde 8'deki tahmini yol kullanılır. Uç nokta bozulursa otomatik olarak tahmini yola düşülür ve bunun bildirimi yapılır.
+9. **Claude kota verisi:** Mevcut kullanıcı kota okuma betiği Claude kotasını Claude Code'un yerel kimlik dosyasındaki OAuth token'ıyla `api.anthropic.com/api/oauth/usage` uç noktasından okuyor. Bu belgelenmemiş bir uç nokta. **Karar [Ö]:** Token yalnızca bu okuma için kullanılır, model çağrısı için asla. Token belleğe alınmaz, loglanmaz, başka bir yere kopyalanmaz. Özellik ayarlarda "Claude kotasını canlı oku" anahtarıyla kapatılabilir; kapalıyken §11 madde 8'deki tahmini yol kullanılır. Uç nokta bozulursa otomatik olarak tahmini yola düşülür ve bunun bildirimi yapılır.
 
 ## 11. İnceleme sonrası netleştirmeler
 
@@ -412,10 +412,10 @@ Bağımsız builder incelemesinden (2026-11-15) çıkan sorular ve cevapları. H
 3. **Yıkıcı araç kısıtlaması Aşama 1'i bloklamaz.** Sonuç motor yetenek tablosuna yazılır. Aşama 2'de kısıtlanamayan motorun yanında uyarı rozeti çıkar. "Riskli görevlerden çıkarma" kuralı Aşama 3'te uygulanır.
 4. **IPC:** harnessd ile Tauri'nin Rust tarafı arasında named pipe (yalnız mevcut kullanıcı ACL'i). Webview yalnızca Tauri komutları ve olaylarıyla konuşur; harnessd'ye doğrudan bağlanmaz, token webview'e verilmez. Telegram köprüsü harnessd'nin içinde çalışır.
 5. **Yaşam döngüsü:** harnessd Aşama 1'den itibaren oturum açılışında Görev Zamanlayıcı ile başlar. Masaüstü uygulaması harnessd çalışmıyorsa onu başlatır. Uygulama kapatılınca harnessd ve motor alt süreçleri çalışmaya devam eder; "çalışan görevler yerinde" bu anlama gelir. Aşama 2 kabul testinde uygulama kapatılıp açılır, görev akışı kaldığı yerden görünür.
-6. **Proje yönlendirmesinin verisi:** `~/.claude/projects-catalog.md` biçimi `- **Ad** — \`yol\` — açıklama`. İçe aktarılır; ad, klasör adı, takma adlar ve açıklama anahtar kelimeleri projeler tablosuna yazılır. Kural eşleştirmesi bu alanlara ve projedeki dosya/klasör adlarına göre yapılır. Ardından son aktif proje, en son da soru gelir.
+6. **Proje yönlendirmesinin verisi:** kullanıcının proje katalog dosyasının biçimi `- **Ad** — \`yol\` — açıklama`. İçe aktarılır; ad, klasör adı, takma adlar ve açıklama anahtar kelimeleri projeler tablosuna yazılır. Kural eşleştirmesi bu alanlara ve projedeki dosya/klasör adlarına göre yapılır. Ardından son aktif proje, en son da soru gelir.
 7. **Claude Code geçmişinin içe aktarılması:** Tüm oturumlar alınır ama içe aktarmadan önce gizli bilgi taraması yapılır ve bulunanlar maskelenir. İçe aktarılan sohbetler `engine=claude (imported)` olarak işaretlenir; Claude'un kendi `--resume` özelliğiyle değil, devir paketiyle herhangi bir motorda devam ettirilir. Büyük hacim için içe aktarma artımlıdır ve indeksleme arka planda yapılır.
 8. **Kota verisi:** Codex tarafı yerel oturum ölçümlerinden ve mevcut kaynaklardan okunur. Claude tarafı §9 madde 9'daki karara bağlı. Karar "hayır" olursa Claude kotası yalnızca CLI'ın verdiği sinyallerden (kota hatası, CLI'ın kendi kullanım çıktısı varsa o) ve harness'in kendi tüketim ölçümünden tahmin edilir; arayüzde "tahmini" etiketi gösterilir.
-9. **agy referansı ve test verisi:** agy sürücüsü için referans `C:/Users/Alperen/.claude/lanes/lane.py`. Bu kullanıcının yerel betiği; kopyalanmaz, davranışı (komut satırı, model kuralı, hata sınıflandırması) temel alınır. Test fixture'ları: repoda yalnızca sentetik ya da temizlenmiş akışlar bulunur. Gerçek kayıtlar `%LOCALAPPDATA%\harness\fixtures-private\` altında durur, repoya girmez; push öncesi gizli anahtar taraması yapılır.
+9. **agy referansı ve test verisi:** agy sürücüsü için referans kullanıcının yerel agy betiğidir. Bu betik kopyalanmaz, davranışı (komut satırı, model kuralı, hata sınıflandırması) temel alınır. Test fixture'ları: repoda yalnızca sentetik ya da temizlenmiş akışlar bulunur. Gerçek kayıtlar `%LOCALAPPDATA%\harness\fixtures-private\` altında durur, repoya girmez; push öncesi gizli anahtar taraması yapılır.
 
 ## 10. Builder'a bırakılanlar
 
