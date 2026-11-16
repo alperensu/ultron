@@ -24,7 +24,7 @@ pub use db::{Db, SearchHit, SessionRow, SessionStatus, StoredEvent};
 pub use eventlog::EventLog;
 pub use events::{EngineEvent, SwitchReason};
 pub use paths::Paths;
-pub use session::SessionManager;
+pub use session::{SessionManager, TurnReservation};
 
 /// Uygulama adı; tek kaynak.
 pub const APP_NAME: &str = "ultron";

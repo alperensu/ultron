@@ -45,6 +45,12 @@ impl Drop for TurnGuard {
     }
 }
 
+/// Sohbet için ayrılmış tek aktif tur; düşünce kilit serbest kalır.
+pub struct TurnReservation {
+    guard: TurnGuard,
+    cancel: CancellationToken,
+}
+
 /// Sohbet oturumlarını yöneten ana nesne.
 pub struct SessionManager {
     db: Arc<Db>,
@@ -94,13 +100,41 @@ impl SessionManager {
         text: &str,
         policy: ToolPolicy,
     ) -> Result<TurnOutcome> {
+        let reservation = self.reserve_turn(chat_id, engine)?;
+        self.send_reserved(reservation, chat_id, cwd, engine, text, policy)
+            .await
+    }
+
+    /// Motor kayıtlı mı ve sohbette başka tur çalışmıyor mu denetler; turu ayırır.
+    /// Hata, kabulden önce istemciye döndürülebilsin diye `send`'den ayrıdır.
+    pub fn reserve_turn(&self, chat_id: &str, engine: EngineId) -> Result<TurnReservation> {
         check_chat_id(chat_id)?;
+        if !self.engines.contains_key(&engine) {
+            return Err(anyhow!("motor kayıtlı değil: {engine:?}"));
+        }
+        let (guard, cancel) = self.begin_turn(chat_id)?;
+        Ok(TurnReservation { guard, cancel })
+    }
+
+    /// [`SessionManager::reserve_turn`] ile ayrılmış turu çalıştırır.
+    pub async fn send_reserved(
+        &self,
+        reservation: TurnReservation,
+        chat_id: &str,
+        cwd: &Path,
+        engine: EngineId,
+        text: &str,
+        policy: ToolPolicy,
+    ) -> Result<TurnOutcome> {
+        let TurnReservation {
+            guard: _guard,
+            cancel,
+        } = reservation;
         let driver = self
             .engines
             .get(&engine)
             .cloned()
             .ok_or_else(|| anyhow!("motor kayıtlı değil: {engine:?}"))?;
-        let (_guard, cancel) = self.begin_turn(chat_id)?;
         self.db.insert_chat(chat_id, None, "", Utc::now())?;
 
         let project_bound = self

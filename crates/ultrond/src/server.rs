@@ -531,6 +531,13 @@ async fn dispatch(
             if !Path::new(&cwd).is_absolute() {
                 return Err(anyhow!("cwd mutlak bir yol olmalı: {cwd}"));
             }
+            // Kabulden önce: motor kayıtlı mı ve sohbette tur çalışıyor mu. Hata burada dönerse
+            // istemci kabul yanıtı görmez; tur kilidi kabul öncesi ayrılır.
+            let pre_engine = match engine {
+                Some(engine) => engine,
+                None => st.db.chat_engine(&chat_id)?.unwrap_or(st.default_engine),
+            };
+            let reservation = st.manager.reserve_turn(&chat_id, pre_engine)?;
             st.db.insert_chat(&chat_id, None, "", chrono::Utc::now())?;
             if let Some(project) = &project {
                 let bound = st.db.get_chat(&chat_id)?.and_then(|c| c.project_id);
@@ -541,10 +548,7 @@ async fn dispatch(
             }
             st.db.touch_chat(&chat_id, &text)?;
             // Motor verilmezse mevcut sohbetin motoru kullanılır (sessiz motor değişimi olmaz).
-            let engine = match engine {
-                Some(engine) => engine,
-                None => st.db.chat_engine(&chat_id)?.unwrap_or(st.default_engine),
-            };
+            let engine = pre_engine;
             let mut last_seq = st.db.next_seq(&chat_id)? - 1;
             let mut wake = st.log.subscribe();
             let guard = st.keep.acquire();
@@ -560,8 +564,28 @@ async fn dispatch(
                 turns.spawn(async move {
                     let result = task_state
                         .manager
-                        .send(&task_chat, Path::new(&cwd), engine, &text, policy.into())
+                        .send_reserved(
+                            reservation,
+                            &task_chat,
+                            Path::new(&cwd),
+                            engine,
+                            &text,
+                            policy.into(),
+                        )
                         .await;
+                    // Kabulden sonraki hata yalnız bu bağlantıya gitmesin: sohbet günlüğüne yazılır,
+                    // böylece her abone görür.
+                    if let Err(e) = &result
+                        && let Err(log_err) = task_state.log.append(
+                            &task_chat,
+                            None,
+                            EngineEvent::Error {
+                                message: format!("{e:#}"),
+                            },
+                        )
+                    {
+                        tracing::error!(error = %log_err, "tur hatası günlüğe yazılamadı");
+                    }
                     drop(guard);
                     let _ = done_tx.send(result);
                 });
