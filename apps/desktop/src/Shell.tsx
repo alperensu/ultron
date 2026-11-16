@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { AppSidebar } from "./features/sidebar/AppSidebar";
-import { ChatPlaceholder } from "./screens/ChatPlaceholder";
+import { Chat } from "./screens/Chat";
 import { SettingsPlaceholder } from "./screens/SettingsPlaceholder";
 import { Today } from "./screens/Today";
 import { useRoute } from "./state/router";
@@ -17,7 +17,7 @@ export function Shell() {
     <div className="ui-shell">
       <AppSidebar />
       {route.name === "chat" ? (
-        <ChatPlaceholder key={route.chatId} chatId={route.chatId} />
+        <Chat key={route.chatId} chatId={route.chatId} />
       ) : route.name === "settings" ? (
         <SettingsPlaceholder />
       ) : (

@@ -16,7 +16,11 @@ export const SENT_MESSAGE_LAYOUT_ID = "sent-message";
  * Tek kutu: yazarken proje yönlendirilir ("→ Proje (otomatik)"), çipe basınca proje seçilir,
  * güven düşükse ve alternatif varsa göndermeden önce tek satır sorulur.
  */
-export function Composer() {
+export function Composer({ chatId, currentProjectId, disabled = false }: {
+  chatId?: string;
+  currentProjectId?: string | null;
+  disabled?: boolean;
+}) {
   const store = useStore();
   const projects = useAppState((s) => s.projects);
   const [text, setText] = useState("");
@@ -27,7 +31,7 @@ export function Composer() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fieldRef = useRef<HTMLTextAreaElement>(null);
-  const { route, resolve } = useRouting(store.bridge, text);
+  const { route, resolve } = useRouting(store.bridge, chatId ? "" : text);
 
   const projectName = (id: string | null | undefined) =>
     id ? (projects.find((p) => p.id === id)?.name ?? id) : null;
@@ -36,12 +40,21 @@ export function Composer() {
     setSending(true);
     setError(null);
     try {
-      const chatId = await store.createChat(text.trim(), projectId);
+      if (chatId) {
+        await store.bridge.sendMessage({
+          chat_id: chatId,
+          text: text.trim(),
+          ...(currentProjectId ? { project_id: currentProjectId } : {}),
+        });
+        setText("");
+        return;
+      }
+      const newChatId = await store.createChat(text.trim(), projectId);
       if (projectId) store.expandProject(projectId);
       setText("");
       setPicked(undefined);
       setQuestion(null);
-      navigate(chatPath(chatId));
+      navigate(chatPath(newChatId));
     } catch (err) {
       setError(describeBridgeError(err));
     } finally {
@@ -50,7 +63,8 @@ export function Composer() {
   }
 
   async function submit(): Promise<void> {
-    if (text.trim() === "" || sending) return;
+    if (text.trim() === "" || sending || disabled) return;
+    if (chatId) return send(null);
     if (picked !== undefined) return send(picked);
     const result = await resolve();
     if (result && isAmbiguous(result)) {
@@ -80,7 +94,7 @@ export function Composer() {
   const hasText = text.trim() !== "";
   const chosen = picked !== undefined ? picked : (route?.project_id ?? null);
   const auto = picked === undefined && route !== null;
-  const chipLabel = !hasText
+  const chipLabel = !hasText || chatId
     ? null
     : chosen
       ? `→ ${projectName(chosen)}${auto ? " (otomatik)" : ""}`
@@ -113,12 +127,13 @@ export function Composer() {
         </p>
       ) : null}
       <div className="composer__row">
-        <motion.div layoutId={SENT_MESSAGE_LAYOUT_ID} transition={spring(0.5)} className="composer__field">
+        <motion.div layoutId={chatId ? undefined : SENT_MESSAGE_LAYOUT_ID} transition={spring(0.5)} className="composer__field">
           <textarea
             ref={fieldRef}
             rows={1}
             value={text}
-            placeholder="Ne yapmak istersin?"
+            placeholder={chatId ? "Bu sohbete yaz" : "Ne yapmak istersin?"}
+            disabled={sending}
             aria-label="Mesaj"
             onChange={(e) => onInput(e.target.value)}
             onKeyDown={onKeyDown}
@@ -138,7 +153,7 @@ export function Composer() {
           type="button"
           className="composer__send press"
           aria-label="Gönder"
-          disabled={!hasText || sending}
+          disabled={!hasText || sending || disabled}
           onClick={() => void submit()}
         >
           <Icon name="send" size={18} />

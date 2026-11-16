@@ -250,21 +250,59 @@ export interface FakeBridgeOptions {
   quota?: QuotaReport;
   /** `historySearch` sonuçları (sorguyu içeren metinler süzülür). */
   searchHits?: SearchHit[];
+  /** Yalnız testler: ilk abonelikle zamanlayıcıdan yayınlanan olaylar. */
+  stream?: { events: StoredEvent[]; eventsPerSecond?: number; delayMs?: number };
 }
 
 export interface FakeBridge extends Bridge {
   /** Canlı olay yayar (test sürücüsü). */
   emit(ev: StoredEvent): void;
   emitDaemonState(state: DaemonState): void;
+  /** Zamanlayıcıyı ve test aboneliklerini temizler. */
+  dispose(): void;
   readonly calls: Array<{ cmd: string; args: unknown[] }>;
 }
 
 export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
   const chats = new Map((opts.chats ?? []).map((c) => [c.id, { ...c }]));
   const events = [...(opts.events ?? [])];
+  const activeChats = new Set<string>();
+  const trackTurn = (event: StoredEvent) => {
+    if (["user_text", "session_started", "assistant_text"].includes(event.kind)) activeChats.add(event.chat_id);
+    if (["turn_completed", "error", "quota_exhausted"].includes(event.kind)) activeChats.delete(event.chat_id);
+  };
+  events.forEach(trackTurn);
   const eventHandlers = new Set<(ev: StoredEvent) => void>();
   const daemonHandlers = new Set<(s: DaemonState) => void>();
   const calls: FakeBridge["calls"] = [];
+  let streamIndex = 0;
+  let streamTimer: ReturnType<typeof setTimeout> | undefined;
+  let streamStarted = false;
+  const emit = (event: StoredEvent) => {
+    events.push(event);
+    trackTurn(event);
+    eventHandlers.forEach((handler) => handler(event));
+  };
+  const append = (chatId: string, kind: string, payload: Record<string, unknown>) => {
+    const seq = events.reduce((last, event) => Math.max(last, event.seq), 0) + 1;
+    emit({
+      id: `fake-${chatId}-${seq}`, chat_id: chatId, session_id: null,
+      seq, ts: new Date().toISOString(), kind, payload: { type: kind, ...payload },
+    });
+  };
+  const scheduleStream = () => {
+    const stream = opts.stream;
+    if (!stream || streamTimer !== undefined || streamIndex >= stream.events.length || eventHandlers.size === 0) return;
+    const rate = Math.max(1, Math.min(1000, stream.eventsPerSecond ?? 50));
+    const delay = streamStarted ? 1000 / rate : Math.max(0, stream.delayMs ?? 1000 / rate);
+    streamStarted = true;
+    streamTimer = setTimeout(() => {
+      streamTimer = undefined;
+      const event = stream.events[streamIndex++];
+      if (event) emit(event);
+      scheduleStream();
+    }, delay);
+  };
   const notImplemented = (what: string): BridgeError => ({
     kind: "daemon",
     message: `henüz uygulanmadı (${what})`,
@@ -284,9 +322,12 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
   };
   return {
     calls,
-    emit: (ev) => {
-      events.push(ev);
-      eventHandlers.forEach((h) => h(ev));
+    emit,
+    dispose: () => {
+      clearTimeout(streamTimer);
+      streamTimer = undefined;
+      eventHandlers.clear();
+      daemonHandlers.clear();
     },
     emitDaemonState: (s) => daemonHandlers.forEach((h) => h(s)),
     listProjects: () => run("list_projects", [], () => ({ projects: opts.projects ?? [] })),
@@ -322,17 +363,27 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
             engine: req.engine ?? "claude",
           });
         }
+        append(id, "user_text", { text: req.text });
         return { chat_id: id };
       }),
     switchEngine: (id, to) =>
       run("switch_engine", [id, to], () => {
-        getChat(id).engine = to;
+        const chat = getChat(id);
+        if (activeChats.has(id)) throw { kind: "daemon", message: "sohbette çalışan bir tur var" } satisfies BridgeError;
+        const from = chat.engine;
+        chat.engine = to;
+        append(id, "engine_switched", { from, to, reason: "user" });
         return { chat_id: id };
       }),
-    cancelTurn: (id) => run("cancel_turn", [id], () => ({ chat_id: id })),
+    cancelTurn: (id) => run("cancel_turn", [id], () => {
+      getChat(id);
+      // Gerçek servis iptal için turn_completed üretmez; durum sayacı sıfıra iner.
+      activeChats.delete(id);
+      return { chat_id: id };
+    }),
     eventsPage: (id, after, limit) =>
       run("events_page", [id, after, limit], () => {
-        const all = events.filter((e) => e.chat_id === id && e.seq > (after ?? 0));
+        const all = events.filter((e) => e.chat_id === id && e.seq > (after ?? 0)).sort((a, b) => a.seq - b.seq);
         const page = all.slice(0, limit);
         return {
           events: page,
@@ -354,10 +405,17 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
     importClaudeHistory: (root) =>
       run("import_claude_history", [root], () => ({ files: 0, chats: 0, messages: 0, skipped: 0, masked: 0 })),
     status: () =>
-      run("status", [], () => ({ version: "test", pid: 0, running_turns: 0, default_engine: "claude" as const })),
+      run("status", [], () => ({ version: "test", pid: 0, running_turns: activeChats.size, default_engine: "claude" as const })),
     onEvent: async (h) => {
       eventHandlers.add(h);
-      return () => eventHandlers.delete(h);
+      scheduleStream();
+      return () => {
+        eventHandlers.delete(h);
+        if (eventHandlers.size === 0) {
+          clearTimeout(streamTimer);
+          streamTimer = undefined;
+        }
+      };
     },
     onDaemonState: async (h) => {
       daemonHandlers.add(h);
