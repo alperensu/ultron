@@ -10,6 +10,7 @@ pub mod external;
 pub mod handoff;
 pub mod ipc;
 pub mod paths;
+pub mod prompts;
 pub mod session;
 pub mod summarizer;
 pub mod workstate;

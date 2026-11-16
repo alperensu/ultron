@@ -25,6 +25,47 @@ pub struct AgyEngine {
     cfg: EngineConfig,
 }
 
+/// Kartı korur; Windows sınırında yalnız değişken istemin eski kısmı kırpılır.
+pub(crate) fn prepend_instructions(spec: &mut CommandSpec, instructions: &str) {
+    if let Some(arg) = spec
+        .args
+        .iter_mut()
+        .rev()
+        .find(|arg| arg.starts_with("-p="))
+    {
+        let prompt = &arg["-p=".len()..];
+        let prefix = crate::prompts::prefix(instructions, "");
+        let available = MAX_PROMPT_ARG_UTF16.saturating_sub("-p=".len() + utf16_len(&prefix));
+        let tail = tail_with_budget(prompt, available);
+        *arg = format!("-p={prefix}{tail}");
+    }
+}
+
+pub(crate) fn instructions_fit(instructions: &str) -> bool {
+    // Kırpma işareti ve en son kullanıcı metni için de yer bırakılır.
+    utf16_len(&crate::prompts::prefix(instructions, "")) + 1024 < MAX_PROMPT_ARG_UTF16
+}
+
+fn tail_with_budget(prompt: &str, budget: usize) -> String {
+    if utf16_len(prompt) <= budget {
+        return prompt.to_string();
+    }
+    let mark_len = utf16_len(TRUNCATION_MARK);
+    if budget < mark_len {
+        return String::new();
+    }
+    let mut used = mark_len;
+    let mut start = prompt.len();
+    for (idx, ch) in prompt.char_indices().rev() {
+        if used + ch.len_utf16() > budget {
+            break;
+        }
+        used += ch.len_utf16();
+        start = idx;
+    }
+    format!("{TRUNCATION_MARK}{}", &prompt[start..])
+}
+
 impl AgyEngine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self { cfg }

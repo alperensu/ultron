@@ -25,6 +25,12 @@ pub struct CodexEngine {
     cfg: EngineConfig,
 }
 
+/// Yerleşik Codex talimatlarına dokunmadan kullanıcı isteminin önüne ekler.
+pub(crate) fn prepend_instructions(spec: &mut CommandSpec, instructions: &str) {
+    let prompt = spec.stdin.as_deref().unwrap_or_default();
+    spec.stdin = Some(crate::prompts::prefix(instructions, prompt));
+}
+
 impl CodexEngine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self { cfg }

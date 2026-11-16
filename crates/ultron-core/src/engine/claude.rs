@@ -24,6 +24,22 @@ const WORKSPACE_DENY: &str = "Bash(rm:*),Bash(del:*),Bash(Remove-Item:*),Bash(gi
 /// MCP sunucusu içermeyen satır içi yapılandırma (`--strict-mcp-config` ile birlikte).
 const EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 
+/// Yerleşik sistem talimatını korur; değişken uzunluklu araç bayraklarından önce ekler.
+pub(crate) fn append_prompt_file(spec: &mut CommandSpec, path: &std::path::Path) {
+    let position = spec
+        .args
+        .iter()
+        .position(|arg| matches!(arg.as_str(), "--tools" | "--disallowedTools"))
+        .unwrap_or(spec.args.len());
+    spec.args.splice(
+        position..position,
+        [
+            "--append-system-prompt-file".to_string(),
+            path.to_string_lossy().into_owned(),
+        ],
+    );
+}
+
 /// Claude Code motoru.
 pub struct ClaudeEngine {
     cfg: EngineConfig,

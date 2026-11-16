@@ -19,6 +19,7 @@ use crate::eventlog::EventLog;
 use crate::events::{EngineEvent, SwitchReason};
 use crate::external;
 use crate::handoff::build_handoff_before;
+use crate::prompts::{self, Role};
 use crate::summarizer::{NullSummarizer, Summarizer};
 use crate::workstate::WorkStateService;
 
@@ -101,6 +102,23 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("motor kayıtlı değil: {engine:?}"))?;
         let (_guard, cancel) = self.begin_turn(chat_id)?;
         self.db.insert_chat(chat_id, None, "", Utc::now())?;
+
+        let project_bound = self
+            .db
+            .get_chat(chat_id)?
+            .is_some_and(|chat| chat.project_id.is_some());
+        let mode = prompts::work_mode(project_bound, cwd);
+        let project_files = if project_bound {
+            ["AGENTS.md", "CLAUDE.md"]
+                .into_iter()
+                .map(|name| cwd.join(name))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let instructions = prompts::compose(Role::Brain, mode, &project_files);
+        let run_dir = crate::paths::Paths::resolve()?.run;
+        let driver = prompts::with_instructions(driver, &instructions, &run_dir, chat_id)?;
 
         // Dış değişiklikler, motor değişim olayı yazılmadan önceki son olay zamanına göre bulunur.
         let had_events = self.db.has_events(chat_id)?;
