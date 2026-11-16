@@ -98,6 +98,7 @@ pub(crate) struct ImportCheckpoint {
     pub generation: i64,
     pub file_size: u64,
     pub first_line_hash: Option<String>,
+    pub prefix_hash: Option<String>,
     pub session_cwd: Option<String>,
 }
 
@@ -418,7 +419,7 @@ impl Db {
     ) -> Result<std::collections::HashMap<String, ImportCheckpoint>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT path, byte_offset, generation, file_size, first_line_hash, session_cwd
+            "SELECT path, byte_offset, generation, file_size, first_line_hash, session_cwd, prefix_hash
              FROM import_state",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -428,6 +429,7 @@ impl Db {
                 file_size: r.get::<_, i64>(3)?.max(0) as u64,
                 first_line_hash: r.get(4)?,
                 session_cwd: r.get(5)?,
+                prefix_hash: r.get(6)?,
             }))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -445,37 +447,22 @@ impl Db {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut inserted = false;
         if let Some(ev) = event {
-            // Her kayıt için yeniden tahsis: araya giren canlı olaylar sıra tüketebilir.
-            let seq: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE chat_id = ?1",
-                params![ev.chat_id], |r| r.get(0),
-            )?;
-            inserted = tx.execute(
-                "INSERT INTO events(id, chat_id, session_id, seq, ts, kind, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
-                params![ev.id, ev.chat_id, ev.session_id, seq, ev.ts.to_rfc3339(), ev.kind, ev.payload.to_string()],
-            )? != 0;
+            inserted = Self::append_event_tx(&tx, ev)?.is_some();
             if inserted {
-                if let Some(text) = indexable_text(&ev.kind, &ev.payload) {
-                    tx.execute(
-                        "INSERT INTO messages_fts(chat_id, event_id, text) VALUES (?1, ?2, ?3)",
-                        params![ev.chat_id, ev.id, text],
-                    )?;
-                }
                 tx.execute("UPDATE chats SET updated_at = ?2 WHERE id = ?1",
                     params![ev.chat_id, ev.ts.to_rfc3339()])?;
             }
         }
         tx.execute(
-            "INSERT INTO import_state(path, byte_offset, updated_at, generation, file_size, first_line_hash, session_cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO import_state(path, byte_offset, updated_at, generation, file_size, first_line_hash, session_cwd, prefix_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(path) DO UPDATE SET byte_offset = excluded.byte_offset,
                 updated_at = excluded.updated_at, generation = excluded.generation,
                 file_size = excluded.file_size, first_line_hash = excluded.first_line_hash,
-                session_cwd = excluded.session_cwd",
+                session_cwd = excluded.session_cwd, prefix_hash = excluded.prefix_hash",
             params![path, i64::try_from(checkpoint.offset)?, Utc::now().to_rfc3339(),
                 checkpoint.generation, i64::try_from(checkpoint.file_size)?,
-                checkpoint.first_line_hash, checkpoint.session_cwd],
+                checkpoint.first_line_hash, checkpoint.session_cwd, checkpoint.prefix_hash],
         )?;
         tx.commit()?;
         Ok(inserted)
@@ -512,7 +499,35 @@ impl Db {
     /// Mesaj olaylarının metni aynı işlemde tam metin dizinine yazılır.
     pub fn insert_event(&self, ev: &StoredEvent) -> Result<bool> {
         let mut conn = self.conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = Self::insert_event_tx(&tx, ev)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Sıra numarasını ve olayı aynı SQLite yazma işlemi içinde tahsis eder.
+    pub fn append_event(&self, ev: &StoredEvent) -> Result<Option<StoredEvent>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = Self::append_event_tx(&tx, ev)?;
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    fn append_event_tx(
+        tx: &rusqlite::Transaction<'_>,
+        ev: &StoredEvent,
+    ) -> Result<Option<StoredEvent>> {
+        let mut stored = ev.clone();
+        stored.seq = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE chat_id = ?1",
+            params![ev.chat_id],
+            |r| r.get(0),
+        )?;
+        Ok(Self::insert_event_tx(tx, &stored)?.then_some(stored))
+    }
+
+    fn insert_event_tx(tx: &rusqlite::Transaction<'_>, ev: &StoredEvent) -> Result<bool> {
         let inserted = tx.execute(
             "INSERT INTO events(id, chat_id, session_id, seq, ts, kind, payload_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
@@ -535,7 +550,6 @@ impl Db {
                 params![ev.chat_id, ev.id, text],
             )?;
         }
-        tx.commit()?;
         Ok(true)
     }
 
@@ -921,3 +935,6 @@ fn engine_parse(s: &str) -> Result<EngineId> {
         other => return Err(anyhow!("bilinmeyen motor: {other}")),
     })
 }
+
+#[cfg(test)]
+mod writer_regression_tests;

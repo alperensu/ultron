@@ -83,6 +83,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE projects ADD COLUMN path_key TEXT NOT NULL DEFAULT '';
     CREATE INDEX projects_path_key ON projects(path_key);
     "#,
+    // v7: işlenmiş önekin son penceresini yeniden yazımlara karşı doğrula.
+    r#"
+    ALTER TABLE import_state ADD COLUMN prefix_hash TEXT;
+    "#,
 ];
 
 /// Bekleyen migrasyonları `user_version` üzerinden sırayla uygular.

@@ -91,6 +91,40 @@ const STARTED: &str = r#"{"type":"session_started","native_session_id":"nat-1"}"
 const REPLY: &str = r#"{"type":"assistant_text","text":"anladım"}"#;
 const DONE: &str = r#"{"type":"turn_completed"}"#;
 
+#[tokio::test]
+async fn reservation_cannot_be_used_for_other_chat() {
+    let env = env_with(&[(EngineId::Claude, vec![DONE])]);
+    let reservation = env.mgr.reserve_turn("reserved", EngineId::Claude).unwrap();
+    let error = env.mgr.send_reserved(
+        reservation, "other", &env.cwd, EngineId::Claude, "test", ToolPolicy::ReadOnly,
+    ).await.unwrap_err();
+    assert!(error.to_string().contains("rezervasyon"), "{error}");
+    assert!(env.db.get_chat("other").unwrap().is_none());
+    assert!(env.mgr.reserve_turn("reserved", EngineId::Claude).is_ok());
+}
+
+#[tokio::test]
+async fn reservation_cannot_be_used_by_other_manager_or_engine() {
+    let env = env_with(&[
+        (EngineId::Claude, vec![DONE]),
+        (EngineId::Codex, vec![DONE]),
+    ]);
+    let other = env_with(&[(EngineId::Claude, vec![DONE])]);
+    let reservation = env.mgr.reserve_turn("reserved", EngineId::Claude).unwrap();
+    let error = other.mgr.send_reserved(
+        reservation, "reserved", &other.cwd, EngineId::Claude, "test", ToolPolicy::ReadOnly,
+    ).await.unwrap_err();
+    assert!(error.to_string().contains("rezervasyon"), "{error}");
+    assert!(other.db.get_chat("reserved").unwrap().is_none());
+    let reservation = env.mgr.reserve_turn("reserved", EngineId::Claude).unwrap();
+    let error = env.mgr.send_reserved(
+        reservation, "reserved", &env.cwd, EngineId::Codex, "test", ToolPolicy::ReadOnly,
+    ).await.unwrap_err();
+    assert!(error.to_string().contains("rezervasyon"), "{error}");
+    assert!(env.db.get_chat("reserved").unwrap().is_none());
+    assert!(env.mgr.reserve_turn("reserved", EngineId::Claude).is_ok());
+}
+
 fn kinds(db: &Db, chat: &str) -> Vec<String> {
     db.events_for_chat(chat, None)
         .unwrap()

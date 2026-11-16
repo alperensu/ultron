@@ -49,6 +49,7 @@ impl Drop for TurnGuard {
 pub struct TurnReservation {
     guard: TurnGuard,
     cancel: CancellationToken,
+    engine: EngineId,
 }
 
 /// Sohbet oturumlarını yöneten ana nesne.
@@ -113,7 +114,11 @@ impl SessionManager {
             return Err(anyhow!("motor kayıtlı değil: {engine:?}"));
         }
         let (guard, cancel) = self.begin_turn(chat_id)?;
-        Ok(TurnReservation { guard, cancel })
+        Ok(TurnReservation {
+            guard,
+            cancel,
+            engine,
+        })
     }
 
     /// [`SessionManager::reserve_turn`] ile ayrılmış turu çalıştırır.
@@ -126,9 +131,16 @@ impl SessionManager {
         text: &str,
         policy: ToolPolicy,
     ) -> Result<TurnOutcome> {
+        if reservation.guard.chat_id != chat_id
+            || reservation.engine != engine
+            || !Arc::ptr_eq(&reservation.guard.active, &self.active)
+        {
+            bail!("tur rezervasyonu başka sohbet, motor veya yönetici için kullanılamaz");
+        }
         let TurnReservation {
             guard: _guard,
             cancel,
+            engine: _,
         } = reservation;
         let driver = self
             .engines

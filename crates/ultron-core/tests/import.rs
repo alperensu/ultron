@@ -183,6 +183,97 @@ fn message(text: &str) -> serde_json::Value {
 }
 
 #[test]
+fn pem_split_across_blocks_is_masked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let record = serde_json::json!({"type":"assistant", "message":{"content":[
+        {"type":"text", "text":"before\n-----BEGIN PRIVATE KEY-----"},
+        {"type":"text", "text":"syntheticpemvalue\n-----END PRIVATE KEY-----\nafter"}
+    ]}});
+    write_records(&root.join("pem.jsonl"), &[record]);
+    let report = import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    assert_eq!(report.masked, 1);
+    let text = texts(&db.events_for_chat("claude-pem", None).unwrap()).remove(0);
+    assert_eq!(text, "before\n[MASKED]\nafter");
+    assert!(db.search_messages(None, "syntheticpemvalue", 10).unwrap().is_empty());
+}
+
+#[test]
+fn yaml_literal_block_masked() {
+    let (text, count) = mask_secrets("config:\n  password: |\n    syntheticliteral\n    secondline\n  public: visible\n");
+    assert!(!text.contains("syntheticliteral") && !text.contains("secondline"), "{text}");
+    assert!(text.contains("public: visible"));
+    assert!(count >= 1);
+}
+
+#[test]
+fn yaml_folded_block_masked() {
+    let (text, count) = mask_secrets("'api_token': >- # folded\n  syntheticfolded\n\n  secondline\npublic: visible\n");
+    assert!(!text.contains("syntheticfolded") && !text.contains("secondline"), "{text}");
+    assert!(text.contains("public: visible"));
+    assert!(count >= 1);
+}
+
+#[test]
+fn yaml_blocks_are_absent_from_db_and_fts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    write_records(&root.join("yaml.jsonl"), &[
+        message("password: |\n  syntheticliteral\n  syntheticcontinuation\npublic: visible"),
+        message("token: >\n  syntheticfolded\n  syntheticcontinuation\npublic: visible"),
+    ]);
+    import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("ultron.db")).unwrap();
+    for (table, column) in [("events", "payload_json"), ("messages_fts", "text")] {
+        let count: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {column} LIKE '%synthetic%'"),
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    for raw in ["syntheticliteral", "syntheticfolded", "syntheticcontinuation"] {
+        assert!(db.search_messages(None, raw, 10).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn equal_size_rewrite_after_first_line_is_detected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let file = root.join("equal.jsonl");
+    let first = serde_json::json!({"type":"system", "cwd":"synthetic/project"});
+    write_records(&file, &[first.clone(), message("old")]);
+    import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    let size = std::fs::metadata(&file).unwrap().len();
+    write_records(&file, &[first, message("new")]);
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), size);
+    let report = import_claude_history(&db, &root, &mut ImportState::load(&db).unwrap()).unwrap();
+    assert_eq!(report.messages, 1);
+    assert_eq!(texts(&db.events_for_chat("claude-equal", None).unwrap()), ["old", "new"]);
+}
+
+#[test]
+fn legacy_checkpoint_without_prefix_hash_does_not_duplicate_messages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = open(tmp.path());
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    write_records(&root.join("legacy.jsonl"), &[message("original")]);
+    import_claude_history(&db, &root, &mut ImportState::default()).unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("ultron.db")).unwrap();
+    conn.execute("UPDATE import_state SET prefix_hash = NULL", []).unwrap();
+    let report = import_claude_history(&db, &root, &mut ImportState::load(&db).unwrap()).unwrap();
+    assert_eq!(report.messages, 0);
+    assert_eq!(db.events_for_chat("claude-legacy", None).unwrap().len(), 1);
+}
+
+#[test]
 fn import_after_live_events_loses_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let db = open(tmp.path());

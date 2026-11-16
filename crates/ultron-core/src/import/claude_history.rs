@@ -103,6 +103,17 @@ fn fingerprint(parts: &[&[u8]]) -> String {
     format!("{a:016x}{b:016x}")
 }
 
+/// İşlenmiş önekin son 4 KiB penceresi ve ofseti; eklenen baytlar buna dahil değildir.
+fn processed_prefix_hash(reader: &mut BufReader<File>, offset: u64) -> Result<String> {
+    let position = reader.stream_position()?;
+    let start = offset.saturating_sub(4096);
+    reader.seek(SeekFrom::Start(start))?;
+    let mut window = vec![0; (offset - start) as usize];
+    reader.read_exact(&mut window)?;
+    reader.seek(SeekFrom::Start(position))?;
+    Ok(fingerprint(&[&offset.to_le_bytes(), &window]))
+}
+
 /// Bir satırı okur. `None`: dosya sonu. `Some((bytes, tam_mı))`; aşırı uzun satır
 /// sonuna kadar tüketilir ve boş (atlanacak) döner.
 fn read_line(r: &mut BufReader<File>) -> Result<Option<(Vec<u8>, bool, u64)>> {
@@ -155,6 +166,7 @@ fn import_file(
             // Ofset belleği sıfırlansa bile kalıcı nesli koru; kimlikler tekrar etmez.
             let mut saved = db.import_checkpoints()?.remove(&key).unwrap_or_default();
             saved.offset = 0;
+            saved.prefix_hash = None;
             saved
         }
     };
@@ -162,7 +174,15 @@ fn import_file(
     let first_hash = read_line(&mut reader)?
         .filter(|(_, complete, _)| *complete)
         .map(|(line, _, _)| fingerprint(&[&line]));
+    let prefix_changed = if checkpoint.offset > len {
+        true
+    } else if let Some(saved_hash) = &checkpoint.prefix_hash {
+        processed_prefix_hash(&mut reader, checkpoint.offset)? != *saved_hash
+    } else {
+        false
+    };
     let rewritten = len < checkpoint.file_size
+        || prefix_changed
         || checkpoint
             .first_line_hash
             .as_ref()
@@ -172,6 +192,9 @@ fn import_file(
         checkpoint.generation += 1;
         checkpoint.offset = 0;
         checkpoint.session_cwd = None;
+    } else if checkpoint.prefix_hash.is_none() {
+        // Eski kontrol noktasını aynı nesilde tara; mevcut kimlikler çoğalmaz.
+        checkpoint.offset = 0;
     }
     checkpoint.file_size = len;
     checkpoint.first_line_hash = first_hash;
@@ -196,6 +219,7 @@ fn import_file(
         }
         let line_start = checkpoint.offset;
         checkpoint.offset += consumed;
+        checkpoint.prefix_hash = Some(processed_prefix_hash(&mut reader, checkpoint.offset)?);
         let text = String::from_utf8_lossy(&line);
         let text = text.trim();
         if text.is_empty() {
@@ -273,6 +297,7 @@ fn import_file(
         }
     }
 
+    checkpoint.prefix_hash = Some(processed_prefix_hash(&mut reader, checkpoint.offset)?);
     db.commit_import_record(&key, &checkpoint, None)?;
     state.checkpoints.insert(key, checkpoint);
     Ok(())
@@ -293,18 +318,14 @@ fn extract_message(v: &Value) -> Option<(&'static str, String, usize)> {
     let mut masked = 0;
     match content {
         Value::String(s) => {
-            let (text, count) = mask_secrets(s);
-            parts.push(text);
-            masked += count;
+            parts.push(s.clone());
         }
         Value::Array(blocks) => {
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            let (text, count) = mask_secrets(t);
-                            parts.push(text);
-                            masked += count;
+                            parts.push(t.to_string());
                         }
                     }
                     Some("tool_use") => {
@@ -324,6 +345,9 @@ fn extract_message(v: &Value) -> Option<(&'static str, String, usize)> {
         .filter(|p| !p.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n");
+    // PEM gibi çok satırlı sırlar içerik blokları arasında bölünebilir.
+    let (joined, count) = mask_secrets(&joined);
+    masked += count;
     if joined.trim().is_empty() {
         None
     } else {

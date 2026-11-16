@@ -58,14 +58,15 @@ impl EventLog {
             id: Uuid::new_v4().to_string(),
             chat_id: chat_id.to_string(),
             session_id: session_id.map(str::to_string),
-            seq: self.db.next_seq(chat_id)?,
+            seq: 0, // Veritabanı işlemi içinde tahsis edilir.
             ts: Utc::now(),
             kind,
             payload,
         };
-        if !self.db.insert_event(&stored)? {
-            bail!("olay zaten kayıtlı: {}", stored.id);
-        }
+        let stored = self
+            .db
+            .append_event(&stored)?
+            .ok_or_else(|| anyhow!("olay zaten kayıtlı: {}", stored.id))?;
         self.write_transcript(&stored)?;
         // Dinleyici yoksa gönderim hatası beklenen bir durumdur.
         let _ = self.tx.send(stored.clone());
