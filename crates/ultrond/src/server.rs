@@ -93,7 +93,12 @@ fn acquire_lock(path: &Path) -> Result<File> {
         .truncate(false)
         .share_mode(0)
         .open(path)
-        .map_err(|e| anyhow!("başka bir ultrond örneği çalışıyor ({}): {e}", path.display()))
+        .map_err(|e| {
+            anyhow!(
+                "başka bir ultrond örneği çalışıyor ({}): {e}",
+                path.display()
+            )
+        })
 }
 
 /// Açık `Running` oturumlarından, son olayı `turn_completed` olmayanları (yani tur ortasında
@@ -127,7 +132,11 @@ pub fn recover_interrupted(db: &Db, log: &EventLog) -> Result<usize> {
 /// kurulur; değilse yalnız kural tabanlı durum kalır. Özetleyici, kullanıcı projelerinden
 /// ayrı `run\summarizer` dizininde (salt okunur kipte) çalışır.
 pub fn select_summarizer(paths: &Paths, cfg: &Config) -> Result<Box<dyn Summarizer>> {
-    match cfg.engines.iter().find(|e| e.id == EngineId::Agy && e.enabled) {
+    match cfg
+        .engines
+        .iter()
+        .find(|e| e.id == EngineId::Agy && e.enabled)
+    {
         Some(agy) => {
             let dir = paths.run.join("summarizer");
             std::fs::create_dir_all(&dir)
@@ -402,9 +411,21 @@ async fn dispatch(
         }
         Request::GetQuota => not_implemented(writer, 5).await,
         Request::SetResetRights { .. } => not_implemented(writer, 5).await,
-        Request::ImportCatalog { .. } => not_implemented(writer, 3).await,
+        Request::ImportCatalog { path } => {
+            let md = tokio::fs::read_to_string(&path)
+                .await
+                .context("proje kataloğu okunamadı")?;
+            let report = ultron_core::projects::import_catalog(&st.db, &md)?;
+            ok(writer, serde_json::to_value(report)?).await?;
+            Ok(Flow::Continue)
+        }
         Request::ImportClaudeHistory { .. } => not_implemented(writer, 4).await,
-        Request::Route { .. } => not_implemented(writer, 3).await,
+        Request::Route { text } => {
+            let active = st.db.last_active_project()?;
+            let result = ultron_core::routing::route(&st.db, &text, active.as_deref())?;
+            ok(writer, serde_json::to_value(result)?).await?;
+            Ok(Flow::Continue)
+        }
         Request::Switch { chat_id, to } => {
             st.manager.switch(&chat_id, to, SwitchReason::User).await?;
             ok(writer, json!({"chat_id": chat_id})).await?;
@@ -420,9 +441,11 @@ async fn dispatch(
             query,
             limit,
         } => {
-            let hits = st
-                .db
-                .search_messages(chat_id.as_deref(), &query, limit.clamp(1, MAX_SEARCH_LIMIT))?;
+            let hits = st.db.search_messages(
+                chat_id.as_deref(),
+                &query,
+                limit.clamp(1, MAX_SEARCH_LIMIT),
+            )?;
             ok(writer, json!({"hits": hits})).await?;
             Ok(Flow::Continue)
         }
@@ -484,13 +507,7 @@ async fn dispatch(
                 turns.spawn(async move {
                     let result = task_state
                         .manager
-                        .send(
-                            &task_chat,
-                            Path::new(&cwd),
-                            engine,
-                            &text,
-                            policy.into(),
-                        )
+                        .send(&task_chat, Path::new(&cwd), engine, &text, policy.into())
                         .await;
                     drop(guard);
                     let _ = done_tx.send(result);
@@ -633,6 +650,251 @@ fn outcome_name(outcome: &TurnOutcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ultron_core::engine::FakeEngine;
+    use ultron_core::ipc::{PolicyArg, ProjectInfo, RouteResult};
+
+    const STARTED: &str = r#"{"type":"session_started","native_session_id":"nat-1"}"#;
+    const REPLY: &str = r#"{"type":"assistant_text","text":"sentetik yanıt"}"#;
+    const DONE: &str = r#"{"type":"turn_completed"}"#;
+
+    fn paths_in(dir: &Path) -> Paths {
+        let paths = Paths::from_root(dir.join("ultron"));
+        paths.ensure().unwrap();
+        paths
+    }
+
+    fn abs_dir(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("proje");
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn unique_pipe() -> String {
+        format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4())
+    }
+
+    async fn start_with(paths: &Paths, pipe: &str, lines: &[&str]) -> ServerHandle {
+        // Birim testlerinde yalnız sahte CLI çalıştırılır.
+        static FAKE: std::sync::Once = std::sync::Once::new();
+        FAKE.call_once(|| {
+            let name = format!("ultron-fake-cli{}", std::env::consts::EXE_SUFFIX);
+            let exe = std::env::current_exe().unwrap();
+            let fake = exe.ancestors().skip(1).take(6).map(|dir| dir.join(&name))
+                .find(|path| path.is_file()).expect("önce ultron-fake-cli derlenmeli");
+            // SAFETY: tüm testler yalnız aynı sahte CLI yolunu bir kez yazar.
+            unsafe { std::env::set_var("ULTRON_FAKE_CLI", fake) };
+        });
+        let fixture = paths.root.join("routing-fixture.jsonl");
+        std::fs::write(&fixture, lines.join("\n") + "\n").unwrap();
+        let mut engines: HashMap<EngineId, Arc<dyn Engine>> = HashMap::new();
+        engines.insert(
+            EngineId::Claude,
+            Arc::new(FakeEngine::from_fixture(&fixture)),
+        );
+        start(ServerConfig {
+            paths: paths.clone(),
+            pipe_name: pipe.into(),
+            cfg: Config::default(),
+            engines,
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn connect(h: &ServerHandle) -> ipc::Client {
+        ipc::Client::connect(h.pipe_name(), h.token())
+            .await
+            .unwrap()
+    }
+
+    async fn next(client: &mut ipc::Client) -> Option<Response> {
+        tokio::time::timeout(Duration::from_secs(20), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn response(h: &ServerHandle, request: Request) -> Response {
+        let mut client = connect(h).await;
+        client.send(&request).await.unwrap();
+        next(&mut client).await.unwrap()
+    }
+
+    async fn data(h: &ServerHandle, request: Request) -> Value {
+        match response(h, request).await {
+            Response::Ok { data } => data,
+            other => panic!("başarı yanıtı bekleniyordu: {other:?}"),
+        }
+    }
+
+    fn seed(db: &Db, id: &str, name: &str, path: &Path, active: Option<&str>) {
+        db.upsert_project(&ProjectInfo {
+            id: id.into(),
+            name: name.into(),
+            path: path.to_string_lossy().into_owned(),
+            aliases: Vec::new(),
+            description: None,
+            last_active_at: active.map(str::to_string),
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_uses_projects_activity_without_any_chats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let db = Db::open(&paths.db).unwrap();
+        let h = start_with(&paths, &unique_pipe(), &[STARTED, REPLY, DONE]).await;
+        let empty: RouteResult = serde_json::from_value(
+            data(
+                &h,
+                Request::Route {
+                    text: "devam".into(),
+                },
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(empty.project_id, None);
+        seed(
+            &db,
+            "eski",
+            "Ödeme",
+            &tmp.path().join("eski"),
+            Some("2026-11-16T10:00:00+03:00"),
+        );
+        seed(
+            &db,
+            "yeni",
+            "Atölye",
+            &tmp.path().join("yeni"),
+            Some("2026-11-16T08:00:00Z"),
+        );
+        seed(
+            &db,
+            "etkin-degil",
+            "İletişim",
+            &tmp.path().join("diger"),
+            None,
+        );
+        assert!(db.list_chats(None, true).unwrap().is_empty());
+        let fallback: RouteResult = serde_json::from_value(
+            data(
+                &h,
+                Request::Route {
+                    text: "devam".into(),
+                },
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(fallback.project_id.as_deref(), Some("yeni"));
+        assert_eq!(fallback.confidence, 0.5);
+        let explicit: RouteResult = serde_json::from_value(
+            data(
+                &h,
+                Request::Route {
+                    text: "ÖDEME".into(),
+                },
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(explicit.project_id.as_deref(), Some("eski"));
+        assert_eq!(explicit.confidence, 0.9);
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn import_catalog_reads_file_upserts_and_reports_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let h = start_with(&paths, &unique_pipe(), &[STARTED, REPLY, DONE]).await;
+        let file = tmp.path().join("catalog.md");
+        std::fs::write(
+            &file,
+            include_str!("../../ultron-core/tests/fixtures/catalog/projects.md"),
+        )
+        .unwrap();
+        let request = Request::ImportCatalog {
+            path: file.to_string_lossy().into_owned(),
+        };
+        let first = data(&h, request.clone()).await;
+        assert_eq!(first, json!({"imported": 3, "updated": 0}));
+        let before = data(&h, Request::ListProjects).await;
+        let second = data(&h, request).await;
+        assert_eq!(second, json!({"imported": 0, "updated": 3}));
+        assert_eq!(data(&h, Request::ListProjects).await, before);
+        let missing = Request::ImportCatalog {
+            path: tmp.path().join("missing.md").to_string_lossy().into_owned(),
+        };
+        assert!(matches!(
+            response(&h, missing).await,
+            Response::Error { .. }
+        ));
+        std::fs::write(&file, [0xff, 0xfe]).unwrap();
+        assert!(matches!(
+            response(
+                &h,
+                Request::ImportCatalog {
+                    path: file.to_string_lossy().into_owned()
+                }
+            )
+            .await,
+            Response::Error { .. }
+        ));
+        assert_eq!(data(&h, Request::ListProjects).await, before);
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn send_binding_updates_project_activity_used_by_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let cwd = abs_dir(tmp.path());
+        let db = Db::open(&paths.db).unwrap();
+        seed(&db, "p1", "Ödeme", &cwd, None);
+        let h = start_with(&paths, &unique_pipe(), &[STARTED, REPLY, DONE]).await;
+        let mut client = connect(&h).await;
+        client
+            .send(&Request::Send {
+                chat_id: Some("bound".into()),
+                cwd: cwd.to_string_lossy().into_owned(),
+                engine: Some(EngineId::Claude),
+                text: "merhaba".into(),
+                policy: PolicyArg::ReadOnly,
+                project_id: Some("p1".into()),
+            })
+            .await
+            .unwrap();
+        loop {
+            match next(&mut client).await.expect("akış erken kapandı") {
+                Response::Ok { data } if data.get("done").is_some() => break,
+                Response::Error { message } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        assert!(
+            db.get_project("p1")
+                .unwrap()
+                .unwrap()
+                .last_active_at
+                .is_some()
+        );
+        let routed: RouteResult = serde_json::from_value(
+            data(
+                &h,
+                Request::Route {
+                    text: "devam".into(),
+                },
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(routed.project_id.as_deref(), Some("p1"));
+        assert_eq!(routed.confidence, 0.5);
+        h.shutdown().await;
+    }
 
     fn config_with_agy(enabled: bool) -> Config {
         let mut cfg = Config::default();
