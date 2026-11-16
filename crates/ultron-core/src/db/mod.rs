@@ -373,6 +373,41 @@ impl Db {
         Ok(())
     }
 
+    /// İçe aktarma ofsetlerini (dosya yolu -> bayt) okur.
+    pub fn import_offsets(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT path, byte_offset FROM import_state")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (p, o) = row?;
+            out.insert(p, u64::try_from(o).unwrap_or(0));
+        }
+        Ok(out)
+    }
+
+    /// Bir dosyanın işlenmiş bayt ofsetini yazar.
+    pub fn set_import_offset(&self, path: &str, offset: u64) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO import_state(path, byte_offset, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET
+                byte_offset = excluded.byte_offset, updated_at = excluded.updated_at",
+            params![path, i64::try_from(offset)?, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Sohbetin güncellenme zamanını verilen değere ayarlar (içe aktarma için).
+    pub fn set_chat_updated_at(&self, chat_id: &str, at: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE chats SET updated_at = ?2 WHERE id = ?1",
+            params![chat_id, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     /// Sohbetin güncellenme zamanını yazar; başlık boş ve otomatikse ilk mesajdan başlık üretir.
     pub fn touch_chat(&self, chat_id: &str, first_message: &str) -> Result<()> {
         let conn = self.conn()?;

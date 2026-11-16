@@ -419,7 +419,22 @@ async fn dispatch(
             ok(writer, serde_json::to_value(report)?).await?;
             Ok(Flow::Continue)
         }
-        Request::ImportClaudeHistory { .. } => not_implemented(writer, 4).await,
+        Request::ImportClaudeHistory { root } => {
+            let root = match root {
+                Some(r) => std::path::PathBuf::from(r),
+                None => std::env::var_os("USERPROFILE")
+                    .map(|h| std::path::PathBuf::from(h).join(".claude").join("projects"))
+                    .ok_or_else(|| anyhow!("USERPROFILE tanımlı değil"))?,
+            };
+            let db = st.db.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let mut state = ultron_core::import::ImportState::load(&db)?;
+                ultron_core::import::import_claude_history(&db, &root, &mut state)
+            })
+            .await??;
+            ok(writer, json!({"report": report})).await?;
+            Ok(Flow::Continue)
+        }
         Request::Route { text } => {
             let active = st.db.last_active_project()?;
             let result = ultron_core::routing::route(&st.db, &text, active.as_deref())?;
