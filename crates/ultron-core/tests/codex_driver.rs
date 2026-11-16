@@ -11,7 +11,7 @@ fn cfg() -> EngineConfig {
     EngineConfig {
         id: EngineId::Codex,
         enabled: true,
-        binary: "codex".into(),
+        binary: "sentetik-codex".into(),
         model: Some("gpt-6.1-sol".into()),
         effort: Some("medium".into()),
         extra_args: Vec::new(),
@@ -46,7 +46,7 @@ fn codex_command_new_and_resume() {
     let eng = CodexEngine::new(cfg());
 
     let new = eng.command(&request(ToolPolicy::ReadOnly, None));
-    assert_eq!(new.program, "codex");
+    assert_eq!(new.program, "sentetik-codex");
     assert_eq!(new.args[0], "exec");
     assert!(new.args.contains(&"--json".to_string()));
     let m = new.args.iter().position(|a| a == "-m").unwrap();

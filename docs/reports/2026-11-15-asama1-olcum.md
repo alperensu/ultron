@@ -8,7 +8,7 @@ Test dosyası: `crates/ultrond/tests/live_acceptance.rs`. Tüm canlı testler `#
 | Test | Sonuç |
 |---|---|
 | `live_claude_to_agy_handoff` (Claude haiku → agy) | **Geçti** (tek çalıştırma) |
-| `live_claude_to_codex_handoff` | **Geçti** (gpt-5.6-sol). Ayrıntı: Codex durumu bölümü. |
+| `live_claude_to_codex_handoff` | **Geçti** (gpt-6.1-sol). Ayrıntı: Codex durumu bölümü. |
 | `live_tool_restriction_probe` | **Ölçüm tamamlandı**. Kabul kapısı değil. Her iki motorda dosya korundu. |
 
 Aşama 1 devir çekirdeği canlı olarak doğrulandı: Claude'da alınan karar, motor değişiminden sonra agy tarafından doğru özetlendi.
@@ -74,7 +74,7 @@ Sonuç: Metin beş ayrı parça olarak geldi, ancak bütün cevap yaklaşık 130
 
 ## Codex durumu
 
-`live_claude_to_codex_handoff` geçti (model gpt-5.6-sol, efor medium). Tur 2 cevabı kısaca: "CSV; Excel'de açılacağı için seçtik, sıradaki adım export fonksiyonunu yazmak." Önceki başarısızlığın sebebi motor değil modeldi: `gpt-6.1-sol` bu hesapta `model_not_found` (400) döndürüyordu ve Ultron bu hatayı stdout JSON'unda gördüğü halde özete yansıtmıyordu (stderr boştu). Hata özeti artık motorun son hata mesajına düşer. Varsayılan `gpt-6.1-sol` adı `config.rs`'te kaldı; hesapta çalışan ad doğrulanmadan değiştirilmedi.
+`live_claude_to_codex_handoff` geçti (model gpt-6.1-sol, efor medium; güncel CLI ile yeniden koşuldu). Tur 2 cevabı kısaca: "CSV formatında karar verdik; Excel’de açılacağı için. Sıradaki adım export fonksiyonunu yazmak." Düzeltme: önceki `model_not_found` (400) sonucu hesaptan değil, PATH'teki eski bağımsız Codex CLI'sından (codex-cli 0.154.0) geliyordu; masaüstü uygulamasının paketlediği güncel CLI (0.169.x) ile `gpt-6.1-sol` bu hesapta çalışıyor. Ultron artık varsayılan `codex` adını sırayla `ULTRON_CODEX_BIN`, `~/.codex/config.toml` içindeki `CODEX_CLI_PATH`, en yeni `OpenAI.Codex_*` appx klasörü ve PATH ile çözüyor. Hata özeti ayrıca motorun son hata mesajına düşer (stdout JSON'undaki hata artık özete yansır).
 
 ## Bilinen sınırlar
 

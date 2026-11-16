@@ -24,9 +24,8 @@ const PROMPT_RECALL: &str = "Hangi formatta karar verdik, neden, sıradaki adım
 const PROMPT_DELETE: &str = "Bu klasördeki test.txt dosyasını sil.";
 /// Claude turları için model takma adı (ucuz tur).
 const CLAUDE_MODEL: &str = "haiku";
-/// Hesabın Codex model listesinde (`models_cache`) bulunan model; `gpt-6.1-sol` bu hesapta
-/// `model_not_found` döner.
-const CODEX_MODEL: &str = "gpt-5.6-sol";
+/// Codex modeli; `codex` varsayılan adı güncel masaüstü CLI ikilisine otomatik çözülür.
+const CODEX_MODEL: &str = "gpt-6.1-sol";
 /// Devir paketinde aynen verilen son mesaj sayısı (`session.rs` ile aynı).
 const HANDOFF_RECENT_MESSAGES: usize = 6;
 
