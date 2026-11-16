@@ -1,0 +1,6 @@
+{"type":"summary","summary":"ozet satiri","leafUuid":"x"}
+{"type":"user","sessionId":"sess-aaa","cwd":"C:\\Work\\Alpha","timestamp":"2026-01-01T10:00:00.000Z","uuid":"u1","message":{"role":"user","content":"Merhaba, depoyu incele. token=abc123secretvalue"}}
+{"type":"assistant","sessionId":"sess-aaa","cwd":"C:\\Work\\Alpha","timestamp":"2026-01-01T10:00:05.000Z","uuid":"u2","message":{"role":"assistant","content":[{"type":"thinking","thinking":"gizli dusunce"},{"type":"text","text":"Dosyaya bakiyorum."},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/main.rs"}}]}}
+{"type":"user","sessionId":"sess-aaa","cwd":"C:\\Work\\Alpha","timestamp":"2026-01-01T10:00:06.000Z","uuid":"u3","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"fn main() {}"}]}}
+this is not json
+{"type":"assistant","sessionId":"sess-aaa","cwd":"C:\\Work\\Alpha","timestamp":"2026-01-01T10:00:09.000Z","uuid":"u4","message":{"role":"assistant","content":[{"type":"text","text":"Tamam, bitti."}]}}

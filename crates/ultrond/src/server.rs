@@ -403,7 +403,22 @@ async fn dispatch(
         Request::GetQuota => not_implemented(writer, 5).await,
         Request::SetResetRights { .. } => not_implemented(writer, 5).await,
         Request::ImportCatalog { .. } => not_implemented(writer, 3).await,
-        Request::ImportClaudeHistory { .. } => not_implemented(writer, 4).await,
+        Request::ImportClaudeHistory { root } => {
+            let root = match root {
+                Some(r) => std::path::PathBuf::from(r),
+                None => std::env::var_os("USERPROFILE")
+                    .map(|h| std::path::PathBuf::from(h).join(".claude").join("projects"))
+                    .ok_or_else(|| anyhow!("USERPROFILE tanımlı değil"))?,
+            };
+            let db = st.db.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let mut state = ultron_core::import::ImportState::load(&db)?;
+                ultron_core::import::import_claude_history(&db, &root, &mut state)
+            })
+            .await??;
+            ok(writer, json!({"report": report})).await?;
+            Ok(Flow::Continue)
+        }
         Request::Route { .. } => not_implemented(writer, 3).await,
         Request::Switch { chat_id, to } => {
             st.manager.switch(&chat_id, to, SwitchReason::User).await?;

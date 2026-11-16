@@ -8,6 +8,7 @@ pub mod eventlog;
 pub mod events;
 pub mod external;
 pub mod handoff;
+pub mod import;
 pub mod ipc;
 pub mod paths;
 pub mod session;

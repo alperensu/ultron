@@ -62,6 +62,14 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE chats ADD COLUMN updated_at TEXT;
     UPDATE chats SET updated_at = created_at WHERE updated_at IS NULL;
     "#,
+    // v4: Claude geçmişi içe aktarma ofsetleri (yalnız ekleyici).
+    r#"
+    CREATE TABLE import_state (
+        path TEXT PRIMARY KEY,
+        byte_offset INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// Bekleyen migrasyonları `user_version` üzerinden sırayla uygular.
@@ -109,7 +117,7 @@ mod tests {
         let v: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, MIGRATIONS.len() as i64);
         let row: (String, String, String, i64, i64, String, String) = conn
             .query_row(
                 "SELECT title, project_id, current_engine, pinned, archived, title_source, updated_at
