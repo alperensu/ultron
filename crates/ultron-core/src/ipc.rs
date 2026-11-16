@@ -68,6 +68,9 @@ pub enum Request {
         chat_id: Option<String>,
         follow: bool,
         after_seq: Option<i64>,
+        /// Yalnız `follow: false` ve sohbetli istekte: en fazla bu kadar olay gönderip `done` der.
+        #[serde(default)]
+        limit: Option<u32>,
     },
     HistorySearch {
         chat_id: Option<String>,

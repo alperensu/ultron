@@ -606,9 +606,20 @@ async fn dispatch(
             chat_id,
             follow,
             after_seq,
+            limit,
         } => match chat_id {
             Some(chat) => {
                 let mut last_seq = after_seq.unwrap_or(0);
+                if let (false, Some(limit)) = (follow, limit) {
+                    let page = st
+                        .db
+                        .events_for_chat_page(&chat, Some(last_seq), limit as usize)?;
+                    for ev in page {
+                        write_msg(writer, &Response::Event(ev)).await?;
+                    }
+                    ok(writer, json!({"done": true})).await?;
+                    return Ok(Flow::Continue);
+                }
                 let mut wake = st.log.subscribe();
                 loop {
                     flush_events(st, &chat, &mut last_seq, writer).await?;

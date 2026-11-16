@@ -70,6 +70,7 @@ async fn daemon_restart_restores_sessions() {
         chat_id: Some("sohbet1".into()),
         follow: false,
         after_seq: None,
+        limit: None,
     })
     .await
     .unwrap();

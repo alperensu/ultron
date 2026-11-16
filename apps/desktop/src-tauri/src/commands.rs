@@ -129,6 +129,8 @@ pub async fn read_events_page(
             chat_id: Some(chat_id.to_string()),
             follow: false,
             after_seq,
+            // Bir fazla iste: `has_more`'u sayfa sonrası olaydan anlarız, akış temiz kapanır.
+            limit: Some(u32::try_from(limit + 1).unwrap_or(u32::MAX)),
         })
         .await
         .map_err(proto)?;

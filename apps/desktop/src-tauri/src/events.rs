@@ -61,6 +61,7 @@ async fn catch_up<F: FnMut(StoredEvent)>(
             chat_id: Some(chat.to_string()),
             follow: false,
             after_seq: cursors.last(chat),
+            limit: None,
         })
         .await?;
     loop {
@@ -89,6 +90,7 @@ async fn follow_once<F: FnMut(StoredEvent)>(
             chat_id: None,
             follow: true,
             after_seq: None,
+            limit: None,
         })
         .await?;
     *connected = true;

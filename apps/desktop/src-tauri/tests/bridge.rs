@@ -180,6 +180,57 @@ async fn event_bridge_resumes_after_reconnect() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn events_page_respects_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bridge = Bridge::new(paths.clone(), None);
+    let server = start_server(&paths, &pipe).await;
+    run_turn(&bridge, &cwd, "c1").await;
+
+    // Servis sınırı kendisi uygular: tam `limit` olay, sonra `done`.
+    let mut client = bridge.connect().await.unwrap();
+    client
+        .send(&Request::Events {
+            chat_id: Some("c1".into()),
+            follow: false,
+            after_seq: None,
+            limit: Some(2),
+        })
+        .await
+        .unwrap();
+    let mut seqs = Vec::new();
+    loop {
+        match client.next().await.unwrap() {
+            Some(ultron_core::ipc::Response::Event(e)) => seqs.push(e.seq),
+            Some(ultron_core::ipc::Response::Ok { data }) => {
+                assert_eq!(data["done"], true);
+                break;
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+    assert_eq!(seqs, vec![1, 2]);
+
+    let page = ultron_desktop::commands::read_events_page(&bridge, "c1", None, 2)
+        .await
+        .unwrap();
+    assert_eq!(page["events"].as_array().unwrap().len(), 2);
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["next_after_seq"], 2);
+    let rest = ultron_desktop::commands::read_events_page(&bridge, "c1", Some(2), 50)
+        .await
+        .unwrap();
+    assert_eq!(rest["has_more"], false);
+    server.shutdown().await;
+}
+
 async fn collect(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, i64)>,
     seen: &mut Vec<i64>,
