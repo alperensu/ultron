@@ -251,12 +251,73 @@ async fn auto_title_from_first_message() {
     h.shutdown().await;
 }
 
+/// Yeni bir `Request` varyantı eklenince bu eşleme derlenmez; varyant testte ele alınmalı.
+fn variant_name(r: &Request) -> &'static str {
+    match r {
+        Request::Hello { .. } => "hello",
+        Request::Send { .. } => "send",
+        Request::Switch { .. } => "switch",
+        Request::Cancel { .. } => "cancel",
+        Request::Events { .. } => "events",
+        Request::HistorySearch { .. } => "history_search",
+        Request::Status => "status",
+        Request::ListProjects => "list_projects",
+        Request::ListChats { .. } => "list_chats",
+        Request::GetChat { .. } => "get_chat",
+        Request::UpdateChat { .. } => "update_chat",
+        Request::GetQuota => "get_quota",
+        Request::ImportCatalog { .. } => "import_catalog",
+        Request::ImportClaudeHistory { .. } => "import_claude_history",
+        Request::Route { .. } => "route",
+        Request::SetResetRights { .. } => "set_reset_rights",
+    }
+}
+
 #[tokio::test]
-async fn later_task_requests_report_not_implemented() {
+async fn every_request_variant_is_implemented() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = paths_in(tmp.path());
+    let cwd = abs_dir(tmp.path());
+    let empty = tmp.path().join("bos");
+    std::fs::create_dir_all(&empty).unwrap();
+    // Gerçek ev dizini okunmasın.
+    // SAFETY: bu test ikilisinde ortam yalnız burada yazılır.
+    unsafe { std::env::set_var("ULTRON_QUOTA_HOME", &empty) };
     let h = start_with(&paths, &unique_pipe(), &LINES).await;
-    let msg = error_of(&h, Request::GetQuota).await;
-    assert!(msg.contains("henüz uygulanmadı"), "{msg}");
+    let requests = vec![
+        Request::Hello { token: "x".into() },
+        send_req(&cwd, Some("kapsam"), "merhaba"),
+        Request::Switch { chat_id: "kapsam".into(), to: EngineId::Claude },
+        Request::Cancel { chat_id: "kapsam".into() },
+        Request::Events { chat_id: Some("kapsam".into()), follow: false, after_seq: None },
+        Request::HistorySearch { chat_id: None, query: "merhaba".into(), limit: 5 },
+        Request::Status,
+        Request::ListProjects,
+        Request::ListChats { project_id: None, include_archived: false },
+        Request::GetChat { chat_id: "kapsam".into() },
+        Request::UpdateChat {
+            chat_id: "kapsam".into(),
+            title: Some("Ad".into()),
+            pinned: None,
+            archived: None,
+            project_id: None,
+        },
+        Request::GetQuota,
+        Request::ImportCatalog { path: tmp.path().join("yok.md").to_string_lossy().into_owned() },
+        Request::ImportClaudeHistory { root: Some(empty.to_string_lossy().into_owned()) },
+        Request::Route { text: "devam".into() },
+        Request::SetResetRights { pool: "claude".into(), count: 1 },
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for req in requests {
+        seen.insert(variant_name(&req));
+        let mut c = connect(&h).await;
+        c.send(&req).await.unwrap();
+        // Yanıt Ok/Event ya da tipli bir doğrulama hatası olabilir; "uygulanmadı" olamaz.
+        if let Response::Error { message } = next(&mut c).await.expect("yanıt yok") {
+            assert!(!message.contains("henüz uygulanmadı"), "{req:?}: {message}");
+        }
+    }
+    assert_eq!(seen.len(), 16, "her varyant denenmeli: {seen:?}");
     h.shutdown().await;
 }
