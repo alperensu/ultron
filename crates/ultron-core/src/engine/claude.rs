@@ -5,6 +5,9 @@
 //! `result`. `tool_use` / `tool_result` biçimi Anthropic mesaj biçiminden alınmıştır;
 //! canlı bir araç çağrısı yakalanmadan doğrulanmamıştır.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
@@ -24,11 +27,17 @@ const EMPTY_MCP: &str = r#"{"mcpServers":{}}"#;
 /// Claude Code motoru.
 pub struct ClaudeEngine {
     cfg: EngineConfig,
+    /// Dosya düzenleyen `tool_use` kimliği → (yol, değişiklik türü). Değişiklik olayı yalnız
+    /// eşleşen `tool_result` başarılı geldiğinde üretilir.
+    pending_edits: Mutex<HashMap<String, (String, &'static str)>>,
 }
 
 impl ClaudeEngine {
     pub fn new(cfg: EngineConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            pending_edits: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -91,7 +100,7 @@ impl Engine for ClaudeEngine {
 
     fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
         match serde_json::from_str::<Value>(line) {
-            Ok(raw) => parse_value(&raw),
+            Ok(raw) => self.parse_value(&raw),
             Err(_) => vec![EngineEvent::Unknown {
                 raw: Value::String(line.to_string()),
             }],
@@ -99,26 +108,78 @@ impl Engine for ClaudeEngine {
     }
 }
 
-fn parse_value(raw: &Value) -> Vec<EngineEvent> {
-    let kind = raw.get("type").and_then(Value::as_str).unwrap_or_default();
-    match kind {
-        "system" => match raw.get("subtype").and_then(Value::as_str) {
-            Some("init") => vec![EngineEvent::SessionStarted {
-                native_session_id: str_field(raw, "session_id"),
-            }],
-            // Kanca olayları (hook_started / hook_response) yalnız gürültüdür.
-            Some(sub) if sub.starts_with("hook_") => Vec::new(),
+impl ClaudeEngine {
+    fn parse_value(&self, raw: &Value) -> Vec<EngineEvent> {
+        let kind = raw.get("type").and_then(Value::as_str).unwrap_or_default();
+        match kind {
+            "system" => match raw.get("subtype").and_then(Value::as_str) {
+                Some("init") => vec![EngineEvent::SessionStarted {
+                    native_session_id: str_field(raw, "session_id"),
+                }],
+                // Kanca olayları (hook_started / hook_response) yalnız gürültüdür.
+                Some(sub) if sub.starts_with("hook_") => Vec::new(),
+                _ => unknown(raw),
+            },
+            "assistant" => assistant_events(self, raw),
+            "user" => self.user_events(raw),
+            "result" => result_events(raw),
+            "rate_limit_event" => rate_limit_events(raw),
             _ => unknown(raw),
-        },
-        "assistant" => assistant_events(raw),
-        "user" => user_events(raw),
-        "result" => result_events(raw),
-        "rate_limit_event" => rate_limit_events(raw),
-        _ => unknown(raw),
+        }
+    }
+
+    /// Düzenleme isteğini bekleyen değişiklikler arasına kaydeder.
+    fn remember_edit(&self, id: &str, path: String, change: &'static str) {
+        self.pending_edits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), (path, change));
+    }
+
+    /// Bekleyen düzenlemeyi kimliğine göre çıkarır.
+    fn take_edit(&self, id: &str) -> Option<(String, &'static str)> {
+        self.pending_edits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+    }
+
+    fn user_events(&self, raw: &Value) -> Vec<EngineEvent> {
+        let Some(blocks) = raw.pointer("/message/content").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for block in blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        {
+            // Sonuç bloğu araç adını taşımaz; kimlik olarak `tool_use_id` kullanılır.
+            let id = str_or_empty(block, "tool_use_id");
+            let is_error = block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            out.push(EngineEvent::ToolResult {
+                tool: id.clone(),
+                output_excerpt: excerpt(
+                    &content_text(block.get("content")),
+                    DEFAULT_EXCERPT_CHARS,
+                ),
+                is_error,
+            });
+            // Değişiklik yalnız başarılı sonuçta kaydedilir; reddedilen/hatalı araç dosyayı değiştirmez.
+            if let Some((path, change)) = self.take_edit(&id).filter(|_| !is_error) {
+                out.push(EngineEvent::FileChanged {
+                    path,
+                    change: change.to_string(),
+                });
+            }
+        }
+        out
     }
 }
 
-fn assistant_events(raw: &Value) -> Vec<EngineEvent> {
+fn assistant_events(engine: &ClaudeEngine, raw: &Value) -> Vec<EngineEvent> {
     let Some(blocks) = raw.pointer("/message/content").and_then(Value::as_array) else {
         return unknown(raw);
     };
@@ -137,11 +198,8 @@ fn assistant_events(raw: &Value) -> Vec<EngineEvent> {
                 if let Some(change) = file_edit_change(&tool) {
                     let path = str_field(&input, "file_path")
                         .or_else(|| str_field(&input, "notebook_path"));
-                    if let Some(path) = path {
-                        out.push(EngineEvent::FileChanged {
-                            path,
-                            change: change.to_string(),
-                        });
+                    if let (Some(path), Some(id)) = (path, str_field(block, "id")) {
+                        engine.remember_edit(&id, path, change);
                     }
                 }
                 out.push(EngineEvent::ToolCall { tool, input });
@@ -173,28 +231,6 @@ fn file_edit_change(tool: &str) -> Option<&'static str> {
         "Edit" | "MultiEdit" | "NotebookEdit" => Some("edit"),
         _ => None,
     }
-}
-
-fn user_events(raw: &Value) -> Vec<EngineEvent> {
-    let Some(blocks) = raw.pointer("/message/content").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .map(|block| EngineEvent::ToolResult {
-            // Sonuç bloğu araç adını taşımaz; kimlik olarak `tool_use_id` kullanılır.
-            tool: str_or_empty(block, "tool_use_id"),
-            output_excerpt: excerpt(
-                &content_text(block.get("content")),
-                DEFAULT_EXCERPT_CHARS,
-            ),
-            is_error: block
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        })
-        .collect()
 }
 
 fn result_events(raw: &Value) -> Vec<EngineEvent> {

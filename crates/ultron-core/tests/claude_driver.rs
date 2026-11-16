@@ -117,39 +117,84 @@ fn claude_parses_init_assistant_tool_result() {
     );
 }
 
+fn result_line(id: &str, is_error: bool) -> String {
+    json!({
+        "type": "user",
+        "message": { "content": [{
+            "type": "tool_result",
+            "tool_use_id": id,
+            "content": "sonuc",
+            "is_error": is_error
+        }] }
+    })
+    .to_string()
+}
+
 #[test]
-fn claude_edit_tool_emits_file_changed() {
+fn claude_successful_edit_emits_file_changed_after_result() {
     let eng = ClaudeEngine::new(cfg());
     let edit = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-9","name":"Edit","input":{"file_path":"C:/proj/a.txt","old_string":"x","new_string":"y"}}]}}"#;
     let write = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-10","name":"Write","input":{"file_path":"C:/proj/b.txt","content":"z"}}]}}"#;
     let notebook = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-11","name":"NotebookEdit","input":{"notebook_path":"C:/proj/n.ipynb","new_source":"q"}}]}}"#;
     let read = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-12","name":"Read","input":{"file_path":"C:/proj/c.txt"}}]}}"#;
 
-    let events = eng.parse_line(edit);
+    // tool_use anında yalnız ToolCall; FileChanged henüz yok.
     assert_eq!(
-        events,
+        eng.parse_line(edit),
+        vec![EngineEvent::ToolCall {
+            tool: "Edit".into(),
+            input: json!({ "file_path": "C:/proj/a.txt", "old_string": "x", "new_string": "y" }),
+        }]
+    );
+    assert!(!eng.parse_line(write).iter().any(|e| matches!(e, EngineEvent::FileChanged { .. })));
+    eng.parse_line(notebook);
+    assert!(!eng.parse_line(read).iter().any(|e| matches!(e, EngineEvent::FileChanged { .. })));
+
+    // Başarılı sonuçta ToolResult ardından FileChanged.
+    assert_eq!(
+        eng.parse_line(&result_line("toolu-9", false)),
         vec![
+            EngineEvent::ToolResult {
+                tool: "toolu-9".into(),
+                output_excerpt: "sonuc".into(),
+                is_error: false,
+            },
             EngineEvent::FileChanged {
                 path: "C:/proj/a.txt".into(),
                 change: "edit".into(),
             },
-            EngineEvent::ToolCall {
-                tool: "Edit".into(),
-                input: json!({ "file_path": "C:/proj/a.txt", "old_string": "x", "new_string": "y" }),
-            },
         ]
     );
+    assert_eq!(
+        eng.parse_line(&result_line("toolu-10", false))
+            .into_iter()
+            .find(|e| matches!(e, EngineEvent::FileChanged { .. })),
+        Some(EngineEvent::FileChanged {
+            path: "C:/proj/b.txt".into(),
+            change: "write".into(),
+        })
+    );
     assert!(matches!(
-        eng.parse_line(write).first(),
-        Some(EngineEvent::FileChanged { path, change }) if path == "C:/proj/b.txt" && change == "write"
-    ));
-    assert!(matches!(
-        eng.parse_line(notebook).first(),
+        eng.parse_line(&result_line("toolu-11", false)).last(),
         Some(EngineEvent::FileChanged { path, change }) if path == "C:/proj/n.ipynb" && change == "edit"
     ));
-    assert!(
-        !eng.parse_line(read).iter().any(|e| matches!(e, EngineEvent::FileChanged { .. })),
-        "Read dosya değişikliği sayılmamalı"
+    // Aynı sonuç ikinci kez gelirse değişiklik tekrarlanmaz.
+    assert!(!eng.parse_line(&result_line("toolu-9", false)).iter().any(|e| matches!(e, EngineEvent::FileChanged { .. })));
+}
+
+#[test]
+fn claude_rejected_write_emits_no_file_changed() {
+    let eng = ClaudeEngine::new(cfg());
+    let write = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-20","name":"Write","input":{"file_path":"C:/proj/b.txt","content":"z"}}]}}"#;
+    eng.parse_line(write);
+    let events = eng.parse_line(&result_line("toolu-20", true));
+    assert_eq!(
+        events,
+        vec![EngineEvent::ToolResult {
+            tool: "toolu-20".into(),
+            output_excerpt: "sonuc".into(),
+            is_error: true,
+        }]
     );
 }
 
