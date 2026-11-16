@@ -8,7 +8,7 @@ Test dosyası: `crates/ultrond/tests/live_acceptance.rs`. Tüm canlı testler `#
 | Test | Sonuç |
 |---|---|
 | `live_claude_to_agy_handoff` (Claude haiku → agy) | **Geçti** (tek çalıştırma) |
-| `live_claude_to_codex_handoff` | **Çalıştırılmadı**: Codex kotası nedeniyle (koordinatör kararı). Kod derlenir, `#[ignore]` ile tutulur. |
+| `live_claude_to_codex_handoff` | **Geçti** (gpt-5.6-sol). Ayrıntı: Codex durumu bölümü. |
 | `live_tool_restriction_probe` | **Ölçüm tamamlandı**. Kabul kapısı değil. Her iki motorda dosya korundu. |
 
 Aşama 1 devir çekirdeği canlı olarak doğrulandı: Claude'da alınan karar, motor değişiminden sonra agy tarafından doğru özetlendi.
@@ -74,7 +74,7 @@ Sonuç: Metin beş ayrı parça olarak geldi, ancak bütün cevap yaklaşık 130
 
 ## Codex durumu
 
-Codex kotası %90 üzerinde olduğu için `live_claude_to_codex_handoff` çalıştırılmadı. Test kodu Codex motoruyla aynı senaryo olarak derleniyor ve `#[ignore]` ile tutuluyor. Codex devir doğrulaması bu raporda yapılmış sayılmaz.
+`live_claude_to_codex_handoff` geçti (model gpt-5.6-sol, efor medium). Tur 2 cevabı kısaca: "CSV; Excel'de açılacağı için seçtik, sıradaki adım export fonksiyonunu yazmak." Önceki başarısızlığın sebebi motor değil modeldi: `gpt-6.1-sol` bu hesapta `model_not_found` (400) döndürüyordu ve Ultron bu hatayı stdout JSON'unda gördüğü halde özete yansıtmıyordu (stderr boştu). Hata özeti artık motorun son hata mesajına düşer. Varsayılan `gpt-6.1-sol` adı `config.rs`'te kaldı; hesapta çalışan ad doğrulanmadan değiştirilmedi.
 
 ## Bilinen sınırlar
 
