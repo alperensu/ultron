@@ -15,6 +15,14 @@ use bridge::Bridge;
 /// Servis durumu olayı (`ready` | `unavailable`); webview ilk açılışta hata ekranını buna göre kurar.
 pub const DAEMON_EVENT: &str = "ultron://daemon";
 
+/// `ultron://daemon` yükü (TS `DaemonState`).
+pub fn daemon_payload(status: &events::DaemonStatus) -> serde_json::Value {
+    match status {
+        events::DaemonStatus::Ready => json!({"state": "ready"}),
+        events::DaemonStatus::Unavailable(e) => json!({"state": "unavailable", "error": e}),
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -22,25 +30,19 @@ pub fn run() {
             app.manage(bridge.clone());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Başlangıç: servisi bul/başlat; başarısızsa DaemonUnavailable bildir ve dene.
-                match bridge.connect().await {
-                    Ok(_) => {
-                        let _ = handle.emit(DAEMON_EVENT, json!({"state": "ready"}));
-                    }
-                    Err(e) => {
-                        let _ = handle.emit(
-                            DAEMON_EVENT,
-                            json!({"state": "unavailable", "error": e}),
-                        );
-                    }
-                }
+                // Takip döngüsü servisi bulur/başlatır; bağlanınca `ready`, bağlanamayınca veya
+                // kopunca `unavailable` bildirir (servis sonradan gelirse de `ready` yayılır).
                 let emitter = handle.clone();
-                events::run_follow(
+                let state_emitter = handle.clone();
+                events::run_follow_with_state(
                     &bridge,
                     events::Backoff::default(),
                     CancellationToken::new(),
                     move |ev| {
                         let _ = emitter.emit(events::EVENT_NAME, ev);
+                    },
+                    move |status| {
+                        let _ = state_emitter.emit(DAEMON_EVENT, daemon_payload(&status));
                     },
                 )
                 .await;

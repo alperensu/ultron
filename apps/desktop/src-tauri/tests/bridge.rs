@@ -246,6 +246,169 @@ async fn events_page_respects_limit() {
     server.shutdown().await;
 }
 
+type Seen = Vec<(String, i64)>;
+
+fn spawn_follower(
+    bridge: &Arc<Bridge>,
+    backoff: Backoff,
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<(String, i64)>,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let handle = {
+        let bridge = bridge.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            run_follow(&bridge, backoff, cancel, move |ev| {
+                let _ = tx.send((ev.chat_id.clone(), ev.seq));
+            })
+            .await;
+        })
+    };
+    (rx, cancel, handle)
+}
+
+async fn collect_until(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, i64)>,
+    seen: &mut Seen,
+    done: impl Fn(&Seen) -> bool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    while !done(seen) {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(item)) => seen.push(item),
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn seqs_of(seen: &Seen, chat: &str) -> Vec<i64> {
+    seen.iter()
+        .filter(|(c, _)| c == chat)
+        .map(|(_, s)| *s)
+        .collect()
+}
+
+#[tokio::test]
+async fn reconnect_discovers_chat_created_while_offline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let server = start_server(&paths, &pipe).await;
+    // Uzun geri çekilme: servis dönene dek takipçi çevrimdışı kalır.
+    let slow = Backoff {
+        initial: Duration::from_secs(4),
+        max: Duration::from_secs(4),
+    };
+    let (mut rx, cancel, follower) = spawn_follower(&bridge, slow);
+    run_turn(&bridge, &cwd, "c1").await;
+    let mut seen = Seen::new();
+    assert!(collect_until(&mut rx, &mut seen, |s| s.len() >= 3).await);
+
+    server.shutdown().await;
+    let server = start_server(&paths, &pipe).await;
+    // Takipçi uykudayken yeni sohbet oluşur ve tamamlanır.
+    run_turn(&bridge, &cwd, "c2").await;
+    let ok = collect_until(&mut rx, &mut seen, |s| seqs_of(s, "c2").len() >= 3).await;
+    assert!(ok, "çevrimdışıyken oluşan sohbet bulunamadı: {seen:?}");
+    // Baştan, ardışık, tekrarsız (c2 çevrimdışıyken tamamlandı).
+    let c2 = seqs_of(&seen, "c2");
+    assert_eq!(c2, (1..=c2.len() as i64).collect::<Vec<_>>());
+    let c1 = seqs_of(&seen, "c1");
+    assert!(c1.len() >= 3);
+    assert_eq!(c1, (1..=c1.len() as i64).collect::<Vec<_>>());
+
+    cancel.cancel();
+    let _ = follower.await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn first_event_gap_fetches_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let server = start_server(&paths, &pipe).await;
+    // Takipçi başlamadan c1'in ilk turu (seq 1..=3) yazılır.
+    run_turn(&bridge, &cwd, "c1").await;
+    let (mut rx, cancel, follower) = spawn_follower(&bridge, Backoff::default());
+    // Taban çizgisi alınana dek bekle, sonra ikinci tur: takipçinin gördüğü ilk canlı olay seq 4.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    run_turn(&bridge, &cwd, "c1").await;
+    let mut seen = Seen::new();
+    let ok = collect_until(&mut rx, &mut seen, |s| s.len() >= 6).await;
+    assert!(ok, "olaylar tamamlanmadı: {seen:?}");
+    assert_eq!(seqs_of(&seen, "c1"), vec![1, 2, 3, 4, 5, 6]);
+
+    cancel.cancel();
+    let _ = follower.await;
+    server.shutdown().await;
+}
+
+async fn next_status(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ultron_desktop::events::DaemonStatus>,
+) -> ultron_desktop::events::DaemonStatus {
+    tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("durum zaman aşımı")
+        .expect("kanal")
+}
+
+#[tokio::test]
+async fn daemon_state_follows_connection() {
+    use ultron_desktop::events::{DaemonStatus, run_follow_with_state};
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let follower = {
+        let bridge = bridge.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let backoff = Backoff {
+                initial: Duration::from_millis(100),
+                max: Duration::from_millis(300),
+            };
+            run_follow_with_state(&bridge, backoff, cancel, |_| {}, move |s| {
+                let _ = tx.send(s);
+            })
+            .await;
+        })
+    };
+    // Servis yok: unavailable (tekrarlar tek bildirimde birleşir).
+    assert!(matches!(next_status(&mut rx).await, DaemonStatus::Unavailable(_)));
+    // Servis sonradan gelir: ready.
+    let server = start_server(&paths, &pipe).await;
+    assert_eq!(next_status(&mut rx).await, DaemonStatus::Ready);
+    // Servis düşer: unavailable.
+    server.shutdown().await;
+    assert!(matches!(next_status(&mut rx).await, DaemonStatus::Unavailable(_)));
+
+    cancel.cancel();
+    let _ = follower.await;
+}
+
 fn keys(v: &serde_json::Value) -> Vec<String> {
     let mut k: Vec<String> = v.as_object().expect("nesne").keys().cloned().collect();
     k.sort();
