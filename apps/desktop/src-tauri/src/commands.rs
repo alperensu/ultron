@@ -137,6 +137,22 @@ pub struct SendArgs {
     pub engine: Option<EngineId>,
     #[serde(default)]
     pub project_id: Option<String>,
+    #[serde(default)]
+    pub elevated: bool,
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_send_defaults_to_workspace_and_accepts_explicit_elevation() {
+        let mut value = serde_json::json!({"text": "sentetik"});
+        let legacy: SendArgs = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.elevated);
+        value["elevated"] = true.into();
+        assert!(serde_json::from_value::<SendArgs>(value).unwrap().elevated);
+    }
 }
 
 #[derive(Deserialize)]
@@ -313,6 +329,7 @@ pub async fn send_message_impl(bridge: &Bridge, args: SendArgs) -> Out<ChatIdRes
                 engine: args.engine,
                 text: args.text,
                 policy: PolicyArg::Workspace,
+                elevated: args.elevated,
                 project_id: args.project_id,
             })
             .await?,

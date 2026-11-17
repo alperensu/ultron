@@ -53,6 +53,9 @@ pub enum Request {
         engine: Option<EngineId>,
         text: String,
         policy: PolicyArg,
+        /// Bu tur için Full politikası ister; yetki ancak onaylayıcı kararıyla verilir.
+        #[serde(default)]
+        elevated: bool,
         /// Yeni sohbeti bu projeye bağlar; `cwd` projenin yolu olur.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<String>,
@@ -157,6 +160,24 @@ fn default_approval_wait_secs() -> u32 {
 #[cfg(test)]
 mod approval_tests {
     use super::*;
+
+    #[test]
+    fn send_without_elevated_keeps_legacy_default() {
+        let legacy = serde_json::json!({
+            "type": "send", "chat_id": null, "cwd": ".", "engine": "codex",
+            "text": "sentetik", "policy": "workspace"
+        });
+        let request: Request = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(request, Request::Send { elevated: false, .. }));
+        let mut elevated = legacy;
+        elevated["elevated"] = true.into();
+        let request: Request = serde_json::from_value(elevated).unwrap();
+        assert!(matches!(request, Request::Send { elevated: true, .. }));
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+    }
 
     #[test]
     fn policy_check_defaults_timeout_and_debug_hides_action() {

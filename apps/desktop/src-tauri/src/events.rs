@@ -1,5 +1,6 @@
 //! Olay köprüsü: genel `Events { follow: true }` akışı; kopunca üstel geri çekilmeyle yeniden
 //! bağlanır, sohbet başına son `seq`'ten devam eder (kaçırma yok, tekrar yok).
+//! `policy_violation` dahil sohbet olayları tür filtresi olmadan `ultron://event`'e aktarılır.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -387,6 +388,25 @@ pub async fn run_follow_with_state<F: FnMut(StoredEvent), G: FnMut(DaemonStatus)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_violation_uses_the_chat_cursor_without_losing_payload() {
+        let event = EngineEvent::PolicyViolation {
+            command: "rm sentetik.txt".into(),
+            category: ultron_core::policy::RiskCategory::Delete,
+        };
+        let payload = serde_json::to_value(event).unwrap();
+        let stored = StoredEvent {
+            id: "sentetik-ihlal".into(), chat_id: "c1".into(), session_id: Some("s1".into()),
+            seq: 1, ts: "2026-01-01T00:00:00Z".parse().unwrap(), kind: "policy_violation".into(), payload: payload.clone(),
+        };
+        let mut cursors = Cursors::default();
+        assert!(cursors.accept(&stored));
+        assert!(!cursors.accept(&stored));
+        let wire = serde_json::to_value(&stored).unwrap();
+        assert_eq!(wire["payload"], payload);
+        assert_eq!(wire["kind"], "policy_violation");
+    }
 
     #[test]
     fn chatless_state_reconcile_restores_expiry_and_ignores_stale_live_pending() {

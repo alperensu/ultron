@@ -182,6 +182,7 @@ async fn send_with_project_binds_chat_and_cwd() {
             engine: Some(EngineId::Claude),
             text: "merhaba".into(),
             policy: PolicyArg::ReadOnly,
+            elevated: false,
             project_id: Some("p1".into()),
         },
     )
@@ -199,6 +200,7 @@ async fn send_with_project_binds_chat_and_cwd() {
             engine: None,
             text: "x".into(),
             policy: PolicyArg::ReadOnly,
+            elevated: false,
             project_id: Some("yok".into()),
         },
     )

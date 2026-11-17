@@ -15,6 +15,24 @@ fn setup() -> Result<(TempDir, Paths, Trash)> {
 }
 
 #[test]
+fn audit_only_validates_new_trash_records() -> Result<()> {
+    let (temp, paths, trash) = setup()?;
+    let old = temp.path().join("old.txt");
+    fs::write(&old, "old")?;
+    let old = trash.put(&old, Some("c1"))?;
+    // Eski içeriğin bozulması yalnız yeni kayıtları inceleyen turu engellemez.
+    fs::write(paths.root.join("trash").join(&old.id).join("item"), "changed length")?;
+    let before = trash.record_ids()?;
+    let new = temp.path().join("new.txt");
+    fs::write(&new, "new")?;
+    let new = trash.put(&new, Some("c1"))?;
+    assert_eq!(trash.records_since(&before)?, vec![new.clone()]);
+    fs::write(paths.root.join("trash").join(new.id).join("item"), "broken size")?;
+    assert!(trash.records_since(&before).is_err(), "yeni kayıt doğrulanmalı");
+    Ok(())
+}
+
+#[test]
 fn trash_moves_and_restores() -> Result<()> {
     let (temp, paths, trash) = setup()?;
     let source = temp.path().join("report.txt");

@@ -94,6 +94,7 @@ fn send(cwd: &Path, chat: &str) -> Request {
         engine: Some(EngineId::Claude),
         text: "selam".into(),
         policy: PolicyArg::ReadOnly,
+        elevated: false,
         project_id: None,
     }
 }
@@ -869,6 +870,7 @@ async fn command_json_shapes_match_ts_types() {
                 text: "sentetik arama mesajı".into(),
                 engine: Some(EngineId::Codex),
                 project_id: None,
+                elevated: false,
             },
         )
         .await
@@ -1075,4 +1077,69 @@ async fn collect(
         }
     }
     true
+}
+
+#[tokio::test]
+async fn desktop_receives_policy_violation_from_daemon() {
+    use ultron_core::ipc::Response;
+    use ultron_desktop::events::{DaemonStatus, run_follow_with_state};
+
+    let _env = ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let cwd = tmp.path().join("proje");
+    std::fs::create_dir(&cwd).unwrap();
+    let server = start_server(&paths, &pipe).await;
+    // FakeEngine dosyayı tur başlarken okur; gerçek riskli komut yürütülmez.
+    std::fs::write(paths.root.join("fixture.jsonl"), [
+        STARTED,
+        r#"{"type":"command","command":"rm synthetic.txt; token=synthetic-secret","exit_code":0,"output_excerpt":""}"#,
+        DONE,
+    ].join("\n") + "\n").unwrap();
+    let bridge = Arc::new(Bridge::new(paths.clone(), None));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let follower = {
+        let bridge = bridge.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            run_follow_with_state(&bridge, Backoff::default(), cancel,
+                move |event| { let _ = tx.send(event); },
+                move |state| { if state == DaemonStatus::Ready { let _ = ready_tx.send(()); } },
+            ).await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), ready_rx.recv()).await.unwrap().unwrap();
+    let mut sender = bridge.connect().await.unwrap();
+    let mut request = send(&cwd, "audit-desktop");
+    if let Request::Send { engine, .. } = &mut request { *engine = Some(EngineId::Codex); }
+    sender.send(&request).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), sender.next()).await.unwrap().unwrap() {
+            Some(Response::Ok { data }) if data["done"] == true => break,
+            Some(Response::Error { message }) => panic!("{message}"),
+            None => panic!("Send erken kapandı"),
+            _ => {}
+        }
+    }
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rx.recv().await.unwrap();
+            if event.kind == "policy_violation" { break event; }
+        }
+    }).await.expect("masaüstü ihlal olayını almadı");
+    assert_eq!(event.chat_id, "audit-desktop");
+    assert_eq!(event.payload["category"], "Delete");
+    assert!(event.session_id.is_some());
+    assert!(!event.payload.to_string().contains("synthetic-secret"));
+    let events = ultron_core::Db::open(&paths.db).unwrap().events_for_chat("audit-desktop", None).unwrap();
+    assert_eq!(events.iter().find(|stored| stored.id == event.id), Some(&event));
+    cancel.cancel();
+    follower.await.unwrap();
+    server.shutdown().await;
 }

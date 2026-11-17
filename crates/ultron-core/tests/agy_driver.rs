@@ -68,7 +68,9 @@ fn agy_command_uses_stream_json_and_flash() {
     assert_eq!(resume.args[mode + 1], "accept-edits");
 
     let full = eng.command(&request(ToolPolicy::Full, None));
-    assert!(!full.args.contains(&"--sandbox".to_string()));
+    assert!(full.args.contains(&"--sandbox".to_string()));
+    let mode = full.args.iter().position(|a| a == "--mode").unwrap();
+    assert_eq!(full.args[mode + 1], "plan");
 }
 
 #[test]
@@ -86,6 +88,45 @@ fn agy_never_skips_permissions() {
                 spec.args
             );
         }
+    }
+}
+
+#[test]
+fn agy_only_workspace_accepts_edits_even_when_resuming() {
+    let engine = AgyEngine::new(cfg());
+    for policy in [ToolPolicy::ReadOnly, ToolPolicy::Workspace, ToolPolicy::Full] {
+        for resume in [None, Some("conv-1")] {
+            let spec = engine.command(&request(policy, resume));
+            assert!(spec.args.contains(&"--sandbox".into()));
+            let mode = spec.args.iter().position(|arg| arg == "--mode").unwrap();
+            assert_eq!(spec.args[mode + 1], if policy == ToolPolicy::Workspace { "accept-edits" } else { "plan" });
+        }
+    }
+}
+
+#[test]
+fn agy_rejects_other_models_and_permission_overrides_before_spawn() {
+    for config in [
+        { let mut c = cfg(); c.model = Some("gemini-pro".into()); c },
+        { let mut c = cfg(); c.extra_args = vec!["--mode=auto".into()]; c },
+        { let mut c = cfg(); c.extra_args = vec!["--dangerously-skip-permissions".into()]; c },
+    ] {
+        let engine = AgyEngine::new(config);
+        let mut cmd = tokio::process::Command::new("not-started");
+        assert!(engine.prepare_command(&request(ToolPolicy::Workspace, None), &mut cmd).is_err());
+    }
+}
+
+#[test]
+fn agy_command_result_requires_explicit_execution_evidence() {
+    let engine = AgyEngine::new(cfg());
+    for exit in [serde_json::Value::Null, json!(0), json!(1)] {
+        let line = json!({"event": "step_update", "step_update": {
+            "step_type": "tool", "tool_info": {"name": "run_command", "input": {"command": "rm test.txt"}},
+            "output": {"exit_code": exit, "text": "sentetik"}
+        }}).to_string();
+        let events = engine.parse_line(&line);
+        assert_eq!(events.iter().any(|event| matches!(event, EngineEvent::Command { .. })), !exit.is_null());
     }
 }
 

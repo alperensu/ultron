@@ -1,6 +1,6 @@
 //! Recoverable deletion. Trash directories and their contents must not contain links.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -96,6 +96,31 @@ impl Trash {
             )));
         }
         Ok(entry)
+    }
+
+    /// İçerik ağaçlarını okumadan başlangıçtaki kayıt kimliklerini alır.
+    pub fn record_ids(&self) -> Result<BTreeSet<String>> {
+        let Some(root) = self.checked_root(false)? else {
+            return Ok(BTreeSet::new());
+        };
+        fs::read_dir(root)?
+            .map(|child| {
+                let child = child?;
+                let id = child.file_name().to_str().context("geçersiz çöp kimliği")?.to_owned();
+                ensure!(Uuid::parse_str(&id)?.to_string() == id, "geçersiz çöp kimliği");
+                Ok(id)
+            })
+            .collect()
+    }
+
+    /// Yalnız başlangıçtan sonra eklenen kayıtların kurtarılabilirliğini doğrular.
+    pub fn records_since(&self, before: &BTreeSet<String>) -> Result<Vec<TrashEntry>> {
+        let Some(root) = self.checked_root(false)? else {
+            return Ok(Vec::new());
+        };
+        self.record_ids()?.difference(before)
+            .map(|id| self.read_entry(&root, id).map(|(entry, _)| entry))
+            .collect()
     }
 
     pub fn list(&self) -> Result<Vec<TrashEntry>> {

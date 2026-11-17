@@ -14,7 +14,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use ultron_core::engine::{Engine, TurnOutcome};
+use ultron_core::engine::{Engine, ToolPolicy, TurnOutcome};
 use ultron_core::events::{EngineEvent, SwitchReason};
 use ultron_core::ipc::{
     self, ChatDetail, MAX_LINE_BYTES, Request, Response, ct_eq, read_frame, sys, write_msg,
@@ -476,6 +476,105 @@ fn is_user_home(path: &Path) -> bool {
 
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
 
+/// Full tur için yalnız onaylayıcı bağlantısının verdiği, hâlâ geçerli karar kabul edilir.
+async fn wait_elevation(st: &State, id: &str, cancel: &CancellationToken) -> Result<()> {
+    use ultron_core::db::approvals::{ApprovalStatus, ResolvedBy};
+    let deadline = tokio::time::sleep(Duration::from_secs(u64::from(approvals::MAX_APPROVAL_WAIT_SECS)));
+    tokio::pin!(deadline);
+    let mut tick = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                let _ = st.approvals.resolve(id, false, ResolvedBy::Timeout);
+                return Err(anyhow!("yükseltme bekleyen tur iptal edildi"));
+            }
+            () = &mut deadline => {
+                let _ = st.approvals.resolve(id, false, ResolvedBy::Timeout);
+                return Err(anyhow!("yükseltme onay süresi doldu"));
+            }
+            _ = tick.tick() => {
+                let row = st.db.get_approval(id)?.ok_or_else(|| anyhow!("yükseltme onayı bulunamadı"))?;
+                match row.status {
+                    ApprovalStatus::Pending => {}
+                    ApprovalStatus::Approved if row.resolved_by == Some(ResolvedBy::Approver) => {
+                        // Karar DB'ye yazılıp döküm/yayın başarısız olmuşsa tur başlamaz.
+                        if st.db.approval_outbox()?.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    _ => return Err(anyhow!("Full tur için onaylayıcı onayı verilmedi")),
+                }
+            }
+        }
+    }
+}
+
+/// Denetim raporu normal olay günlüğünden geçer: SQLite, döküm ve tüm aboneler.
+fn persist_audit(log: &EventLog, report: ultron_core::session::audit::AuditReport) -> Result<()> {
+    for violation in report.violations {
+        log.append(
+            &report.chat_id,
+            Some(&report.session_id),
+            EngineEvent::PolicyViolation {
+                command: violation.command,
+                category: violation.category,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Abonelik turdan önce kurulur; son rapor kalıcılaşmadan Send tamamlanmaz.
+async fn send_audited(
+    st: &State,
+    reservation: ultron_core::session::TurnReservation,
+    chat_id: &str,
+    cwd: &Path,
+    engine: EngineId,
+    text: &str,
+    policy: ToolPolicy,
+) -> Result<TurnOutcome> {
+    let mut audits = st.manager.subscribe_audits();
+    let turn = st.manager.send_reserved(reservation, chat_id, cwd, engine, text, policy);
+    tokio::pin!(turn);
+    let mut audit_error = None;
+    let result = loop {
+        tokio::select! {
+            biased;
+            report = audits.recv(), if audit_error.is_none() => {
+                match report {
+                    Ok(report) if report.chat_id == chat_id => {
+                        if let Err(error) = persist_audit(&st.log, report) {
+                            audit_error = Some(error);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => audit_error = Some(anyhow!("tur denetimi akışı kayıpsız alınamadı")),
+                }
+            }
+            result = &mut turn => break result,
+        }
+    };
+    // Tur future'ı aynı poll içinde rapor üretip tamamlanmış olabilir.
+    while audit_error.is_none() {
+        match audits.try_recv() {
+            Ok(report) if report.chat_id == chat_id => {
+                if let Err(error) = persist_audit(&st.log, report) {
+                    audit_error = Some(error);
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(_) => audit_error = Some(anyhow!("tur denetimi akışı kayıpsız alınamadı")),
+        }
+    }
+    match audit_error {
+        Some(error) => Err(error.context("politika ihlalleri kalıcılaştırılamadı")),
+        None => result,
+    }
+}
+
 /// IPC'den gelen katalog yolunu sınırlı okur: düzenli dosya, `.md`/`.txt`, en çok 1 MiB.
 async fn read_catalog_file(path: &Path) -> Result<String> {
     use tokio::io::AsyncReadExt;
@@ -765,6 +864,7 @@ async fn dispatch(
             engine,
             text,
             policy,
+            elevated,
             project_id,
         } => {
             let chat_id = chat_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
@@ -805,7 +905,8 @@ async fn dispatch(
                 Some(engine) => engine,
                 None => st.db.chat_engine(&chat_id)?.unwrap_or(st.default_engine),
             };
-            let reservation = st.manager.reserve_turn(&chat_id, pre_engine)?;
+            let mut reservation = st.manager.reserve_turn(&chat_id, pre_engine)?;
+            let policy = if elevated { ToolPolicy::Full } else { policy.into() };
             st.db.insert_chat(&chat_id, None, "", chrono::Utc::now())?;
             if let Some(project) = &project {
                 let bound = st.db.get_chat(&chat_id)?.and_then(|c| c.project_id);
@@ -820,6 +921,13 @@ async fn dispatch(
             let mut last_seq = st.db.next_seq(&chat_id)? - 1;
             let mut wake = st.log.subscribe();
             let mut approval_wake = st.approvals.subscribe_global();
+            let elevation = if policy == ToolPolicy::Full {
+                let approval = st.manager.request_elevation(&mut reservation, Path::new(&cwd), &text)?;
+                st.approvals.publish_pending()?;
+                Some(approval)
+            } else {
+                None
+            };
             let guard = st.keep.acquire();
             let (done_tx, mut done_rx) = oneshot::channel();
             {
@@ -831,17 +939,21 @@ async fn dispatch(
                     .map_err(|_| anyhow!("tur kaydı kilidi zehirlendi"))?;
                 while turns.try_join_next().is_some() {}
                 turns.spawn(async move {
-                    let result = task_state
-                        .manager
-                        .send_reserved(
+                    let result = async {
+                        if let Some(approval) = elevation {
+                            wait_elevation(&task_state, &approval.id, &reservation.cancellation_token()).await?;
+                        }
+                        send_audited(
+                            &task_state,
                             reservation,
                             &task_chat,
                             Path::new(&cwd),
                             engine,
                             &text,
-                            policy.into(),
+                            policy,
                         )
-                        .await;
+                        .await
+                    }.await;
                     // Kabulden sonraki hata yalnız bu bağlantıya gitmesin: sohbet günlüğüne yazılır,
                     // böylece her abone görür.
                     if let Err(e) = &result
@@ -1106,6 +1218,83 @@ mod tests {
     const REPLY: &str = r#"{"type":"assistant_text","text":"sentetik yanıt"}"#;
     const DONE: &str = r#"{"type":"turn_completed"}"#;
 
+    #[tokio::test]
+    async fn elevation_wait_accepts_only_delivered_approver_decisions() {
+        use ultron_core::db::approvals::ResolvedBy;
+        use ultron_core::policy::{Action, RiskCategory};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let db = Arc::new(Db::open(&paths.db).unwrap());
+        let log = Arc::new(EventLog::new(db.clone(), paths.clone()));
+        db.insert_chat("elevation", None, "sentetik", chrono::Utc::now()).unwrap();
+        let st = State {
+            manager: SessionManager::new(db.clone(), log.clone(), Config::default(), HashMap::new()),
+            approvals: approvals::Approvals::new(db.clone(), log.clone(), paths.clone()),
+            db: db.clone(), log, token: String::new(), approver_token: String::new(),
+            keep: KeepAwake::new(), default_engine: EngineId::Codex,
+            turns: Mutex::new(JoinSet::new()), paths: paths.clone(),
+            quota: ultron_core::quota::QuotaService::from_env(), import_lock: tokio::sync::Mutex::new(()),
+        };
+        let create = || db.create_approval(Some("elevation"), EngineId::Codex,
+            RiskCategory::SystemConfig, "sentetik", &Action::ToolCall {
+                tool: "ultron.turn.elevate".into(), input: json!({"policy": "full"}),
+            }).unwrap();
+        let row = create();
+        st.approvals.resolve(&row.id, true, ResolvedBy::Desktop).unwrap();
+        assert!(wait_elevation(&st, &row.id, &CancellationToken::new()).await.is_err());
+        let row = create();
+        st.approvals.resolve(&row.id, true, ResolvedBy::Approver).unwrap();
+        wait_elevation(&st, &row.id, &CancellationToken::new()).await.unwrap();
+        let row = create();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(wait_elevation(&st, &row.id, &cancel).await.is_err());
+        assert_eq!(db.get_approval(&row.id).unwrap().unwrap().status,
+            ultron_core::db::approvals::ApprovalStatus::Denied);
+        let row = create();
+        let transcript = paths.transcripts.join("elevation.jsonl");
+        std::fs::remove_file(&transcript).unwrap();
+        std::fs::create_dir(&transcript).unwrap();
+        assert!(st.approvals.resolve(&row.id, true, ResolvedBy::Approver).is_err());
+        // DB'de approved olsa da teslim hatası Full çalıştırma iznine dönüşmez.
+        assert!(tokio::time::timeout(Duration::from_millis(80),
+            wait_elevation(&st, &row.id, &CancellationToken::new())).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_violation_is_persisted_and_broadcast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let db = Arc::new(Db::open(&paths.db).unwrap());
+        db.insert_chat("audit", None, "sentetik", chrono::Utc::now()).unwrap();
+        db.upsert_session(&ultron_core::db::SessionRow {
+            id: "s1".into(), chat_id: "audit".into(), engine: EngineId::Codex,
+            native_session_id: None, status: SessionStatus::Closed,
+            started_at: chrono::Utc::now(), ended_at: None,
+        }).unwrap();
+        let log = EventLog::new(db.clone(), paths.clone());
+        let mut live = log.subscribe();
+        let secret = ["sentetik", "sifre"].join("_");
+        persist_audit(&log, ultron_core::session::audit::AuditReport {
+            chat_id: "audit".into(), session_id: "s1".into(),
+            violations: vec![ultron_core::session::audit::PolicyViolation {
+                command: format!("rm x; example --password {secret}; {}", "ğ".repeat(5000)),
+                category: ultron_core::policy::RiskCategory::Delete,
+            }], changes: Vec::new(), errors: Vec::new(),
+        }).unwrap();
+        let stored = db.events_for_chat("audit", None).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].kind, "policy_violation");
+        assert_eq!(stored[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(live.try_recv().unwrap(), stored[0]);
+        assert!(!serde_json::to_string(&stored).unwrap().contains(&secret));
+        assert!(stored[0].payload["command"].as_str().unwrap().chars().count() <= 4000);
+        let transcript = std::fs::read_to_string(paths.transcripts.join("audit.jsonl")).unwrap();
+        assert!(transcript.contains("policy_violation"));
+        assert!(!transcript.contains(&secret));
+        assert!(matches!(live.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    }
+
     fn paths_in(dir: &Path) -> Paths {
         let paths = Paths::from_root(dir.join("ultron"));
         paths.ensure().unwrap();
@@ -1317,6 +1506,7 @@ mod tests {
                     engine: Some(EngineId::Claude),
                     text: "merhaba".into(),
                     policy: PolicyArg::ReadOnly,
+                    elevated: false,
                     project_id: None,
                 })
                 .await
@@ -1343,6 +1533,7 @@ mod tests {
                 engine: Some(EngineId::Claude),
                 text: "merhaba".into(),
                 policy: PolicyArg::ReadOnly,
+                elevated: false,
                 project_id: None,
             })
             .await
@@ -1406,6 +1597,7 @@ mod tests {
                 engine: Some(EngineId::Claude),
                 text: "merhaba".into(),
                 policy: PolicyArg::ReadOnly,
+                elevated: false,
                 project_id: Some("p1".into()),
             })
             .await

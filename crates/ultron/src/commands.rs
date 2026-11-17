@@ -616,6 +616,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     engine: engine.map(EngineId::from),
                     text: message,
                     policy: policy.into(),
+                    elevated: false,
                     project_id: None,
                 })
                 .await?;

@@ -176,6 +176,87 @@ fn extra_args_precede_stdin_marker() {
 }
 
 #[test]
+fn codex_sandbox_and_noninteractive_approval_are_explicit_on_resume() {
+    let eng = CodexEngine::new(cfg());
+    for policy in [ToolPolicy::ReadOnly, ToolPolicy::Workspace, ToolPolicy::Full] {
+        for resume in [None, Some("th-1")] {
+            let spec = eng.command(&request(policy, resume));
+            let sandbox = if policy == ToolPolicy::ReadOnly { "read-only" } else { "workspace-write" };
+            assert!(spec.args.contains(&format!("sandbox_mode=\"{sandbox}\"")));
+            assert!(spec.args.contains(&"approval_policy=\"never\"".into()));
+            assert!(spec.args.contains(&"windows.sandbox=\"elevated\"".into()));
+            assert!(spec.args.contains(&"sandbox_workspace_write.writable_roots=[]".into()));
+            assert!(spec.args.contains(&format!("sandbox_workspace_write.network_access={}", policy == ToolPolicy::Full)));
+            assert!(spec.args.contains(&"sandbox_workspace_write.exclude_tmpdir_env_var=true".into()));
+            assert!(spec.args.contains(&"sandbox_workspace_write.exclude_slash_tmp=true".into()));
+            assert!(spec.args.contains(&"--ignore-user-config".into()));
+            assert!(spec.args.contains(&"--strict-config".into()));
+            assert!(spec.args.contains(&"mcp_servers={}".into()));
+            assert!(spec.args.contains(&"orchestrator.mcp.enabled=false".into()));
+        }
+    }
+}
+
+#[test]
+fn codex_extra_args_cannot_override_protection() {
+    for extra in [
+        vec!["--dangerously-bypass-approvals-and-sandbox"],
+        vec!["-c", "sandbox_mode=\"danger-full-access\""],
+        vec!["--add-dir", "outside"],
+        vec!["--profile", "untrusted"],
+    ] {
+        let mut config = cfg();
+        config.extra_args = extra.into_iter().map(str::to_owned).collect();
+        let engine = CodexEngine::new(config);
+        let mut cmd = tokio::process::Command::new("not-started");
+        assert!(engine.prepare_command(&request(ToolPolicy::Workspace, None), &mut cmd).is_err());
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn codex_refuses_turn_when_windows_sandbox_preflight_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = cfg();
+    config.binary = env!("CARGO_BIN_EXE_ultron-fake-cli").into();
+    let engine = CodexEngine::new(config);
+    let mut req = request(ToolPolicy::Workspace, None);
+    req.cwd = tmp.path().into();
+    let (tx, _rx) = mpsc::channel(64);
+    let error = run_turn(&engine, req, tx, CancellationToken::new()).await.unwrap_err();
+    assert!(error.to_string().contains("koruması uygulanamadı; tur başlatılmadı"));
+    assert!(!tmp.path().join("g5-engine-started").exists());
+    let preflight: Vec<String> = serde_json::from_slice(&std::fs::read(tmp.path().join("g5-sandbox-args.json")).unwrap()).unwrap();
+    assert!(preflight.contains(&"windows.sandbox=\"elevated\"".into()));
+    assert!(preflight.contains(&"sandbox_workspace_write.network_access=false".into()));
+    assert!(preflight.contains(&"sandbox_workspace_write.writable_roots=[]".into()));
+}
+
+#[cfg(windows)]
+#[test]
+fn codex_preparation_disables_inherited_stdio_and_http_mcp_on_new_and_resumed_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("g5-sandbox-ready"), "sentetik").unwrap();
+    let mut config = cfg();
+    config.binary = env!("CARGO_BIN_EXE_ultron-fake-cli").into();
+    let engine = CodexEngine::new(config);
+    for resume in [None, Some("th-1")] {
+        let mut req = request(ToolPolicy::Workspace, resume);
+        req.cwd = tmp.path().into();
+        let spec = engine.command(&req);
+        let mut cmd = tokio::process::Command::new(spec.program);
+        cmd.args(spec.args);
+        engine.prepare_command(&req, &mut cmd).unwrap();
+        let overrides: Vec<_> = cmd.as_std().get_args().filter_map(|arg| arg.to_str())
+            .filter(|arg| arg.starts_with("mcp_servers=")).collect();
+        let config = overrides.last().unwrap().parse::<toml::Table>().unwrap();
+        assert_eq!(config["mcp_servers"]["files.external"]["enabled"].as_bool(), Some(false));
+        assert_eq!(config["mcp_servers"]["remote"]["enabled"].as_bool(), Some(false));
+        assert!(!overrides.last().unwrap().contains("never-run"));
+    }
+}
+
+#[test]
 fn codex_item_error_is_not_quota() {
     // Öğe düzeyindeki hata tur sonu değildir; kota mesajı bile olsa Error olmalı.
     let eng = CodexEngine::new(cfg());
@@ -202,6 +283,8 @@ fn assistant_text_with_quota_word_is_not_quota() {
 async fn live_codex_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = cfg();
+    // Gerçek ikili: sentetik ad canlı testte çözülemez.
+    config.binary = "codex".into();
     config.model = Some("gpt-6-luna".into());
     config.effort = Some("max".into());
     let eng = CodexEngine::new(config);
@@ -227,4 +310,37 @@ async fn live_codex_roundtrip() {
         e,
         EngineEvent::SessionStarted { native_session_id: Some(_) }
     )));
+}
+
+/// Canlı: Workspace politikasında cwd içine yazılabilir, kardeş dizine yazılamaz.
+#[tokio::test]
+#[ignore = "canlı CLI; kota harcar. Yalnız onaylı ve kota <%90 iken: cargo test -- --ignored live_"]
+async fn live_codex_workspace_write_boundary() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("calisma");
+    let sibling = root.path().join("kardes");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    let mut config = cfg();
+    config.binary = "codex".into();
+    config.model = Some("gpt-6-luna".into());
+    config.effort = Some("low".into());
+    let eng = CodexEngine::new(config);
+    let prompt = format!(
+        "Shell ile iki dosya oluştur. 1) çalışma dizininde ic.txt (içerik: ok). 2) şu mutlak yolda: {} (içerik: ok). İkincisi hata verirse tekrar deneme, kısaca raporla.",
+        sibling.join("dis.txt").display()
+    );
+    let req = TurnRequest {
+        chat_id: "live-ws".into(),
+        cwd: cwd.clone(),
+        prompt,
+        resume_native_id: None,
+        tool_policy: ToolPolicy::Workspace,
+    };
+    let (tx, mut rx) = mpsc::channel(256);
+    let outcome = run_turn(&eng, req, tx, CancellationToken::new()).await.unwrap();
+    while rx.recv().await.is_some() {}
+    assert_eq!(outcome, TurnOutcome::Completed);
+    assert!(cwd.join("ic.txt").exists(), "cwd içine yazılabilmeli");
+    assert!(!sibling.join("dis.txt").exists(), "cwd dışına yazılmamalı");
 }

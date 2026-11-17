@@ -45,6 +45,11 @@ impl Approvals {
         self.global.subscribe()
     }
 
+    /// Oturum yöneticisinin oluşturduğu onayları da aynı kalıcı outbox yoluyla yayınlar.
+    pub(crate) fn publish_pending(&self) -> Result<()> {
+        self.flush_outbox()
+    }
+
     /// Outbox silinmeden önce döküm yazılır; hata halinde kayıt yeniden denemek için kalır.
     fn flush_outbox(&self) -> Result<()> {
         let _guard = self

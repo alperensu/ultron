@@ -1,4 +1,4 @@
-//! Codex sürücüsü: `codex exec --json` (codex-cli 0.154.0).
+//! Codex sürücüsü: `codex exec --json` (uygulama CLI: 0.169.0-alpha.11.1).
 //!
 //! Gerçek yakalamada doğrulanan olay tipleri: `thread.started`, `turn.started`,
 //! `item.completed` (`item.type == "error"`), `error`, `turn.failed`.
@@ -10,6 +10,8 @@
 //! `-c sandbox_mode=...` ile, çalışma dizini ise süreç `cwd` ile verilir.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -37,7 +39,7 @@ impl CodexEngine {
     }
 }
 
-/// Politikaya karşılık gelen sandbox kipi. `danger-full-access` Aşama 1'de kullanılmaz.
+/// Full onayı bile işletim sistemi sandbox'ını kaldırmaz.
 fn sandbox_for(policy: ToolPolicy) -> &'static str {
     match policy {
         ToolPolicy::ReadOnly => "read-only",
@@ -65,7 +67,7 @@ impl Engine for CodexEngine {
         if let Some(id) = &req.resume_native_id {
             args.extend(["resume".into(), id.clone()]);
         }
-        args.push("--json".into());
+        args.extend(["--json".into(), "--ignore-user-config".into(), "--strict-config".into()]);
         if let Some(model) = &self.cfg.model {
             args.extend(["-m".into(), model.clone()]);
         }
@@ -83,6 +85,14 @@ impl Engine for CodexEngine {
             ]),
         }
         args.extend(self.cfg.extra_args.iter().cloned());
+        // Devam edilen oturumun veya profilin önceki izinlerini devralma.
+        args.extend([
+            "-c".into(),
+            format!("sandbox_mode=\"{sandbox}\""),
+            "-c".into(),
+            "approval_policy=\"never\"".into(),
+        ]);
+        args.extend(protection_args(req.tool_policy));
         // Son argüman: istemi stdin'den oku.
         args.push("-".into());
         CommandSpec {
@@ -93,6 +103,37 @@ impl Engine for CodexEngine {
         }
     }
 
+    fn prepare_command(
+        &self,
+        req: &TurnRequest,
+        cmd: &mut tokio::process::Command,
+    ) -> anyhow::Result<()> {
+        validate_extra_args(&self.cfg.extra_args)?;
+        if req.resume_native_id.as_ref().is_some_and(|id| id.starts_with('-')) {
+            anyhow::bail!("Codex oturum kimliği seçenek olamaz");
+        }
+        let program = cmd.as_std().get_program().to_owned();
+        let help = probe_cli(&program, &req.cwd, &["exec".into(), "--help".into()])?;
+        validate_protection_help(&help)?;
+        // Boş TOML tablosu alt katmanlardaki sunucuları silmez. Kullanıcı katmanı
+        // yüklenmez; proje/sistem katmanlarında görülen her sunucu ayrıca kapatılır.
+        // Liste yalnız yapılandırmadır: MCP sunucusu veya araç çalıştırılmaz.
+        let servers = probe_cli(&program, &req.cwd, &["mcp".into(), "list".into(), "--json".into()])?;
+        let disabled = disabled_mcp_override(&servers)?;
+        cmd.args(["-c", &disabled]);
+        #[cfg(windows)]
+        {
+            let mut args = vec!["sandbox".into()];
+            args.extend(protection_args(req.tool_policy));
+            args.extend(["-c".into(), format!("sandbox_mode=\"{}\"", sandbox_for(req.tool_policy))]);
+            args.extend(["--".into(), "cmd.exe".into(), "/d".into(), "/c".into(), "exit 0".into()]);
+            // Aynı ikili ve sabitlenmiş arka uçla etkisiz komut. Kurulum/çalıştırma
+            // başarısızsa gerçek motor süreci hiçbir zaman başlatılmaz.
+            probe_cli(&program, &req.cwd, &args)?;
+        }
+        Ok(())
+    }
+
     fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
         match serde_json::from_str::<Value>(line) {
             Ok(raw) => parse_value(&raw),
@@ -101,6 +142,109 @@ impl Engine for CodexEngine {
             }],
         }
     }
+}
+
+/// CLI yardımındaki -c TOML geçersiz kılmaları; yeni ve devam turlarında aynıdır.
+fn protection_args(policy: ToolPolicy) -> Vec<String> {
+    let mut args = Vec::new();
+    for value in [
+        "windows.sandbox=\"elevated\"".to_owned(),
+        "sandbox_workspace_write.writable_roots=[]".into(),
+        format!("sandbox_workspace_write.network_access={}", policy == ToolPolicy::Full),
+        "sandbox_workspace_write.exclude_tmpdir_env_var=true".into(),
+        "sandbox_workspace_write.exclude_slash_tmp=true".into(),
+        "mcp_servers={}".into(),
+        "orchestrator.mcp.enabled=false".into(),
+    ] {
+        args.extend(["-c".into(), value]);
+    }
+    args
+}
+
+fn validate_protection_help(help: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        ["--ignore-user-config", "--strict-config"].iter().all(|flag| help.contains(flag)),
+        "Codex CLI zorunlu sandbox/MCP korumalarını desteklemiyor; tur başlatılmadı"
+    );
+    Ok(())
+}
+
+fn disabled_mcp_override(list: &str) -> anyhow::Result<String> {
+    let list: Value = serde_json::from_str(list)
+        .map_err(|_| anyhow::anyhow!("Codex MCP yapılandırması doğrulanamadı; tur başlatılmadı"))?;
+    let servers = list.as_array()
+        .ok_or_else(|| anyhow::anyhow!("Codex MCP listesi doğrulanamadı; tur başlatılmadı"))?;
+    let mut disabled = toml::map::Map::new();
+    for server in servers {
+        let name = server.get("name").and_then(Value::as_str).filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Codex MCP sunucusu doğrulanamadı; tur başlatılmadı"))?;
+        // Kullanıcı katmanı yokken de geçerli bir kayıt gerekir. Aynı taşıma
+        // türünde etkisiz hedef kullan; komut, URL veya sırları argv'ye kopyalama.
+        let (field, inert_target) = match server.pointer("/transport/type").and_then(Value::as_str) {
+            Some("stdio") => ("command", "ultron-disabled-mcp"),
+            Some("streamable_http") => ("url", "https://disabled.invalid/mcp"),
+            _ => anyhow::bail!("Codex MCP taşıması doğrulanamadı; tur başlatılmadı"),
+        };
+        disabled.insert(name.to_owned(), toml::Value::Table(toml::map::Map::from_iter([
+            ("enabled".into(), toml::Value::Boolean(false)),
+            (field.into(), toml::Value::String(inert_target.into())),
+        ])));
+    }
+    Ok(format!("mcp_servers={}", toml::Value::Table(disabled)))
+}
+
+/// Yardım/liste/sandbox ön kontrolü kota harcamaz; süre ve çıktı sınırı vardır.
+/// Hata çıktısı yapılandırma/sır içerebileceğinden kullanıcıya kopyalanmaz.
+fn probe_cli(program: &std::ffi::OsStr, cwd: &Path, args: &[String]) -> anyhow::Result<String> {
+    use std::io::Read;
+    const LIMIT: u64 = 1024 * 1024;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = cmd.spawn().map_err(|_| anyhow::anyhow!(
+        "Codex sandbox/MCP koruması doğrulanamadı; tur başlatılmadı"))?;
+    let stdout = child.stdout.take().expect("ön kontrol stdout borusu");
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(LIMIT + 1).read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let bytes = reader.join().ok().and_then(Result::ok);
+    anyhow::ensure!(status.is_some_and(|status| status.success()),
+        "Codex sandbox/MCP koruması uygulanamadı; tur başlatılmadı");
+    let bytes = bytes.filter(|bytes| bytes.len() as u64 <= LIMIT)
+        .ok_or_else(|| anyhow::anyhow!("Codex koruma ön kontrolü çıktı sınırını aştı; tur başlatılmadı"))?;
+    String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("Codex koruma ön kontrolü doğrulanamadı; tur başlatılmadı"))
+}
+
+/// Yapılandırma, profil ve ek kök seçenekleri sandbox sözleşmesini değiştirebilir.
+/// Ek argümanlar yalnız sunumu etkileyen seçeneklerle sınırlıdır.
+fn validate_extra_args(args: &[String]) -> anyhow::Result<()> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--ephemeral" => {}
+            "--color" if args.next().is_some_and(|v| matches!(v.as_str(), "auto" | "always" | "never")) => {}
+            "--color=auto" | "--color=always" | "--color=never" => {}
+            _ => anyhow::bail!("Codex ek argümanı güvenli seçenek listesinde değil"),
+        }
+    }
+    Ok(())
 }
 
 /// Yapılandırmada varsayılan `codex` adı duruyorsa güncel ikiliyi otomatik bulur;
@@ -288,6 +432,30 @@ fn u64_field(v: &Value, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod resolve_tests {
     use super::*;
+
+    #[test]
+    fn mcp_override_disables_every_inherited_server_without_copying_secrets() {
+        let override_arg = disabled_mcp_override(r#"[{"name":"files.external","enabled":true,"transport":{"type":"stdio","command":"private-command","env":{"TOKEN":"sentetik"}}},{"name":"other","enabled":false,"transport":{"type":"streamable_http","url":"https://private.invalid"}}]"#).unwrap();
+        let config = override_arg.parse::<toml::Table>().unwrap();
+        assert_eq!(config["mcp_servers"]["files.external"]["enabled"].as_bool(), Some(false));
+        assert_eq!(config["mcp_servers"]["other"]["enabled"].as_bool(), Some(false));
+        assert_eq!(config["mcp_servers"]["files.external"]["command"].as_str(), Some("ultron-disabled-mcp"));
+        assert_eq!(config["mcp_servers"]["other"]["url"].as_str(), Some("https://disabled.invalid/mcp"));
+        assert!(!override_arg.contains("sentetik"));
+        assert!(!override_arg.contains("private"));
+        assert!(disabled_mcp_override(r#"[{"unexpected":true}]"#).is_err());
+        assert!(disabled_mcp_override("{}").is_err());
+        assert!(disabled_mcp_override("invalid").is_err());
+    }
+
+    #[test]
+    fn missing_cli_protection_fails_closed_in_turkish() {
+        assert!(validate_protection_help("old CLI").unwrap_err().to_string().contains("tur başlatılmadı"));
+        assert!(validate_protection_help("--ignore-user-config --strict-config").is_ok());
+        let temp = tempfile::tempdir().unwrap();
+        let error = probe_cli(temp.path().join("missing-codex.exe").as_os_str(), temp.path(), &[]).unwrap_err();
+        assert!(error.to_string().contains("tur başlatılmadı"));
+    }
 
     fn make_appx(root: &Path, name: &str) -> PathBuf {
         let d = root.join(name);

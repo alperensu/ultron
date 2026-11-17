@@ -27,4 +27,4 @@
 - Sahte CLI yardımcı ikili dosyası `tests/bin/fake_cli.rs` konumundadır.
 
 ## Kalan risk
-Politika sözcüksel bir ek savunma katmanıdır; politika yolunun dışındaki aynı kullanıcı süreçleri onaylayıcı belirtecini hâlâ okuyabilir. Motorların işletim sistemi düzeyinde izolasyonu (kısıtlı belirteç veya ayrı hesap) Faz 3 Görev 5 için planlanmıştır.
+Politika sözcüksel bir ek savunma katmanıdır; politika yolunun dışındaki aynı kullanıcı süreçleri onaylayıcı belirtecini hâlâ okuyabilir. Motorların işletim sistemi düzeyinde izolasyonu (kısıtlı belirteç veya ayrı hesap) Faz 3 Görev 5 için planlanmıştır. Tur sonu denetimi yalnız dosya metaverisine dayalı, mümkün olan ölçüde çalışan bir ek savunmadır; içerik bütünlüğünü garanti etmez.

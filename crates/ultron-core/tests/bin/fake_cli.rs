@@ -11,6 +11,22 @@ fn main() {
     let mode = args.first().map(String::as_str).unwrap_or("");
     let mut out = std::io::stdout();
     match mode {
+        "exec" if args.iter().any(|arg| arg == "--help") => {
+            writeln!(out, "--ignore-user-config --strict-config").unwrap();
+        }
+        "mcp" if args.get(1).map(String::as_str) == Some("list") => {
+            writeln!(out, r#"[{{"name":"files.external","enabled":true,"transport":{{"type":"stdio","command":"never-run"}}}},{{"name":"remote","enabled":true,"transport":{{"type":"streamable_http","url":"https://synthetic.invalid"}}}}]"#).unwrap();
+        }
+        "sandbox" => {
+            std::fs::write("g5-sandbox-args.json", serde_json::to_vec(&args).unwrap()).unwrap();
+            if !std::path::Path::new("g5-sandbox-ready").is_file() {
+                std::process::exit(17);
+            }
+        }
+        "exec" => {
+            std::fs::write("g5-engine-started", b"started").unwrap();
+            writeln!(out, r#"{{"type":"turn.completed","usage":{{}}}}"#).unwrap();
+        }
         "replay" => {
             let text = std::fs::read_to_string(&args[1]).expect("fixture okunamadı");
             for line in text.lines() {

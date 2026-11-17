@@ -2,18 +2,21 @@
 //! yönetir. Kalıcı durum (güncel motor, oturumlar, son görülen git HEAD) veritabanındadır;
 //! bellekte yalnızca "şu an çalışan tur" kaydı tutulur.
 
+pub mod audit;
+
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::{Config, EngineId};
 use crate::db::{Db, RECENT_EVENTS_WINDOW, SessionRow, SessionStatus};
+use crate::db::approvals::{Approval, ApprovalStatus};
 use crate::engine::{Engine, ToolPolicy, TurnOutcome, TurnRequest, agy, run_turn};
 use crate::eventlog::EventLog;
 use crate::events::{EngineEvent, SwitchReason};
@@ -30,6 +33,47 @@ const HANDOFF_RECENT_MESSAGES: usize = 6;
 const RESUME_FAILED_MESSAGE: &str = "yerel oturum devam ettirilemedi, yeni oturum açıldı";
 
 type ActiveTurns = Arc<Mutex<HashMap<String, CancellationToken>>>;
+
+/// Sohbet/yönetici kimliğinden bağımsız, aynı fiziksel çalışma alanı için tur kilidi.
+/// Zayıf referanslar tamamlanan çalışma alanlarını bellekte tutmaz.
+fn workspace_turn_lock(cwd: &Path) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    type WorkspaceLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<WorkspaceLocks> = OnceLock::new();
+    let root = std::fs::canonicalize(cwd)?;
+    #[cfg(windows)]
+    let root = PathBuf::from(root.as_os_str().to_string_lossy().to_lowercase());
+    let mut locks = LOCKS.get_or_init(Mutex::default).lock()
+        .map_err(|_| anyhow!("çalışma alanı tur kilidi zehirlendi"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&root).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(root, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+/// Mesaj içeriğini kalıcı onay kuyruğuna yazmadan, kesin özetini üretir.
+#[cfg(windows)]
+fn message_sha256(text: &str) -> Result<String> {
+    use windows_sys::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
+    let mut digest = [0_u8; 32];
+    let length = u32::try_from(text.len()).map_err(|_| anyhow!("yükseltme mesajı çok büyük"))?;
+    // SAFETY: salt okunur girdi ve 32 baytlık çıktı çağrı boyunca geçerli; anahtar yoktur.
+    let status = unsafe {
+        BCryptHash(BCRYPT_SHA256_ALG_HANDLE, std::ptr::null(), 0,
+            text.as_ptr(), length, digest.as_mut_ptr(), digest.len() as u32)
+    };
+    if status < 0 {
+        bail!("yükseltme mesajının SHA-256 özeti üretilemedi");
+    }
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(not(windows))]
+fn message_sha256(_text: &str) -> Result<String> {
+    bail!("yükseltme mesajının SHA-256 özeti bu platformda desteklenmiyor")
+}
 
 /// Sohbet başına tek aktif tur kilidi; düşünce serbest bırakır.
 struct TurnGuard {
@@ -50,6 +94,21 @@ pub struct TurnReservation {
     guard: TurnGuard,
     cancel: CancellationToken,
     engine: EngineId,
+    turn_id: String,
+    elevation: Option<Elevation>,
+}
+
+struct Elevation {
+    approval_id: String,
+    cwd: std::path::PathBuf,
+    text: String,
+}
+
+impl TurnReservation {
+    /// Onay bekleyen tur da normal Cancel komutuyla durdurulabilir.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
 }
 
 /// Sohbet oturumlarını yöneten ana nesne.
@@ -60,6 +119,7 @@ pub struct SessionManager {
     engines: HashMap<EngineId, Arc<dyn Engine>>,
     workstate: WorkStateService,
     active: ActiveTurns,
+    audit_reports: broadcast::Sender<audit::AuditReport>,
 }
 
 impl SessionManager {
@@ -78,6 +138,7 @@ impl SessionManager {
             cfg,
             engines,
             active: Arc::new(Mutex::new(HashMap::new())),
+            audit_reports: broadcast::channel(64).0,
         }
     }
 
@@ -86,6 +147,12 @@ impl SessionManager {
     pub fn with_summarizer(mut self, summarizer: Box<dyn Summarizer>) -> SessionManager {
         self.workstate = WorkStateService::new(self.db.clone(), summarizer);
         self
+    }
+
+    /// Codex/agy denetim sonuçları. Ortak PolicyViolation/bildirim adaptörü bu akışı tüketebilir.
+    /// Dinleyici olmasa da ihlaller sohbet günlüğüne maskeli Error olarak kaydedilir.
+    pub fn subscribe_audits(&self) -> broadcast::Receiver<audit::AuditReport> {
+        self.audit_reports.subscribe()
     }
 
     /// Bir tur çalıştırır. Aynı motorda açık oturum varsa native resume; yoksa (sohbetin
@@ -118,7 +185,44 @@ impl SessionManager {
             guard,
             cancel,
             engine,
+            turn_id: Uuid::new_v4().to_string(),
+            elevation: None,
         })
+    }
+
+    /// Motor başlamadan önce, yalnız bu rezervasyona ait Full onayını kuyruğa alır.
+    /// Onay burada çözülmez; requester hiçbir zaman onaylayıcı yetkisi kazanmaz.
+    pub fn request_elevation(
+        &self,
+        reservation: &mut TurnReservation,
+        cwd: &Path,
+        text: &str,
+    ) -> Result<Approval> {
+        if !Arc::ptr_eq(&reservation.guard.active, &self.active) {
+            bail!("tur rezervasyonu başka yöneticiye ait");
+        }
+        if reservation.elevation.is_some() {
+            bail!("bu tur için yükseltme zaten istendi");
+        }
+        let cwd = std::fs::canonicalize(cwd)?;
+        let action = crate::policy::Action::ToolCall {
+            tool: "ultron.turn.elevate".into(),
+            input: serde_json::json!({
+                "turn_id": reservation.turn_id, "cwd": cwd, "policy": "full",
+                "text_preview": crate::import::mask_secrets(text).0.chars().take(512).collect::<String>(),
+                "text_sha256": message_sha256(text)?,
+            }),
+        };
+        self.db.insert_chat(&reservation.guard.chat_id, None, "", Utc::now())?;
+        let approval = self.db.create_approval(
+            Some(&reservation.guard.chat_id), reservation.engine,
+            crate::policy::RiskCategory::SystemConfig,
+            "Yalnız bu tur için Full araç politikası istendi; sandbox kaldırılmaz", &action,
+        )?;
+        reservation.elevation = Some(Elevation {
+            approval_id: approval.id.clone(), cwd, text: text.into(),
+        });
+        Ok(approval)
     }
 
     /// [`SessionManager::reserve_turn`] ile ayrılmış turu çalıştırır.
@@ -137,11 +241,43 @@ impl SessionManager {
         {
             bail!("tur rezervasyonu başka sohbet, motor veya yönetici için kullanılamaz");
         }
+        if policy == ToolPolicy::Full {
+            let elevation = reservation.elevation.as_ref()
+                .ok_or_else(|| anyhow!("Full politikası bu tur için kullanıcı onayı gerektirir"))?;
+            let approval = self.db.get_approval(&elevation.approval_id)?
+                .ok_or_else(|| anyhow!("yükseltme onayı bulunamadı"))?;
+            if approval.status != ApprovalStatus::Approved
+                || approval.chat_id.as_deref() != Some(chat_id)
+                || approval.engine != engine
+                || elevation.cwd != std::fs::canonicalize(cwd)?
+                || elevation.text != text
+            {
+                bail!("Full politikası bu tur için geçerli kullanıcı onayı gerektirir");
+            }
+            // Komut metni kuyrukta maskelidir; yetkiyi sır taşımayan tekil tur kimliği bağlar.
+            let recorded: crate::policy::Action = serde_json::from_str(&approval.action_json)?;
+            let digest = message_sha256(text)?;
+            if !matches!(recorded, crate::policy::Action::ToolCall { tool, input }
+                if tool == "ultron.turn.elevate"
+                    && input.get("turn_id").and_then(serde_json::Value::as_str) == Some(reservation.turn_id.as_str())
+                    && input.get("policy").and_then(serde_json::Value::as_str) == Some("full")
+                    && input.get("text_sha256").and_then(serde_json::Value::as_str) == Some(digest.as_str())) {
+                bail!("yükseltme eylemi rezervasyonla eşleşmiyor");
+            }
+        }
         let TurnReservation {
             guard: _guard,
             cancel,
             engine: _,
+            turn_id: _,
+            elevation: _,
         } = reservation;
+        let workspace_lock = workspace_turn_lock(cwd)?;
+        let _workspace_guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
+            guard = workspace_lock.lock_owned() => guard,
+        };
         let driver = self
             .engines
             .get(&engine)
@@ -275,7 +411,7 @@ impl SessionManager {
             .run_attempt(chat_id, &mut session, req, driver.clone(), cancel.clone())
             .await?;
 
-        if resumed && matches!(outcome, TurnOutcome::Failed { .. }) {
+        if resumed && matches!(outcome, TurnOutcome::Failed { .. }) && !summary.saw_effects {
             // Yerel oturum bozuk olabilir: kapat, devir paketiyle yeni oturumda bir kez daha dene.
             session.status = SessionStatus::Closed;
             session.ended_at = Some(Utc::now());
@@ -420,11 +556,30 @@ impl SessionManager {
         driver: Arc<dyn Engine>,
         cancel: CancellationToken,
     ) -> Result<(TurnOutcome, TurnSummary)> {
+        let mut audit = if matches!(session.engine, EngineId::Codex | EngineId::Agy) {
+            let dir = req.cwd.clone();
+            let paths = crate::Paths::resolve()?;
+            let project_bound = self.db.get_chat(chat_id)?.is_some_and(|chat| chat.project_id.is_some());
+            match blocking(move || audit::TurnAudit::start(&dir, paths, project_bound)).await? {
+                Ok(audit) => Some(audit),
+                Err(error) => {
+                    session.status = SessionStatus::Failed;
+                    session.ended_at = Some(Utc::now());
+                    self.db.upsert_session(session)?;
+                    self.log.append(chat_id, Some(&session.id), EngineEvent::Error {
+                        message: format!("Tur denetimi hazırlanamadı: {}", crate::import::mask_secrets(&error.to_string()).0),
+                    })?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let (tx, mut rx) = mpsc::channel::<EngineEvent>(64);
         let run = run_turn(driver.as_ref(), req, tx, cancel);
         let consume = async {
             let mut summary = TurnSummary::default();
-            while let Some(ev) = rx.recv().await {
+            while let Some(mut ev) = rx.recv().await {
                 if let EngineEvent::SessionStarted {
                     native_session_id: Some(id),
                 } = &ev
@@ -433,11 +588,52 @@ impl SessionManager {
                     self.db.upsert_session(session)?;
                 }
                 summary.observe(&ev);
+                if let Some(audit) = audit.as_mut() {
+                    // Codex ToolCall tamamlanan MCP öğesidir; agy çağrı adımı ise
+                    // henüz gerçekleşmemiş teklif olabilir. Teklifi ihlal sayma.
+                    if session.engine == EngineId::Codex || !matches!(ev, EngineEvent::ToolCall { .. }) {
+                        audit.observe(&ev);
+                    }
+                    ev = audit::mask_event(ev)?;
+                }
                 self.log.append(chat_id, Some(&session.id), ev)?;
             }
             Ok::<_, anyhow::Error>(summary)
         };
-        let (outcome, summary) = tokio::join!(run, consume);
+        let (outcome, mut summary) = tokio::join!(run, consume);
+
+        // Başlatma hatası, iptal veya kota da gerçekleşmiş yan etkileri gizlememeli.
+        if let Some(audit) = audit {
+            let chat = chat_id.to_owned();
+            let id = session.id.clone();
+            let report = blocking(move || audit.finish(&chat, &id)).await?;
+            if (!report.changes.is_empty() || !report.errors.is_empty())
+                && let Ok(summary) = summary.as_mut()
+            {
+                summary.saw_effects = true;
+            }
+            for (path, change) in &report.changes {
+                self.log.append(chat_id, Some(&session.id), EngineEvent::FileChanged {
+                    path: crate::import::mask_secrets(&path.to_string_lossy()).0, change: change.clone(),
+                })?;
+            }
+            for violation in &report.violations {
+                self.log.append(chat_id, Some(&session.id), EngineEvent::Error {
+                    message: format!("Politika ihlali ({:?}): {}", violation.category, violation.command),
+                })?;
+            }
+            for error in &report.errors {
+                let event = if error.starts_with("Denetim sınırlı:") {
+                    EngineEvent::Unknown { raw: serde_json::json!({
+                        "type": "audit_limited", "message": error,
+                    }) }
+                } else {
+                    EngineEvent::Error { message: format!("Tur denetimi tamamlanamadı: {error}") }
+                };
+                self.log.append(chat_id, Some(&session.id), event)?;
+            }
+            let _ = self.audit_reports.send(report);
+        }
 
         let (outcome, summary) = match (outcome, summary) {
             (Ok(outcome), Ok(summary)) => (outcome, summary),
@@ -531,6 +727,7 @@ struct TurnSummary {
     saw_error: bool,
     saw_quota: bool,
     saw_turn_completed: bool,
+    saw_effects: bool,
 }
 
 impl TurnSummary {
@@ -540,6 +737,9 @@ impl TurnSummary {
             EngineEvent::Error { .. } => self.saw_error = true,
             EngineEvent::QuotaExhausted { .. } => self.saw_quota = true,
             EngineEvent::TurnCompleted => self.saw_turn_completed = true,
+            EngineEvent::Command { exit_code: Some(_), .. }
+            | EngineEvent::FileChanged { .. }
+            | EngineEvent::ToolCall { .. } => self.saw_effects = true,
             _ => {}
         }
     }
@@ -564,4 +764,28 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| anyhow!("arka plan görevi başarısız: {e}"))
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn elevation_digest_matches_sha256_vector() {
+        assert_eq!(message_sha256("abc").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[tokio::test]
+    async fn workspace_audits_wait_for_other_chats_and_release_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = workspace_turn_lock(temp.path()).unwrap().lock_owned().await;
+        let same = workspace_turn_lock(&temp.path().join(".")).unwrap();
+        assert!(same.try_lock().is_err(), "ikinci sohbet aynı alanı eşzamanlı kullanamaz");
+        let other = tempfile::tempdir().unwrap();
+        assert!(workspace_turn_lock(other.path()).unwrap().try_lock().is_ok());
+        drop(first);
+        assert!(same.try_lock().is_ok(), "iptal/bitiş kilidi bırakmalı");
+    }
 }

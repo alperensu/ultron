@@ -87,11 +87,7 @@ impl Engine for AgyEngine {
     }
 
     fn command(&self, req: &TurnRequest) -> CommandSpec {
-        let model = self
-            .cfg
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let model = DEFAULT_MODEL.to_string();
         let mut args: Vec<String> = vec![
             "--output-format".into(),
             "stream-json".into(),
@@ -102,11 +98,12 @@ impl Engine for AgyEngine {
             args.extend(["--conversation".into(), id.clone()]);
         }
         match req.tool_policy {
-            ToolPolicy::ReadOnly => args.extend(["--mode".into(), "plan".into()]),
+            ToolPolicy::ReadOnly | ToolPolicy::Full => {
+                args.extend(["--mode".into(), "plan".into(), "--sandbox".into()]);
+            }
             ToolPolicy::Workspace => {
                 args.extend(["--mode".into(), "accept-edits".into(), "--sandbox".into()]);
             }
-            ToolPolicy::Full => args.extend(["--mode".into(), "accept-edits".into()]),
         }
         args.extend(self.cfg.extra_args.iter().cloned());
         // İstem her zaman son argüman; `--dangerously-skip-permissions` asla eklenmez.
@@ -117,6 +114,24 @@ impl Engine for AgyEngine {
             cwd: req.cwd.clone(),
             stdin: None,
         }
+    }
+
+    fn prepare_command(
+        &self,
+        req: &TurnRequest,
+        _cmd: &mut tokio::process::Command,
+    ) -> anyhow::Result<()> {
+        if self.cfg.model.as_deref().is_some_and(|model| model != DEFAULT_MODEL) {
+            anyhow::bail!("agy yalnız Gemini Flash-low modeliyle çalıştırılabilir");
+        }
+        // --settings, --mode, --model, --add-dir ve izin atlama seçenekleri kabul edilmez.
+        if !self.cfg.extra_args.is_empty() {
+            anyhow::bail!("agy ek argümanları koruma politikasını değiştiremez");
+        }
+        if req.resume_native_id.as_ref().is_some_and(|id| id.starts_with('-')) {
+            anyhow::bail!("agy oturum kimliği seçenek olamaz");
+        }
+        Ok(())
     }
 
     fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
@@ -217,11 +232,23 @@ fn tool_step_events(step: &Value, step_type: &str) -> Vec<EngineEvent> {
             };
             let is_error = str_field(step, "state").as_deref() == Some("FAILED")
                 || info.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-            vec![EngineEvent::ToolResult {
+            let mut events = vec![EngineEvent::ToolResult {
                 tool,
                 output_excerpt: excerpt(&text, DEFAULT_EXCERPT_CHARS),
                 is_error,
-            }]
+            }];
+            // Yalnız açık çıkış kodu taşıyan sonuç çalışmış komut kanıtıdır.
+            // Alan biçimi canlı yakalamayla doğrulanmadı; eksik alanlarda tahmin yapılmaz.
+            let exit_code = step.get("exit_code").or_else(|| output.get("exit_code"))
+                .and_then(Value::as_i64).and_then(|code| i32::try_from(code).ok());
+            let command = info.pointer("/input/command").and_then(Value::as_str);
+            if let (Some(exit_code), Some(command)) = (exit_code, command) {
+                events.push(EngineEvent::Command {
+                    command: command.to_owned(), exit_code: Some(exit_code),
+                    output_excerpt: excerpt(&text, DEFAULT_EXCERPT_CHARS),
+                });
+            }
+            events
         }
         None => {
             let input = match info.get("input") {

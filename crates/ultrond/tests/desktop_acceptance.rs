@@ -202,6 +202,7 @@ async fn desktop_acceptance_chat_and_events_survive_daemon_restart() {
             engine: Some(EngineId::Claude),
             text: PROMPT.into(),
             policy: PolicyArg::ReadOnly,
+            elevated: false,
             project_id: None,
         })
         .await

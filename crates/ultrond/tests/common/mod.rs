@@ -104,6 +104,7 @@ pub fn send_req(cwd: &Path, chat: Option<&str>, text: &str) -> Request {
         engine: Some(EngineId::Claude),
         text: text.to_string(),
         policy: ultron_core::ipc::PolicyArg::ReadOnly,
+        elevated: false,
         project_id: None,
     }
 }

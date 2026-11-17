@@ -92,6 +92,188 @@ const REPLY: &str = r#"{"type":"assistant_text","text":"anladım"}"#;
 const DONE: &str = r#"{"type":"turn_completed"}"#;
 
 #[tokio::test]
+async fn elevation_accepts_large_message_with_bounded_preview_and_exact_intent() {
+    use ultron_core::db::approvals::ResolvedBy;
+    let env = env_with(&[(EngineId::Codex, vec![DONE])]);
+    let text = "ğ\"\\\n".repeat(5120);
+    assert!(text.len() >= 20 * 1024);
+    let mut reservation = env.mgr.reserve_turn("large", EngineId::Codex).unwrap();
+    let approval = env.mgr.request_elevation(&mut reservation, &env.cwd, &text).unwrap();
+    assert_eq!(approval.status, ultron_core::db::approvals::ApprovalStatus::Pending);
+    assert!(approval.action_json.len() < 4096);
+    let value: serde_json::Value = serde_json::from_str(&approval.action_json).unwrap();
+    let input = &value["ToolCall"]["input"];
+    assert!(input["text_preview"].as_str().unwrap().chars().count() <= 512);
+    assert_eq!(input["text_sha256"].as_str().unwrap().len(), 64);
+    assert!(input.get("text").is_none());
+    env.db.resolve_approval(&approval.id, true, ResolvedBy::Desktop).unwrap();
+    let changed = format!("{text}x");
+    assert!(env.mgr.send_reserved(reservation, "large", &env.cwd, EngineId::Codex, &changed, ToolPolicy::Full).await.is_err());
+    let mut reservation = env.mgr.reserve_turn("large", EngineId::Codex).unwrap();
+    let approval = env.mgr.request_elevation(&mut reservation, &env.cwd, &text).unwrap();
+    env.db.resolve_approval(&approval.id, true, ResolvedBy::Desktop).unwrap();
+    assert_eq!(env.mgr.send_reserved(reservation, "large", &env.cwd, EngineId::Codex, &text, ToolPolicy::Full).await.unwrap(), TurnOutcome::Completed);
+}
+
+#[tokio::test]
+async fn different_chats_in_same_workspace_are_serialized_and_wait_is_cancellable() {
+    let mut env = env_with(&[(EngineId::Codex, vec![DONE])]);
+    let reqs: Reqs = Arc::default();
+    let engine = RecEngine {
+        id: EngineId::Codex,
+        inner: FakeEngine::with_mode(&["hold"], false),
+        reqs: reqs.clone(),
+    };
+    let paths = Paths::from_root(env.tmp.path().join("serialized"));
+    paths.ensure().unwrap();
+    let db = Arc::new(Db::open(&paths.db).unwrap());
+    let log = Arc::new(EventLog::new(db.clone(), paths));
+    env.mgr = Arc::new(SessionManager::new(db, log, Config::default(),
+        HashMap::from([(EngineId::Codex, Arc::new(engine) as Arc<dyn Engine>)])));
+    let mgr = env.mgr.clone();
+    let cwd = env.cwd.clone();
+    let first = tokio::spawn(async move {
+        mgr.send("first", &cwd, EngineId::Codex, "first", ToolPolicy::Workspace).await
+    });
+    for _ in 0..100 {
+        if !reqs.lock().unwrap().is_empty() { break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(reqs.lock().unwrap().len(), 1);
+    let second_reservation = env.mgr.reserve_turn("second", EngineId::Codex).unwrap();
+    let second_cancel = second_reservation.cancellation_token();
+    let mgr = env.mgr.clone();
+    let cwd = env.cwd.clone();
+    let second = tokio::spawn(async move {
+        mgr.send_reserved(second_reservation, "second", &cwd, EngineId::Codex, "second", ToolPolicy::Workspace).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reqs.lock().unwrap().len(), 1, "ikinci sohbet motoru başlatmamalı");
+    second_cancel.cancel();
+    assert_eq!(second.await.unwrap().unwrap(), TurnOutcome::Cancelled);
+    env.mgr.cancel("first").await.unwrap();
+    assert_eq!(first.await.unwrap().unwrap(), TurnOutcome::Cancelled);
+    assert!(env.mgr.reserve_turn("second", EngineId::Codex).is_ok());
+}
+
+#[tokio::test]
+async fn codex_full_policy_requires_approved_elevation() {
+    use ultron_core::db::approvals::ResolvedBy;
+    let env = env_with(&[(EngineId::Codex, vec![DONE])]);
+    let error = env.mgr.send("full", &env.cwd, EngineId::Codex, "test", ToolPolicy::Full)
+        .await.unwrap_err();
+    assert!(error.to_string().contains("onayı"));
+    assert!(env.reqs[&EngineId::Codex].lock().unwrap().is_empty());
+
+    let mut reservation = env.mgr.reserve_turn("full", EngineId::Codex).unwrap();
+    let approval = env.mgr.request_elevation(&mut reservation, &env.cwd, "test").unwrap();
+    assert_eq!(approval.status, ultron_core::db::approvals::ApprovalStatus::Pending);
+    let error = env.mgr.send_reserved(reservation, "full", &env.cwd, EngineId::Codex, "test", ToolPolicy::Full)
+        .await.unwrap_err();
+    assert!(error.to_string().contains("onayı"));
+
+    let mut reservation = env.mgr.reserve_turn("full", EngineId::Codex).unwrap();
+    let approval = env.mgr.request_elevation(&mut reservation, &env.cwd, "test").unwrap();
+    env.db.resolve_approval(&approval.id, true, ResolvedBy::Desktop).unwrap();
+    let out = env.mgr.send_reserved(reservation, "full", &env.cwd, EngineId::Codex, "test", ToolPolicy::Full)
+        .await.unwrap();
+    assert_eq!(out, TurnOutcome::Completed);
+    assert_eq!(env.reqs[&EngineId::Codex].lock().unwrap().len(), 1);
+
+    // Önceki tur onayı sonraki tura taşınmaz.
+    assert!(env.mgr.send("full", &env.cwd, EngineId::Codex, "test", ToolPolicy::Full).await.is_err());
+}
+
+#[tokio::test]
+async fn elevation_rejects_denial_and_changed_turn_intent() {
+    use ultron_core::db::approvals::ResolvedBy;
+    let env = env_with(&[(EngineId::Codex, vec![DONE])]);
+    for (approve, text) in [(false, "test"), (true, "başka iş")] {
+        let mut reservation = env.mgr.reserve_turn("elevation", EngineId::Codex).unwrap();
+        let approval = env.mgr.request_elevation(&mut reservation, &env.cwd, "test").unwrap();
+        env.db.resolve_approval(&approval.id, approve, ResolvedBy::Desktop).unwrap();
+        assert!(env.mgr.send_reserved(reservation, "elevation", &env.cwd, EngineId::Codex, text, ToolPolicy::Full)
+            .await.is_err());
+    }
+    assert!(env.reqs[&EngineId::Codex].lock().unwrap().is_empty());
+}
+
+#[test]
+fn audit_classifies_execution_and_masks_secrets() {
+    use ultron_core::policy::{PolicyConfig, PolicyContext, RiskCategory};
+    use ultron_core::session::audit::PostTurnAudit;
+    let mut audit = PostTurnAudit::new(PolicyConfig::default(), PolicyContext {
+        project_root: None, workspace_root: PathBuf::from("workspace"),
+    });
+    for (command, exit_code) in [
+        ("git status", Some(0)),
+        ("rm blocked.txt", None),
+        ("cmd /c del test.txt", Some(0)),
+        ("git push --force; token=synthetic-value", Some(1)),
+    ] {
+        audit.observe(&EngineEvent::Command { command: command.into(), exit_code, output_excerpt: String::new() }).unwrap();
+    }
+    let violations = audit.finish();
+    assert_eq!(violations.len(), 2);
+    assert_eq!(violations[0].category, RiskCategory::Delete);
+    assert_eq!(violations[1].category, RiskCategory::GitHistory);
+    assert!(!violations[1].command.contains("synthetic-value"));
+}
+
+#[tokio::test]
+async fn post_turn_audit_flags_executed_risky_command() {
+    let env = env_with(&[(EngineId::Codex, vec![
+        r#"{"type":"command","command":"cmd /c del test.txt; token=synthetic-value","exit_code":0,"output_excerpt":"token=synthetic-output"}"#,
+        r#"{"type":"command","command":"rm blocked.txt","exit_code":null,"output_excerpt":""}"#,
+        r#"{"type":"tool_call","tool":"synthetic","input":{"api_key":"synthetic-json-key","command":"token=synthetic-call"}}"#,
+        r#"{"type":"tool_result","tool":"synthetic","output_excerpt":"token=synthetic-result","is_error":false}"#,
+        DONE,
+    ])]);
+    let mut reports = env.mgr.subscribe_audits();
+    let outcome = env.mgr.send("audit", &env.cwd, EngineId::Codex, "test", ToolPolicy::Workspace).await.unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    let report = reports.try_recv().unwrap();
+    assert_eq!(report.chat_id, "audit");
+    assert_eq!(report.violations.len(), 1);
+    assert_eq!(report.violations[0].category, ultron_core::policy::RiskCategory::Delete);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let events = env.db.events_tail("audit", 100).unwrap();
+    let stored = serde_json::to_string(&events).unwrap();
+    assert!(!stored.contains("synthetic-value"));
+    assert!(!stored.contains("synthetic-output"));
+    assert!(!stored.contains("synthetic-json-key"));
+    assert!(!stored.contains("synthetic-call"));
+    assert!(!stored.contains("synthetic-result"));
+    assert!(events.iter().any(|event| event.kind == "error"
+        && event.payload["message"].as_str().is_some_and(|message| message.contains("Politika ihlali"))));
+}
+
+#[tokio::test]
+async fn agy_proposed_tool_call_without_execution_does_not_report_violation() {
+    let env = env_with(&[(EngineId::Agy, vec![
+        r#"{"type":"tool_call","tool":"files.delete_file","input":{"path":"blocked.txt"}}"#,
+        REPLY, DONE,
+    ])]);
+    let mut reports = env.mgr.subscribe_audits();
+    assert_eq!(env.mgr.send("proposal", &env.cwd, EngineId::Agy, "test", ToolPolicy::ReadOnly).await.unwrap(), TurnOutcome::Completed);
+    assert!(reports.try_recv().unwrap().violations.is_empty());
+}
+
+#[tokio::test]
+async fn failed_resume_with_executed_command_is_not_replayed() {
+    let env = env_with(&[(EngineId::Codex, vec![
+        STARTED,
+        r#"{"type":"command","command":"git push --force","exit_code":1,"output_excerpt":""}"#,
+        r#"{"type":"error","message":"sentetik hata"}"#,
+    ])]);
+    for _ in 0..2 {
+        assert!(matches!(env.mgr.send("no-replay", &env.cwd, EngineId::Codex, "test", ToolPolicy::Workspace)
+            .await.unwrap(), TurnOutcome::Failed { .. }));
+    }
+    assert_eq!(env.reqs[&EngineId::Codex].lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn reservation_cannot_be_used_for_other_chat() {
     let env = env_with(&[(EngineId::Claude, vec![DONE])]);
     let reservation = env.mgr.reserve_turn("reserved", EngineId::Claude).unwrap();
