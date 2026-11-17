@@ -130,6 +130,8 @@ pub async fn import_projects(
         report.notes_updated += usize::from(row.note_updated);
         report.rows.push(row);
     }
+    // `auto` kipinde özetleyici çalışma sırasında yedeğe geçebilir; gerçek tür sonda okunur.
+    report.summarizer = summarizer.kind().to_string();
     Ok(report)
 }
 
@@ -259,7 +261,8 @@ async fn import_one(
                     source_stamp: stamp,
                     claude_sessions: item.claude.len(),
                     codex_sessions: item.codex.len(),
-                    summarizer: kind.to_string(),
+                    // Yedeğe geçildiyse not gerçekte üretildiği özetleyiciyle etiketlenir.
+                    summarizer: summarizer.kind().to_string(),
                 },
             )?;
             row.note_updated = true;

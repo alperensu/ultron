@@ -64,6 +64,24 @@ pub fn validate_worker_model(model: &str) -> Result<()> {
     Ok(())
 }
 
+/// Çalışma durumu / proje notu özetleyicisi seçimi (`summarizer` anahtarı).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SummarizerMode {
+    /// agy etkinse agy; agy kotaya takılırsa aynı çalıştırmanın kalanında claude-haiku.
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    /// Yalnız agy (etkin değilse özetleyici yok).
+    #[serde(rename = "agy")]
+    Agy,
+    /// Yalnız Claude Haiku, araçsız.
+    #[serde(rename = "claude-haiku")]
+    ClaudeHaiku,
+    /// Özetleyici yok; yalnız kural tabanlı durum.
+    #[serde(rename = "none")]
+    Off,
+}
+
 /// Ultron genel yapılandırması (`root\config.toml`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -75,6 +93,8 @@ pub struct Config {
     pub reset_rights: ResetRights,
     /// `false` ise Claude kullanım uç noktası hiç çağrılmaz.
     pub claude_live_quota: bool,
+    /// Özetleyici seçimi: `auto` (varsayılan), `agy`, `claude-haiku` veya `none`.
+    pub summarizer: SummarizerMode,
 }
 
 /// Havuz başına kalan sıfırlama hakları; `None` = bilinmiyor.
@@ -95,6 +115,7 @@ impl Default for Config {
             context_budget_chars: 24000,
             reset_rights: ResetRights::default(),
             claude_live_quota: true,
+            summarizer: SummarizerMode::Auto,
         }
     }
 }

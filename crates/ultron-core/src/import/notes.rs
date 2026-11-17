@@ -463,8 +463,8 @@ pub async fn build_note(
         shrunk,
         now,
     } = ctx;
-    let kind = summarizer.kind();
     let prev_state = prev.map(|p| p.state.clone()).unwrap_or_default();
+    let kind = summarizer.kind();
     let mut state = prev_state.clone();
     if kind != "null" && (!data.messages.is_empty() || !data.docs.is_empty()) {
         // Belgeler ilk gruba bağlam olarak girer; mesajlar eskiden yeniye gruplanır.
@@ -512,6 +512,8 @@ pub async fn build_note(
         }
     }
 
+    // Yedeğe geçilmiş olabileceğinden başlık, döngü bittikten sonraki özetleyiciyi yazar.
+    let kind = summarizer.kind();
     let date = now.format("%Y-%m-%d").to_string();
     let yes = |b: bool| if b { "var" } else { "yok" };
     let has_doc = |n: &str| data.docs.iter().any(|(d, _)| d == n);

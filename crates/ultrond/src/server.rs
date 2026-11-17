@@ -19,7 +19,8 @@ use ultron_core::events::{EngineEvent, SwitchReason};
 use ultron_core::ipc::{
     self, ChatDetail, MAX_LINE_BYTES, Request, Response, ct_eq, read_frame, sys, write_msg,
 };
-use ultron_core::summarizer::{AgySummarizer, NullSummarizer, Summarizer};
+use ultron_core::summarizer::{AgySummarizer, AutoSummarizer, ClaudeSummarizer, NullSummarizer, Summarizer};
+use ultron_core::config::SummarizerMode;
 use ultron_core::{Config, Db, EngineId, EventLog, Paths, SessionManager, SessionStatus};
 
 use crate::keepawake::KeepAwake;
@@ -157,22 +158,50 @@ pub fn recover_interrupted(db: &Db, log: &EventLog) -> Result<usize> {
     Ok(count)
 }
 
-/// Çalışma durumu özetleyicisini yapılandırmaya göre seçer. agy etkinse agy özetleyicisi
-/// kurulur; değilse yalnız kural tabanlı durum kalır. Özetleyici, kullanıcı projelerinden
-/// ayrı `run\summarizer` dizininde (salt okunur kipte) çalışır.
+/// Çalışma durumu özetleyicisini `summarizer` yapılandırmasına göre seçer.
+/// - `auto`: agy etkinse agy; agy kotaya takılırsa aynı çalıştırmanın kalanında claude-haiku
+///   (Claude etkinse). agy etkin değilse özetleyici yok.
+/// - `agy` / `claude-haiku`: yalnız o motor (etkin değilse özetleyici yok).
+/// - `none`: özetleyici yok.
+///
+/// Özetleyiciler kullanıcı projelerinden ayrı `run\summarizer` dizininde (salt okunur kipte) çalışır.
 pub fn select_summarizer(paths: &Paths, cfg: &Config) -> Result<Box<dyn Summarizer>> {
-    match cfg
-        .engines
-        .iter()
-        .find(|e| e.id == EngineId::Agy && e.enabled)
-    {
-        Some(agy) => {
-            let dir = paths.run.join("summarizer");
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("özetleyici dizini oluşturulamadı: {}", dir.display()))?;
-            Ok(Box::new(AgySummarizer::agy(agy.clone(), dir)))
+    let enabled = |id: EngineId| cfg.engines.iter().find(|e| e.id == id && e.enabled);
+    let (agy, claude) = (enabled(EngineId::Agy), enabled(EngineId::Claude));
+    let dir = || -> Result<std::path::PathBuf> {
+        let dir = paths.run.join("summarizer");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("özetleyici dizini oluşturulamadı: {}", dir.display()))?;
+        Ok(dir)
+    };
+    let boxed: Box<dyn Summarizer> = match (cfg.summarizer, agy, claude) {
+        (SummarizerMode::Off, _, _) => Box::new(NullSummarizer),
+        (SummarizerMode::Agy | SummarizerMode::Auto, Some(agy), claude) => {
+            let primary = AgySummarizer::agy(agy.clone(), dir()?);
+            match claude {
+                Some(claude) if cfg.summarizer == SummarizerMode::Auto => Box::new(AutoSummarizer::new(
+                    Box::new(primary),
+                    Box::new(ClaudeSummarizer::haiku(claude, dir()?)),
+                )),
+                _ => Box::new(primary),
+            }
         }
-        None => Ok(Box::new(NullSummarizer)),
+        (SummarizerMode::ClaudeHaiku, _, Some(claude)) => {
+            Box::new(ClaudeSummarizer::haiku(claude, dir()?))
+        }
+        _ => Box::new(NullSummarizer),
+    };
+    Ok(boxed)
+}
+
+/// Kuru çalıştırma için özetleyici türü adı (motor çağırmadan, dizin oluşturmadan).
+pub fn summarizer_kind(cfg: &Config) -> &'static str {
+    let enabled = |id: EngineId| cfg.engines.iter().any(|e| e.id == id && e.enabled);
+    match cfg.summarizer {
+        SummarizerMode::Off => "null",
+        SummarizerMode::Agy | SummarizerMode::Auto if enabled(EngineId::Agy) => "agy",
+        SummarizerMode::ClaudeHaiku if enabled(EngineId::Claude) => "claude-haiku",
+        _ => "null",
     }
 }
 
@@ -664,17 +693,10 @@ async fn dispatch(
             let cfg = ultron_core::Config::load(&st.paths)?;
             let filters = ultron_core::import::discovery::Filters::system(&home);
             // Dry-run motor çağırmaz ve dizin oluşturmaz.
-            let (summarizer, kind): (Box<dyn Summarizer>, &str) = if dry_run {
-                let kind = if cfg.engines.iter().any(|e| e.id == EngineId::Agy && e.enabled) {
-                    "agy"
-                } else {
-                    "null"
-                };
-                (Box::new(NullSummarizer), kind)
+            let summarizer: Box<dyn Summarizer> = if dry_run {
+                Box::new(NullSummarizer)
             } else {
-                let sum = select_summarizer(&st.paths, &cfg)?;
-                let kind = sum.kind();
-                (sum, kind)
+                select_summarizer(&st.paths, &cfg)?
             };
             let mut report = ultron_core::import::import_projects(
                 &st.db,
@@ -684,7 +706,12 @@ async fn dispatch(
                 dry_run,
             )
             .await?;
-            report.summarizer = kind.to_string();
+            // Gerçek çalıştırmada tür, yedek geçiş olduysa içe aktarma sonundaki özetleyiciden gelir.
+            report.summarizer = if dry_run {
+                summarizer_kind(&cfg).to_string()
+            } else {
+                report.summarizer.clone()
+            };
             ok(writer, json!({"report": report})).await?;
             Ok(Flow::Continue)
         }
@@ -1432,5 +1459,34 @@ mod tests {
 
         let disabled = select_summarizer(&paths, &config_with_agy(false)).unwrap();
         assert_eq!(disabled.kind(), "null");
+    }
+
+    #[test]
+    fn summarizer_mode_selects_engine_and_reports_kind() {
+        use ultron_core::config::SummarizerMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(tmp.path().join("ultron"));
+        paths.ensure().unwrap();
+        let with_mode = |mode: SummarizerMode, agy: bool| {
+            let mut cfg = config_with_agy(agy);
+            cfg.summarizer = mode;
+            cfg
+        };
+        // auto: agy birincil; yedek (claude-haiku) iç içe kurulur, tür agy'dir.
+        let auto = with_mode(SummarizerMode::Auto, true);
+        assert_eq!(select_summarizer(&paths, &auto).unwrap().kind(), "agy");
+        assert_eq!(summarizer_kind(&auto), "agy");
+        // auto + agy kapalı: özetleyici yok (Claude'a sessizce geçilmez).
+        let auto_off = with_mode(SummarizerMode::Auto, false);
+        assert_eq!(select_summarizer(&paths, &auto_off).unwrap().kind(), "null");
+        assert_eq!(summarizer_kind(&auto_off), "null");
+        let haiku = with_mode(SummarizerMode::ClaudeHaiku, false);
+        assert_eq!(select_summarizer(&paths, &haiku).unwrap().kind(), "claude-haiku");
+        assert_eq!(summarizer_kind(&haiku), "claude-haiku");
+        let agy_only = with_mode(SummarizerMode::Agy, true);
+        assert_eq!(select_summarizer(&paths, &agy_only).unwrap().kind(), "agy");
+        let off = with_mode(SummarizerMode::Off, true);
+        assert_eq!(select_summarizer(&paths, &off).unwrap().kind(), "null");
+        assert_eq!(summarizer_kind(&off), "null");
     }
 }

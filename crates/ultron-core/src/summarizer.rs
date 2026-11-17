@@ -1,11 +1,12 @@
 //! Çalışma durumu özetleyicisi. Özetleyici, sohbetin son mesajlarından hedef, sonraki adım,
 //! açık soru ve tamamlananları çıkarır. Varsayılan uygulama agy'yi salt okunur kipte ve
-//! `--json-schema` ile çağırır; motor enjekte edilebilir olduğu için testler gerçek CLI'a
-//! dokunmaz.
+//! `--json-schema` ile çağırır; agy kotaya takılırsa `auto` kipinde Claude Haiku'ya (araçsız)
+//! geçilir. Motor enjekte edilebilir olduğu için testler gerçek CLI'a dokunmaz.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -16,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{EngineConfig, EngineId};
 use crate::db::StoredEvent;
 use crate::engine::{
-    AgyEngine, Capabilities, CommandSpec, Engine, ToolPolicy, TurnOutcome, TurnRequest, run_turn,
+    AgyEngine, Capabilities, ClaudeEngine, CommandSpec, Engine, ToolPolicy, TurnOutcome,
+    TurnRequest, run_turn,
 };
 use crate::events::EngineEvent;
 use crate::handoff::conversation_messages;
@@ -35,6 +37,26 @@ const MESSAGE_CLIP_CHARS: usize = 500;
 pub const SUMMARY_SCHEMA: &str = r#"{"type":"object","properties":{"goal":{"type":["string","null"]},"next_step":{"type":["string","null"]},"open_questions":{"type":["array","null"],"items":{"type":"string"}},"done":{"type":["array","null"],"items":{"type":"string"}}},"additionalProperties":false}"#;
 
 const SUMMARY_CHAT: &str = "workstate-summary";
+
+/// Claude özetleyicisinin modeli (Claude Code takma adı).
+pub const HAIKU_MODEL: &str = "haiku";
+
+/// Özetleyici kotası doldu. `auto` kipi bu hatada yedek özetleyiciye geçer.
+#[derive(Debug)]
+pub struct SummaryQuotaError(String);
+
+impl std::fmt::Display for SummaryQuotaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SummaryQuotaError {}
+
+/// Hata bir özetleyici kota hatası mı?
+pub fn is_quota_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SummaryQuotaError>().is_some()
+}
 
 /// Özetleyicinin döndürdüğü yama. `None` alanlar mevcut değeri korur.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -93,21 +115,127 @@ impl Summarizer for AgySummarizer {
     }
 
     fn refresh<'a>(&'a self, state: &'a WorkState, recent: &'a [StoredEvent]) -> SummaryFuture<'a> {
+        Box::pin(run_summary(self.engine.as_ref(), &self.cwd, state, recent))
+    }
+}
+
+/// Özet turunu çalıştırır: zaman aşımı ve yapılandırılmış çıktı ayrıştırma. agy ve Claude
+/// özetleyicileri aynı yolu kullanır.
+async fn run_summary(
+    engine: &dyn Engine,
+    cwd: &Path,
+    state: &WorkState,
+    recent: &[StoredEvent],
+) -> Result<SummaryPatch> {
+    let req = TurnRequest {
+        chat_id: SUMMARY_CHAT.into(),
+        cwd: cwd.to_path_buf(),
+        prompt: build_prompt(state, recent),
+        resume_native_id: None,
+        tool_policy: ToolPolicy::ReadOnly,
+    };
+    let text = tokio::time::timeout(SUMMARY_TIMEOUT, collect_turn(engine, req))
+        .await
+        .map_err(|_| anyhow!("çalışma özeti zaman aşımına uğradı"))??;
+    parse_patch(&text)
+}
+
+/// Claude Haiku tabanlı özetleyici. Claude CLI `--model haiku` ile ve hiçbir araç açık
+/// olmadan (`--tools ""`) çalışır; çalışma dizini Ultron'un özetleyici dizinidir.
+pub struct ClaudeSummarizer {
+    engine: Box<dyn Engine>,
+    cwd: PathBuf,
+}
+
+impl ClaudeSummarizer {
+    /// Verilen motoru olduğu gibi kullanır (testlerde sahte motor verilir).
+    pub fn new(engine: Box<dyn Engine>, cwd: PathBuf) -> Self {
+        Self { engine, cwd }
+    }
+
+    /// Claude yapılandırmasından Haiku özetleyicisi kurar. Model sabitlenir; ek argümanlar ve
+    /// efor yok sayılır, yalnız binary yolu alınır. JSON sözleşmesi istemde verilir:
+    /// `--json-schema` kullanılmaz, çünkü Claude onu `StructuredOutput` sahte aracıyla uygular
+    /// ve Ultron politikası bilinmeyen aracı reddeder (canlı denemede doğrulandı).
+    pub fn haiku(cfg: &EngineConfig, cwd: PathBuf) -> Self {
+        let haiku_cfg = EngineConfig {
+            id: EngineId::Claude,
+            enabled: true,
+            binary: cfg.binary.clone(),
+            model: Some(HAIKU_MODEL.into()),
+            effort: None,
+            extra_args: Vec::new(),
+        };
+        let engine = NoToolsEngine::new(Box::new(ClaudeEngine::new(haiku_cfg)));
+        Self::new(Box::new(engine), cwd)
+    }
+
+    /// Verilen istem için motorun ürettiği komut (argv denetimi için; süreç başlatmaz).
+    pub fn command_spec(&self, prompt: &str) -> CommandSpec {
+        self.engine.command(&TurnRequest {
+            chat_id: SUMMARY_CHAT.into(),
+            cwd: self.cwd.clone(),
+            prompt: prompt.to_string(),
+            resume_native_id: None,
+            tool_policy: ToolPolicy::ReadOnly,
+        })
+    }
+}
+
+impl Summarizer for ClaudeSummarizer {
+    fn kind(&self) -> &'static str {
+        "claude-haiku"
+    }
+
+    fn refresh<'a>(&'a self, state: &'a WorkState, recent: &'a [StoredEvent]) -> SummaryFuture<'a> {
+        Box::pin(run_summary(self.engine.as_ref(), &self.cwd, state, recent))
+    }
+}
+
+/// Birincil özetleyici kota hatası verirse aynı çağrıyı yedeğe yönlendirir ve bu örneğin
+/// kalan ömrü boyunca yedeği kullanır (`auto` kipi). Diğer hatalar olduğu gibi döner.
+pub struct AutoSummarizer {
+    primary: Box<dyn Summarizer>,
+    fallback: Box<dyn Summarizer>,
+    fell_back: AtomicBool,
+}
+
+impl AutoSummarizer {
+    pub fn new(primary: Box<dyn Summarizer>, fallback: Box<dyn Summarizer>) -> Self {
+        Self {
+            primary,
+            fallback,
+            fell_back: AtomicBool::new(false),
+        }
+    }
+
+    /// Yedeğe geçilip geçilmediği.
+    pub fn fell_back(&self) -> bool {
+        self.fell_back.load(Ordering::SeqCst)
+    }
+}
+
+impl Summarizer for AutoSummarizer {
+    fn kind(&self) -> &'static str {
+        if self.fell_back() {
+            self.fallback.kind()
+        } else {
+            self.primary.kind()
+        }
+    }
+
+    fn refresh<'a>(&'a self, state: &'a WorkState, recent: &'a [StoredEvent]) -> SummaryFuture<'a> {
         Box::pin(async move {
-            let req = TurnRequest {
-                chat_id: SUMMARY_CHAT.into(),
-                cwd: self.cwd.clone(),
-                prompt: build_prompt(state, recent),
-                resume_native_id: None,
-                tool_policy: ToolPolicy::ReadOnly,
-            };
-            let text = tokio::time::timeout(
-                SUMMARY_TIMEOUT,
-                collect_turn(self.engine.as_ref(), req),
-            )
-            .await
-            .map_err(|_| anyhow!("çalışma özeti zaman aşımına uğradı"))??;
-            parse_patch(&text)
+            if !self.fell_back() {
+                match self.primary.refresh(state, recent).await {
+                    Ok(patch) => return Ok(patch),
+                    Err(err) if is_quota_error(&err) => {
+                        self.fell_back.store(true, Ordering::SeqCst);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            self.fallback.refresh(state, recent).await
         })
     }
 }
@@ -157,31 +285,40 @@ impl Engine for StructuredEngine {
 }
 
 /// Turu çalıştırır; `AssistantText` parçalarını birleştirir. Motor hata ya da kota olayı
-/// üretirse veya tur tamamlanmazsa hata döner.
+/// üretirse veya tur tamamlanmazsa hata döner. Kota hatası [`SummaryQuotaError`] olarak döner.
 async fn collect_turn(engine: &dyn Engine, req: TurnRequest) -> Result<String> {
     let (tx, mut rx) = mpsc::channel::<EngineEvent>(64);
     let run = run_turn(engine, req, tx, CancellationToken::new());
     let collect = async {
         let mut text = String::new();
         let mut failure: Option<String> = None;
+        let mut quota = false;
         while let Some(ev) = rx.recv().await {
             match ev {
                 EngineEvent::AssistantText { text: part } => text.push_str(&part),
-                EngineEvent::Error { message } | EngineEvent::QuotaExhausted { message, .. } => {
+                EngineEvent::QuotaExhausted { message, .. } => {
+                    quota = true;
+                    failure.get_or_insert(message);
+                }
+                EngineEvent::Error { message } => {
                     failure.get_or_insert(message);
                 }
                 _ => {}
             }
         }
-        (text, failure)
+        (text, failure, quota)
     };
-    let (outcome, (text, failure)) = tokio::join!(run, collect);
+    let (outcome, (text, failure, quota)) = tokio::join!(run, collect);
+    let quota_error = || {
+        anyhow::Error::new(SummaryQuotaError(format!(
+            "özetleyici için kota doldu{}",
+            reason_suffix(failure.as_deref())
+        )))
+    };
     match outcome? {
         TurnOutcome::Completed => {}
         TurnOutcome::Cancelled => bail!("özetleyici turu iptal edildi"),
-        TurnOutcome::QuotaExhausted => {
-            bail!("özetleyici için kota doldu{}", reason_suffix(failure.as_deref()))
-        }
+        TurnOutcome::QuotaExhausted => return Err(quota_error()),
         TurnOutcome::Failed {
             exit_code,
             stderr_excerpt,
@@ -192,10 +329,56 @@ async fn collect_turn(engine: &dyn Engine, req: TurnRequest) -> Result<String> {
             bail!("özetleyici turu başarısız oldu{}", reason_suffix(Some(&detail)))
         }
     }
+    if quota {
+        return Err(quota_error());
+    }
     if let Some(message) = failure {
         bail!("özetleyici hatası{}", reason_suffix(Some(&message)));
     }
     Ok(text)
+}
+
+/// Araç kısıtını kaldırır: `--tools` değeri boşaltılır (Claude'da `""` = hiçbir araç yok).
+/// Araç bayrağı yoksa boş bir `--tools ""` eklenir.
+struct NoToolsEngine {
+    inner: Box<dyn Engine>,
+}
+
+impl NoToolsEngine {
+    fn new(inner: Box<dyn Engine>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Engine for NoToolsEngine {
+    fn id(&self) -> EngineId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn command(&self, req: &TurnRequest) -> CommandSpec {
+        let mut spec = self.inner.command(req);
+        match spec.args.iter().position(|a| a == "--tools") {
+            Some(pos) if pos + 1 < spec.args.len() => spec.args[pos + 1].clear(),
+            _ => spec.args.extend(["--tools".into(), String::new()]),
+        }
+        spec
+    }
+
+    fn prepare_command(
+        &self,
+        req: &TurnRequest,
+        cmd: &mut tokio::process::Command,
+    ) -> Result<()> {
+        self.inner.prepare_command(req, cmd)
+    }
+
+    fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
+        self.inner.parse_line(line)
+    }
 }
 
 /// Hata nedeni son eki: tek satır, maskelenmiş, en çok 200 karakter; ham kullanıcı içeriği

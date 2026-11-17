@@ -112,3 +112,25 @@ fn engine(id: EngineId, model: Option<&str>, effort: Option<&str>) -> EngineConf
         extra_args: Vec::new(),
     }
 }
+
+#[test]
+fn summarizer_key_defaults_to_auto_and_parses_all_values() {
+    use ultron_core::config::SummarizerMode;
+    assert_eq!(Config::default().summarizer, SummarizerMode::Auto);
+    assert_eq!(toml::from_str::<Config>("").unwrap().summarizer, SummarizerMode::Auto);
+    for (text, mode) in [
+        ("auto", SummarizerMode::Auto),
+        ("agy", SummarizerMode::Agy),
+        ("claude-haiku", SummarizerMode::ClaudeHaiku),
+        ("none", SummarizerMode::Off),
+    ] {
+        let cfg: Config = toml::from_str(&format!("summarizer = \"{text}\"")).unwrap();
+        assert_eq!(cfg.summarizer, mode, "{text}");
+    }
+}
+
+#[test]
+fn summarizer_key_rejects_unknown_value() {
+    assert!(toml::from_str::<Config>("summarizer = \"gemini\"").is_err());
+    assert!(toml::from_str::<Config>("summarizer = \"Claude-Haiku\"").is_err());
+}
