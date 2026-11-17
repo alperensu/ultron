@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { describeBridgeError, type CatalogImportReport, type ImportReport } from "../lib/bridge";
+import { describeBridgeError, type CatalogImportReport, type ProjectImportReport } from "../lib/bridge";
 import { ENGINE_LABEL } from "../lib/format";
 import { useAppState, useStore } from "../state/store";
 import { CapsuleButton, GroupedList, LargeTitle, Row } from "../ui";
@@ -14,7 +14,7 @@ export function Settings() {
   const [statusError, setStatusError] = useState<string | null>(null);
   const [path, setPath] = useState("");
   const catalog = useImport<CatalogImportReport>();
-  const history = useImport<ImportReport>();
+  const history = useImport<ProjectImportReport>();
 
   useEffect(() => {
     let active = true;
@@ -91,13 +91,13 @@ export function Settings() {
               ) : null}
             </form>
           </GroupedList>
-          <GroupedList header="Claude Code geçmişini içe aktar" footer="Yerel Claude Code geçmişi artımlı olarak alınır; gizli bilgi desenleri maskelenir.">
+          <GroupedList header="Projeleri içe aktar" footer="Sohbetler alınmaz; yalnız proje klasörleri ve her projenin geçmiş notu alınır. Gizli bilgi desenleri maskelenir.">
             <div className="settings-import" aria-busy={history.pending}>
-              <p>Standart Claude Code geçmiş klasörü okunur.</p>
-              <CapsuleButton disabled={history.pending} onClick={() => void history.run(() => bridge.importClaudeHistory())}>
-                {history.pending ? "Geçmiş içe aktarılıyor…" : "Claude Code geçmişini içe aktar"}
+              <p>Claude Code ve Codex oturumlarından proje klasörleri bulunur.</p>
+              <CapsuleButton disabled={history.pending} onClick={() => void history.run(() => bridge.importProjects())}>
+                {history.pending ? "Projeler içe aktarılıyor…" : "Projeleri içe aktar"}
               </CapsuleButton>
-              {history.pending ? <p role="status">Dosyalar işleniyor; işlem bitince sonuç burada görünecek.</p> : null}
+              {history.pending ? <p role="status">Oturumlar işleniyor; işlem bitince sonuç burada görünecek.</p> : null}
               {history.error ? <p className="quota-error" role="alert">{history.error}</p> : null}
               {history.report ? <HistoryImportReport report={history.report} /> : null}
             </div>
@@ -108,16 +108,14 @@ export function Settings() {
   );
 }
 
-function HistoryImportReport({ report }: { report: ImportReport }) {
+function HistoryImportReport({ report }: { report: ProjectImportReport }) {
   return (
-    <div role="status" aria-label="Geçmiş içe aktarma sonucu">
-      <p>Geçmiş içe aktarıldı.</p>
+    <div role="status" aria-label="Proje içe aktarma sonucu">
+      <p>Projeler içe aktarıldı.</p>
       <dl className="settings-report">
-        <div><dt>Dosya</dt><dd>{report.files}</dd></div>
-        <div><dt>Sohbet</dt><dd>{report.chats}</dd></div>
-        <div><dt>Mesaj</dt><dd>{report.messages}</dd></div>
-        <div><dt>Atlanan</dt><dd>{report.skipped}</dd></div>
-        <div><dt>Maskelenen</dt><dd>{report.masked}</dd></div>
+        <div><dt>Proje</dt><dd>{report.rows.length}</dd></div>
+        <div><dt>Yeni proje</dt><dd>{report.created}</dd></div>
+        <div><dt>Güncellenen not</dt><dd>{report.notes_updated}</dd></div>
       </dl>
     </div>
   );

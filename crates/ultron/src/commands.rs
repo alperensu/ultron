@@ -55,6 +55,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: HistoryCmd,
     },
+    /// Proje ve geçmiş notu içe aktarma; sohbet içe aktarmaz.
+    Import {
+        #[command(subcommand)]
+        action: ImportCmd,
+    },
     /// Servis durumunu gösterir.
     Status,
     /// ultrond'u oturum açılışında başlatan görevi kurar ya da kaldırır.
@@ -72,6 +77,23 @@ pub enum HistoryCmd {
         chat: Option<String>,
         #[arg(long, default_value_t = 5)]
         limit: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum ImportCmd {
+    /// Claude/Codex oturumlarından proje klasörlerini bulur, projeleri oluşturur ve
+    /// "Şimdiye kadar yapılanlar" notunu yazar.
+    Projects {
+        /// Yalnız listeler: motor çağrılmaz, hiçbir şey yazılmaz.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Eski içe aktarıcının oluşturduğu sohbetleri (yedek alarak) siler.
+    RemoveChats {
+        /// Yalnız sayar: yedek ve silme yapılmaz.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -338,6 +360,30 @@ pub async fn run(cli: Cli) -> Result<()> {
                 _ => bail!("servis beklenmeyen yanıt verdi"),
             }
         }
+        Cmd::Import { action } => {
+            // Yönetim komutları onaylayıcı sırrıyla bağlanır; motorlar bu sırra erişemez.
+            let mut client = connect_approver().await?;
+            let request = match action {
+                ImportCmd::Projects { dry_run } => Request::ImportProjects {
+                    dry_run,
+                    home: None,
+                },
+                ImportCmd::RemoveChats { dry_run } => Request::RemoveImportedChats { dry_run },
+            };
+            client.send(&request).await?;
+            match client.next().await? {
+                Some(Response::Ok { data }) => {
+                    let report = &data["report"];
+                    match action {
+                        ImportCmd::Projects { .. } => print!("{}", render_project_report(report)),
+                        ImportCmd::RemoveChats { .. } => print!("{}", render_remove_report(report)),
+                    }
+                    Ok(())
+                }
+                Some(Response::Error { message }) => bail!("{message}"),
+                _ => bail!("servis beklenmeyen yanıt verdi"),
+            }
+        }
         Cmd::Status => {
             let mut client = connect_or_start().await?;
             client.send(&Request::Status).await?;
@@ -357,6 +403,66 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
     }
+}
+
+/// Onaylayıcı sırrıyla bağlanır (servis yoksa başlatılır).
+async fn connect_approver() -> Result<Client> {
+    let _ready = connect_or_start().await?;
+    let paths = Paths::resolve()?;
+    let secret = std::fs::read_to_string(ultron_core::ipc::approver_token_path(&paths))
+        .context("onaylayıcı sırrı okunamadı")?;
+    Client::connect(&ultron_core::ipc::pipe_name()?, secret.trim())
+        .await
+        .context("onaylayıcı bağlantısı kurulamadı")
+}
+
+/// `import projects` tablosu: yol, Claude/Codex/işçi oturum sayısı, not güncellendi mi.
+pub fn render_project_report(report: &Value) -> String {
+    let yes = |v: &Value| if v.as_bool() == Some(true) { "evet" } else { "hayır" };
+    let mut out = format!(
+        "{:<60} {:>7} {:>6} {:>5} {:<6} {}\n",
+        "PROJE YOLU", "CLAUDE", "CODEX", "ISCI", "NOT", "DURUM"
+    );
+    for row in report["rows"].as_array().cloned().unwrap_or_default() {
+        out.push_str(&format!(
+            "{:<60} {:>7} {:>6} {:>5} {:<6} {}\n",
+            clip(row["path"].as_str().unwrap_or("?"), 60),
+            row["claude_sessions"],
+            row["codex_sessions"],
+            row["worker_sessions"].as_u64().unwrap_or(0),
+            yes(&row["note_updated"]),
+            row["note_status"].as_str().unwrap_or(""),
+        ));
+    }
+    let dry = report["dry_run"].as_bool() == Some(true);
+    out.push_str(&format!(
+        "{} proje{}, {} yeni proje, {} not {}, {} eşleşmeyen oturum. Özetleyici: {}.\n",
+        report["rows"].as_array().map_or(0, Vec::len),
+        if dry { " (dry-run: hiçbir şey yazılmadı, motor çağrılmadı)" } else { "" },
+        report["created"],
+        report["notes_updated"],
+        if dry { "güncellenecek" } else { "güncellendi" },
+        report["unmatched_sessions"].as_u64().unwrap_or(0),
+        report["summarizer"].as_str().unwrap_or("?"),
+    ));
+    out
+}
+
+/// `import remove-chats` çıktısı.
+pub fn render_remove_report(report: &Value) -> String {
+    let dry = report["dry_run"].as_bool() == Some(true);
+    let mut out = format!(
+        "{} içe aktarılmış sohbet, {} olay {}.
+",
+        report["chats"],
+        report["events"],
+        if dry { "silinecek (dry-run: hiçbir şey yazılmadı)" } else { "silindi" },
+    );
+    if let Some(backup) = report["backup"].as_str() {
+        out.push_str(&format!("Yedek: {backup}
+"));
+    }
+    out
 }
 
 /// `service install|uninstall`: yalnız açıkça çağrıldığında `schtasks` çalıştırır.

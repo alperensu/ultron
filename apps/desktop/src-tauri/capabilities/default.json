@@ -22,7 +22,7 @@
     "allow-set-reset-rights",
     "allow-route-message",
     "allow-import-catalog",
-    "allow-import-claude-history",
+    "allow-import-projects",
     "allow-status"
   ]
 }

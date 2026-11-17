@@ -138,6 +138,35 @@ const MIGRATIONS: &[&str] = &[
         event_json TEXT NOT NULL
     );
     "#,
+    // v10: proje başına "Şimdiye kadar yapılanlar" geçmiş notu için yeni tablo.
+    r#"
+    CREATE TABLE project_notes (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id),
+        markdown TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        source_stamp INTEGER NOT NULL,
+        claude_sessions INTEGER NOT NULL,
+        codex_sessions INTEGER NOT NULL
+    );
+    "#,
+    // v11: NOT ekleyici. Aynı `path_key`li yinelenen proje satırlarını en küçük kimlikte
+    // birleştirir (sohbetler ve notlar ona taşınır, yinelenenler silinir), sonra `path_key`
+    // üzerinde benzersiz indeks kurar; notlara özetleyici türü sütunu eklenir.
+    r#"
+    ALTER TABLE project_notes ADD COLUMN summarizer TEXT NOT NULL DEFAULT '';
+    UPDATE chats SET project_id = (
+        SELECT MIN(p2.id) FROM projects p2
+        WHERE p2.path_key = (SELECT p1.path_key FROM projects p1 WHERE p1.id = chats.project_id))
+    WHERE project_id IN (
+        SELECT p.id FROM projects p WHERE p.path_key != ''
+          AND p.id != (SELECT MIN(q.id) FROM projects q WHERE q.path_key = p.path_key));
+    DELETE FROM project_notes WHERE project_id IN (
+        SELECT p.id FROM projects p WHERE p.path_key != ''
+          AND p.id != (SELECT MIN(q.id) FROM projects q WHERE q.path_key = p.path_key));
+    DELETE FROM projects WHERE path_key != ''
+      AND id != (SELECT MIN(q.id) FROM projects q WHERE q.path_key = projects.path_key);
+    CREATE UNIQUE INDEX projects_path_key_unique ON projects(path_key) WHERE path_key != '';
+    "#,
 ];
 
 /// Bekleyen migrasyonları `user_version` üzerinden sırayla uygular.
@@ -192,6 +221,32 @@ mod tests {
     }
 
     #[test]
+    fn v11_merges_duplicate_projects_moves_chats_and_adds_unique_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for (idx, sql) in MIGRATIONS.iter().take(10).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", (idx + 1) as i64).unwrap();
+        }
+        for id in ["b", "a"] {
+            conn.execute("INSERT INTO projects(id, name, path, path_key) VALUES (?1, 'p', 'C:/x', 'c:/x')", [id]).unwrap();
+        }
+        conn.execute("INSERT INTO projects(id, name, path, path_key) VALUES ('c', 'q', 'C:/y', 'c:/y')", []).unwrap();
+        conn.execute("INSERT INTO chats(id, project_id, title, created_at) VALUES ('k', 'b', 't', '2026-01-01T00:00:00Z')", []).unwrap();
+        conn.execute("INSERT INTO project_notes(project_id, markdown, updated_at, source_stamp, claude_sessions, codex_sessions) VALUES ('b', 'n', 'x', 1, 1, 0)", []).unwrap();
+        apply(&conn).unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM projects ORDER BY id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(ids, ["a", "c"]);
+        let owner: String = conn.query_row("SELECT project_id FROM chats WHERE id = 'k'", [], |r| r.get(0)).unwrap();
+        assert_eq!(owner, "a");
+        let notes: i64 = conn.query_row("SELECT COUNT(*) FROM project_notes", [], |r| r.get(0)).unwrap();
+        assert_eq!(notes, 0);
+        assert!(conn.execute("INSERT INTO projects(id, name, path, path_key) VALUES ('z', 'p', 'C:/X', 'c:/x')", []).is_err());
+    }
+
+    #[test]
     fn approvals_migration_preserves_v7_data_and_is_repeatable() {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -226,9 +281,10 @@ mod tests {
         apply(&conn).unwrap();
         apply(&conn).unwrap();
         let keys: Vec<String> = conn.prepare("SELECT path_key FROM projects ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(keys, ["c:/work/alpha", "c:/work/alpha", "c:/ödeme"]);
+        // v11 yinelenen satırı en küçük kimlikte (p1) birleştirir; sohbet p1'e taşınır.
+        assert_eq!(keys, ["c:/work/alpha", "c:/ödeme"]);
         let row: (String, String, String) = conn.query_row("SELECT path, aliases_json, project_id FROM projects JOIN chats ON projects.id = chats.project_id", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
-        assert_eq!(row, ("c:/work/alpha".into(), "[\"kept\"]".into(), "p2".into()));
+        assert_eq!(row, (r"C:\Work\Alpha\".into(), "[\"kept\"]".into(), "p1".into()));
         let state: (i64, i64, i64) = conn.query_row("SELECT byte_offset, file_size, generation FROM import_state", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         assert_eq!(state, (42, 42, 0));
     }

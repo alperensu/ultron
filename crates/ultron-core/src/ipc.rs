@@ -109,6 +109,19 @@ pub enum Request {
     ImportClaudeHistory {
         root: Option<String>,
     },
+    /// Projeleri bulur/oluşturur ve her projeye geçmiş notu yazar (sohbet içe aktarmaz).
+    /// `home`: `.claude`/`.codex` köklerinin bulunduğu dizin (varsayılan: kullanıcı profili).
+    ImportProjects {
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<String>,
+    },
+    /// Claude geçmişi içe aktarıcısının oluşturduğu sohbetleri yedek alarak siler.
+    RemoveImportedChats {
+        #[serde(default)]
+        dry_run: bool,
+    },
     Route {
         text: String,
     },
@@ -240,6 +253,47 @@ pub struct ImportReport {
     pub masked: usize,
 }
 
+/// `ImportProjects` satırı: bir proje klasörü.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectImportRow {
+    pub path: String,
+    pub name: String,
+    pub claude_sessions: usize,
+    pub codex_sessions: usize,
+    /// İşçi / alt ajan oturumları (Claude + Codex toplamı); not için kısaltılarak kullanılır.
+    #[serde(default)]
+    pub worker_sessions: usize,
+    /// Proje bu çalıştırmada oluşturuldu (dry-run'da: oluşturulacak).
+    pub project_created: bool,
+    /// Not bu çalıştırmada yazıldı (dry-run'da: yazılacak).
+    pub note_updated: bool,
+    /// "güncellendi", "güncel", "güncellenecek", "kaynak yok" veya hata metni.
+    pub note_status: String,
+}
+
+/// `ImportProjects` raporu.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectImportReport {
+    pub dry_run: bool,
+    pub rows: Vec<ProjectImportRow>,
+    pub created: usize,
+    pub notes_updated: usize,
+    pub summarizer: String,
+    /// Kapsayıcı klasör/ev dizini/çözülemeyen worktree nedeniyle hiçbir projeye atfedilemeyen oturumlar.
+    #[serde(default)]
+    pub unmatched_sessions: usize,
+}
+
+/// `RemoveImportedChats` raporu.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveChatsReport {
+    pub dry_run: bool,
+    pub chats: usize,
+    pub events: usize,
+    /// SQLite yedeğinin yolu (dry-run'da veya silinecek sohbet yoksa `None`).
+    pub backup: Option<String>,
+}
+
 // Token'ı günlüklere sızdırmamak için elle yazılmış Debug.
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -297,6 +351,8 @@ impl std::fmt::Debug for Request {
             Request::GetQuota => f.write_str("GetQuota"),
             Request::ImportCatalog { .. } => f.write_str("ImportCatalog"),
             Request::ImportClaudeHistory { .. } => f.write_str("ImportClaudeHistory"),
+            Request::ImportProjects { .. } => f.write_str("ImportProjects"),
+            Request::RemoveImportedChats { .. } => f.write_str("RemoveImportedChats"),
             Request::Route { .. } => f.write_str("Route"),
             Request::SetResetRights { pool, count } => f
                 .debug_struct("SetResetRights")

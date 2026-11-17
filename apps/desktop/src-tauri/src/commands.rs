@@ -79,6 +79,11 @@ struct HistoryImportEnvelope {
     report: ImportReport,
 }
 
+#[derive(Deserialize)]
+struct ProjectImportEnvelope {
+    report: ultron_core::ipc::ProjectImportReport,
+}
+
 /// Tür uyuşmazlıkları webview'e bozuk veri yerine `protocol` hatası olarak gider.
 fn decode<T: DeserializeOwned>(data: Value) -> Out<T> {
     serde_json::from_value(data).map_err(|e| BridgeError::Protocol {
@@ -443,6 +448,24 @@ pub async fn import_claude_history(b: Shared<'_>, args: HistoryArgs) -> Out<Impo
 
 pub async fn import_claude_history_impl(bridge: &Bridge, args: HistoryArgs) -> Out<ImportReport> {
     read_history_import(bridge, args.root).await
+}
+
+#[tauri::command]
+pub async fn import_projects(b: Shared<'_>) -> Out<ultron_core::ipc::ProjectImportReport> {
+    import_projects_impl(&b).await
+}
+
+/// `ImportProjects`: projeleri bulur ve geçmiş notlarını yazar; sohbet içe aktarmaz.
+pub async fn import_projects_impl(bridge: &Bridge) -> Out<ultron_core::ipc::ProjectImportReport> {
+    let data: ProjectImportEnvelope = request(
+        bridge,
+        Request::ImportProjects {
+            dry_run: false,
+            home: None,
+        },
+    )
+    .await?;
+    Ok(data.report)
 }
 
 #[tauri::command]

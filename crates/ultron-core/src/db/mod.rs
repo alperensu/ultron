@@ -103,6 +103,27 @@ pub(crate) struct ImportCheckpoint {
     pub session_cwd: Option<String>,
 }
 
+/// Projenin "Şimdiye kadar yapılanlar" notu ve artımlı güncelleme damgası.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectNote {
+    pub markdown: String,
+    pub updated_at: String,
+    /// Kaynak dosyaların en yeni değişiklik zamanı (ms); değişmediyse not yenilenmez.
+    pub source_stamp: i64,
+    pub claude_sessions: usize,
+    pub codex_sessions: usize,
+    /// Notu üreten özetleyicinin türü ("agy", "null"...); tür değişince not yenilenir.
+    pub summarizer: String,
+}
+
+/// İçe aktarıcının oluşturduğu sohbet koşulu (`chats` tablosu `c` takma adıyla).
+const IMPORTED_CHAT_PREDICATE: &str = "c.id LIKE 'claude-%'
+    AND NOT EXISTS (SELECT 1 FROM engine_sessions s WHERE s.chat_id = c.id)
+    AND EXISTS (SELECT 1 FROM events e WHERE e.chat_id = c.id)
+    AND NOT EXISTS (SELECT 1 FROM events e WHERE e.chat_id = c.id
+        AND (e.id NOT LIKE 'imp-%'
+             OR COALESCE(json_extract(e.payload_json, '$.source'), '') != 'claude-imported'))";
+
 pub(crate) fn normalized_project_path(path: &str) -> String {
     path.replace('\\', "/").trim_end_matches('/').to_lowercase()
 }
@@ -251,6 +272,183 @@ impl Db {
             Ok(p)
         })
         .transpose()
+    }
+
+    /// Yola (normalize edilmiş) göre proje bulur.
+    pub fn find_project_by_path(&self, path: &str) -> Result<Option<ProjectInfo>> {
+        let key = normalized_project_path(path);
+        let conn = self.conn()?;
+        let row = conn
+            .query_row(
+                "SELECT id, name, path, aliases_json, description, last_active_at
+                 FROM projects WHERE path_key = ?1 ORDER BY id LIMIT 1",
+                params![key],
+                Self::project_row,
+            )
+            .optional()?;
+        row.map(|(mut p, aliases)| {
+            p.aliases = serde_json::from_str(&aliases)?;
+            Ok(p)
+        })
+        .transpose()
+    }
+
+    /// Projenin geçmiş notunu okur.
+    pub fn get_project_note(&self, project_id: &str) -> Result<Option<ProjectNote>> {
+        let conn = self.conn()?;
+        Ok(conn
+            .query_row(
+                "SELECT markdown, updated_at, source_stamp, claude_sessions, codex_sessions, summarizer
+                 FROM project_notes WHERE project_id = ?1",
+                params![project_id],
+                |r| {
+                    Ok(ProjectNote {
+                        markdown: r.get(0)?,
+                        updated_at: r.get(1)?,
+                        source_stamp: r.get(2)?,
+                        claude_sessions: r.get::<_, i64>(3)?.max(0) as usize,
+                        codex_sessions: r.get::<_, i64>(4)?.max(0) as usize,
+                        summarizer: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Geçmiş notunu tek SQL ifadesiyle (atomik) yazar veya değiştirir.
+    pub fn put_project_note(&self, project_id: &str, note: &ProjectNote) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO project_notes(project_id, markdown, updated_at, source_stamp, claude_sessions, codex_sessions, summarizer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(project_id) DO UPDATE SET markdown = excluded.markdown,
+                updated_at = excluded.updated_at, source_stamp = excluded.source_stamp,
+                claude_sessions = excluded.claude_sessions, codex_sessions = excluded.codex_sessions,
+                summarizer = excluded.summarizer",
+            params![
+                project_id,
+                note.markdown,
+                note.updated_at,
+                note.source_stamp,
+                note.claude_sessions as i64,
+                note.codex_sessions as i64,
+                note.summarizer
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// İçe aktarıcının oluşturduğu sohbetler: kimlik `claude-` ile başlar, motor oturumu yoktur
+    /// ve en az bir olayı vardır; tüm olaylar `imp-` kimlikli ve `source = claude-imported`
+    /// işaretlidir. Ultron içinde açılan (uuid kimlikli, oturumlu) sohbetler bu kümeye girmez.
+    pub fn imported_chat_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT c.id FROM chats c WHERE {IMPORTED_CHAT_PREDICATE} ORDER BY c.id"
+        ))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Verilen sohbetlerden, işlem içinde koşul yeniden doğrulananları siler (olaylar, FTS
+    /// kayıtları, `work_state`, sohbet satırı). FTS tek taramayla toplu silinir.
+    /// `import_state` ofsetleri bilerek korunur: sonraki bir içe aktarma silinen sohbetleri
+    /// baştan diriltmez. Dönen: (sohbet, olay).
+    pub fn delete_imported_chats(&self, ids: &[String]) -> Result<(usize, usize)> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS del_chats(id TEXT PRIMARY KEY); DELETE FROM del_chats;",
+        )?;
+        for id in ids {
+            tx.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO del_chats(id)
+                     SELECT c.id FROM chats c WHERE c.id = ?1 AND {IMPORTED_CHAT_PREDICATE}"
+                ),
+                params![id],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM messages_fts WHERE chat_id IN (SELECT id FROM del_chats)",
+            [],
+        )?;
+        let events = tx.execute(
+            "DELETE FROM events WHERE chat_id IN (SELECT id FROM del_chats)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM work_state WHERE chat_id IN (SELECT id FROM del_chats)",
+            [],
+        )?;
+        let chats = tx.execute(
+            "DELETE FROM chats WHERE id IN (SELECT id FROM del_chats)",
+            [],
+        )?;
+        tx.execute_batch("DROP TABLE del_chats;")?;
+        tx.commit()?;
+        Ok((chats, events))
+    }
+
+    /// Veritabanının tutarlı bir kopyasını SQLite yedekleme API'siyle `dest`e yazar. Dosya
+    /// yalnız mevcut kullanıcıya açık oluşturulur ve `PRAGMA integrity_check` geçmezse silinir.
+    pub fn backup_to(&self, dest: &Path) -> Result<()> {
+        crate::ipc::sys::write_private_file(dest, &[])?;
+        let run = || -> Result<()> {
+            let conn = self.conn()?;
+            let mut dst = Connection::open(dest)
+                .with_context(|| format!("yedek dosyası açılamadı: {}", dest.display()))?;
+            {
+                let backup = rusqlite::backup::Backup::new(&conn, &mut dst)?;
+                backup.run_to_completion(256, std::time::Duration::from_millis(10), None)?;
+            }
+            // WAL yan dosyaları (varsayılan ACL ile) oluşmasın.
+            dst.pragma_update(None, "journal_mode", "DELETE")?;
+            let check: String = dst.pragma_query_value(None, "integrity_check", |r| r.get(0))?;
+            if check != "ok" {
+                return Err(anyhow!("yedek bütünlük denetimi başarısız: {check}"));
+            }
+            Ok(())
+        };
+        let result = run();
+        if result.is_err() {
+            let _ = std::fs::remove_file(dest);
+        }
+        result
+    }
+
+    /// Yola göre projeyi bulur, yoksa tek işlemde ekler. Dönen: (proje, yeni mi).
+    pub fn find_or_insert_project(&self, info: &ProjectInfo) -> Result<(ProjectInfo, bool)> {
+        let key = normalized_project_path(&info.path);
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT id, name, path, aliases_json, description, last_active_at
+                 FROM projects WHERE path_key = ?1 ORDER BY id LIMIT 1",
+                params![key],
+                Self::project_row,
+            )
+            .optional()?;
+        if let Some((mut p, aliases)) = existing {
+            p.aliases = serde_json::from_str(&aliases)?;
+            return Ok((p, false));
+        }
+        tx.execute(
+            "INSERT INTO projects(id, name, path, aliases_json, description, last_active_at, path_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                info.id,
+                info.name,
+                info.path,
+                serde_json::to_string(&info.aliases)?,
+                info.description,
+                info.last_active_at,
+                key,
+            ],
+        )?;
+        tx.commit()?;
+        Ok((info.clone(), true))
     }
 
     /// Tüm projeler: son etkinliğe göre yeniden eskiye, sonra ada göre.

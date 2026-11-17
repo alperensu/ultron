@@ -64,6 +64,7 @@ pub fn run() {
             commands::route_message,
             commands::import_catalog,
             commands::import_claude_history,
+            commands::import_projects,
             commands::status,
         ])
         .run(tauri::generate_context!())
