@@ -75,6 +75,210 @@ fn require_approver(auth: &ConnectionAuth) -> Result<()> {
     Ok(())
 }
 
+// Aynı masaüstünün iki penceresi birbirinin dosya işlemiyle yarışmaz.
+static TRASH_LOCK: Mutex<()> = Mutex::new(());
+static POLICY_LOCK: Mutex<()> = Mutex::new(());
+
+fn read_policy_table(paths: &Paths) -> Result<toml::Table> {
+    use std::io::Read;
+    use std::os::windows::fs::MetadataExt;
+    let path = paths.root.join("policy.toml");
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(toml::Table::new()),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(meta.is_file() && meta.file_attributes() & 0x400 == 0, "policy.toml düzenli bir dosya olmalı");
+    const MAX_POLICY_BYTES: u64 = 64 * 1024;
+    let mut text = String::new();
+    File::open(path)?.take(MAX_POLICY_BYTES + 1).read_to_string(&mut text)?;
+    anyhow::ensure!(text.len() as u64 <= MAX_POLICY_BYTES, "policy.toml çok büyük (en çok 64 KiB)");
+    text.parse().context("policy.toml çözümlenemedi")
+}
+
+fn policy_settings(table: &toml::Table) -> Result<ipc::PolicySettings> {
+    let config = toml::Value::Table(table.clone()).try_into()?;
+    let retention = match table.get("trash_retention_days") {
+        None => 30,
+        Some(value) => value.as_integer().and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| anyhow!("geçersiz çöp saklama süresi"))?,
+    };
+    Ok(ipc::PolicySettings { config, trash_retention_days: retention })
+}
+
+fn get_policy_settings(paths: &Paths) -> Result<ipc::PolicySettings> {
+    let _guard = POLICY_LOCK.lock().map_err(|_| anyhow!("politika kilidi zehirlendi"))?;
+    policy_settings(&read_policy_table(paths)?)
+}
+
+fn set_policy_settings(paths: &Paths, settings: ipc::PolicySettings) -> Result<ipc::PolicySettings> {
+    use std::io::Write;
+    let _guard = POLICY_LOCK.lock().map_err(|_| anyhow!("politika kilidi zehirlendi"))?;
+    anyhow::ensure!((1..=3650).contains(&settings.trash_retention_days), "saklama süresi 1–3650 gün olmalı");
+    for list in [&settings.config.finance_paths, &settings.config.protected_paths] {
+        anyhow::ensure!(list.len() <= 128, "en çok 128 yol girilebilir");
+        for path in list {
+            let text = path.to_string_lossy();
+            reject_remote_path(&text)?;
+            anyhow::ensure!(path.is_absolute() && text.len() <= 4096 && !text.chars().any(char::is_control), "geçersiz mutlak politika yolu");
+        }
+    }
+    let mut table = read_policy_table(paths)?;
+    let current = policy_settings(&table)?;
+    anyhow::ensure!(settings.config.deploy_patterns == current.config.deploy_patterns && settings.config.allow_list == current.config.allow_list,
+        "salt okunur kurallar değişmiş; ayarları yeniden yükle");
+    let mut config = toml::Value::try_from(&settings.config)?.try_into::<toml::Table>()?;
+    // Bilinmeyen alanlar ve arayüzün düzenleyemediği kurallar korunur.
+    for name in ["finance_paths", "protected_paths"] {
+        table.insert(name.into(), config.remove(name).context("politika alanı eksik")?);
+    }
+    table.insert("trash_retention_days".into(), i64::from(settings.trash_retention_days).into());
+    let text = toml::to_string(&table)?;
+    anyhow::ensure!(text.len() <= 64 * 1024, "politika ayarları çok büyük");
+    let tmp = paths.root.join(format!("policy.toml.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, paths.root.join("policy.toml"))?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result?;
+    policy_settings(&table)
+}
+
+const TRASH_PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Ayarlı saklama süresini aşan çöp kayıtlarını siler. Süre 1–3650 dışındaysa (0, bozuk ayar)
+/// temizlik kapalı sayılır ve `None` döner; hiçbir şey silinmez.
+fn purge_expired_trash(paths: &Paths, now: chrono::DateTime<chrono::Utc>) -> Result<Option<usize>> {
+    let days = get_policy_settings(paths)?.trash_retention_days;
+    if !(1..=3650).contains(&days) {
+        return Ok(None);
+    }
+    ultron_core::trash::Trash::new(paths).purge_expired(days, now).map(Some)
+}
+
+/// Başlangıçta bir kez, sonra her 6 saatte bir süresi dolmuş çöp kayıtlarını temizler.
+async fn trash_retention_loop(paths: Paths, cancel: CancellationToken) {
+    loop {
+        let p = paths.clone();
+        match tokio::task::spawn_blocking(move || purge_expired_trash(&p, chrono::Utc::now())).await {
+            Ok(Ok(Some(count))) => tracing::info!(count, "süresi dolan çöp kayıtları silindi"),
+            Ok(Ok(None)) => tracing::info!("çöp saklama süresi geçersiz veya kapalı; temizlik atlandı"),
+            Ok(Err(error)) => tracing::warn!(error = %error, "çöp temizliği başarısız"),
+            Err(error) => tracing::warn!(error = %error, "çöp temizliği görevi çöktü"),
+        }
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            () = tokio::time::sleep(TRASH_PURGE_INTERVAL) => {}
+        }
+    }
+}
+
+fn purge_trash_entry(paths: &Paths, id: &str) -> Result<()> {
+    // `list` UUID, kök/ata, meta, tüm alt yolların reparse durumu ve boyutunu doğrular.
+    let trash = ultron_core::trash::Trash::new(paths);
+    anyhow::ensure!(trash.list()?.iter().any(|entry| entry.id == id), "çöp kaydı bulunamadı");
+    let root = std::fs::canonicalize(paths.root.join("trash"))?;
+    let slot = root.join(id);
+    anyhow::ensure!(std::fs::canonicalize(&slot)?.parent() == Some(root.as_path()), "çöp kökü dışı silme reddedildi");
+    // Original_path hiçbir zaman silme hedefi değildir.
+    std::fs::remove_dir_all(slot)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod desktop_management_tests {
+    use super::*;
+
+    #[test]
+    fn policy_settings_roundtrip_preserves_other_rules_and_unknown_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(tmp.path().join("ultron"));
+        paths.ensure().unwrap();
+        std::fs::write(paths.root.join("policy.toml"),
+            "deploy_patterns = ['example-deploy']\nallow_list = ['git status']\nfuture_setting = 'keep'\n").unwrap();
+        let mut settings = get_policy_settings(&paths).unwrap();
+        assert_eq!(settings.trash_retention_days, 30);
+        settings.config.finance_paths = vec![tmp.path().join("finance")];
+        settings.config.protected_paths = vec![tmp.path().join("protected")];
+        settings.trash_retention_days = 45;
+        assert_eq!(set_policy_settings(&paths, settings.clone()).unwrap(), settings);
+        assert_eq!(get_policy_settings(&paths).unwrap(), settings);
+        assert_eq!(read_policy_table(&paths).unwrap()["future_setting"].as_str(), Some("keep"));
+        settings.config.allow_list.push("example forbidden edit".into());
+        assert!(set_policy_settings(&paths, settings).is_err());
+    }
+
+    #[test]
+    fn policy_settings_reject_invalid_paths_retention_and_corrupt_file_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(tmp.path().join("ultron"));
+        paths.ensure().unwrap();
+        let mut settings = get_policy_settings(&paths).unwrap();
+        settings.trash_retention_days = 0;
+        assert!(set_policy_settings(&paths, settings.clone()).is_err());
+        settings.trash_retention_days = 30;
+        settings.config.protected_paths.push("relative".into());
+        assert!(set_policy_settings(&paths, settings.clone()).is_err());
+        assert!(!paths.root.join("policy.toml").exists());
+        std::fs::write(paths.root.join("policy.toml"), "[invalid").unwrap();
+        settings.config.protected_paths.clear();
+        assert!(get_policy_settings(&paths).is_err());
+        assert!(set_policy_settings(&paths, settings).is_err());
+        assert_eq!(std::fs::read_to_string(paths.root.join("policy.toml")).unwrap(), "[invalid");
+    }
+
+    #[test]
+    fn expired_trash_is_purged_with_configured_retention_and_disabled_when_invalid() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(home.path().join("ultron"));
+        paths.ensure().unwrap();
+        let file = home.path().join("old.txt");
+        std::fs::write(&file, "x").unwrap();
+        let trash = ultron_core::trash::Trash::new(&paths);
+        trash.put(&file, None).unwrap();
+        let future = chrono::Utc::now() + chrono::Duration::days(40);
+        // 60 gün saklama: 40 gün sonra kayıt henüz dolmamış (sahte saat).
+        let mut settings = get_policy_settings(&paths).unwrap();
+        settings.trash_retention_days = 60;
+        set_policy_settings(&paths, settings).unwrap();
+        assert_eq!(purge_expired_trash(&paths, future).unwrap(), Some(0));
+        assert_eq!(trash.list().unwrap().len(), 1);
+        std::fs::write(paths.root.join("policy.toml"), "trash_retention_days = 0
+").unwrap();
+        assert_eq!(purge_expired_trash(&paths, future).unwrap(), None);
+        assert_eq!(trash.list().unwrap().len(), 1);
+        std::fs::write(paths.root.join("policy.toml"), "trash_retention_days = 30
+").unwrap();
+        assert_eq!(purge_expired_trash(&paths, future).unwrap(), Some(1));
+        assert!(trash.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn trash_purge_validates_id_and_deletes_only_selected_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(tmp.path().join("ultron"));
+        paths.ensure().unwrap();
+        let first = tmp.path().join("first.txt");
+        let second = tmp.path().join("second.txt");
+        std::fs::write(&first, "synthetic first").unwrap();
+        std::fs::write(&second, "synthetic second").unwrap();
+        let trash = ultron_core::trash::Trash::new(&paths);
+        let a = trash.put(&first, None).unwrap();
+        let b = trash.put(&second, None).unwrap();
+        assert!(purge_trash_entry(&paths, "..").is_err());
+        purge_trash_entry(&paths, &a.id).unwrap();
+        assert!(!paths.root.join("trash").join(a.id).exists());
+        assert_eq!(trash.list().unwrap(), vec![b.clone()]);
+        let restored = trash.restore(&b.id, None).unwrap();
+        assert_eq!(std::fs::read_to_string(restored).unwrap(), "synthetic second");
+    }
+}
+
 fn reject_remote_path(path: &str) -> Result<()> {
     if ultron_core::import::discovery::is_remote_or_verbatim(path) {
         return Err(anyhow!("UNC ve verbatim biçimli yollar kabul edilmez"));
@@ -257,6 +461,7 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
     });
 
     let cancel = CancellationToken::new();
+    tokio::spawn(trash_retention_loop(paths.clone(), cancel.clone()));
     let loop_cancel = cancel.clone();
     let loop_name = pipe_name.clone();
     let task = tokio::spawn(async move {
@@ -616,6 +821,43 @@ async fn dispatch(
     cancel: &CancellationToken,
 ) -> Result<Flow> {
     match request {
+        Request::TrashList => {
+            require_approver(auth)?;
+            let entries = {
+                let _guard = TRASH_LOCK.lock().map_err(|_| anyhow!("çöp kilidi zehirlendi"))?;
+                ultron_core::trash::Trash::new(&st.paths).list()?
+            };
+            ok(writer, json!({"entries": entries})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::TrashRestore { id } => {
+            require_approver(auth)?;
+            let path = {
+                let _guard = TRASH_LOCK.lock().map_err(|_| anyhow!("çöp kilidi zehirlendi"))?;
+                ultron_core::trash::Trash::new(&st.paths).restore(&id, None)?
+            };
+            ok(writer, json!({"path": path})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::TrashPurge { id } => {
+            require_approver(auth)?;
+            {
+                let _guard = TRASH_LOCK.lock().map_err(|_| anyhow!("çöp kilidi zehirlendi"))?;
+                purge_trash_entry(&st.paths, &id)?;
+            }
+            ok(writer, json!({"id": id})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::GetPolicyConfig => {
+            require_approver(auth)?;
+            ok(writer, serde_json::to_value(get_policy_settings(&st.paths)?)?).await?;
+            Ok(Flow::Continue)
+        }
+        Request::SetPolicyConfig { settings } => {
+            require_approver(auth)?;
+            ok(writer, serde_json::to_value(set_policy_settings(&st.paths, settings)?)?).await?;
+            Ok(Flow::Continue)
+        }
         Request::PolicyCheck {
             action,
             chat_id,

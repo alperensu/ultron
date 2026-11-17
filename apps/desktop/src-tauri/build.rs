@@ -2,6 +2,13 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "list_approvals",
+            "resolve_approval",
+            "list_trash",
+            "restore_trash",
+            "purge_trash",
+            "get_policy_config",
+            "set_policy_config",
             "list_projects",
             "list_chats",
             "get_chat",

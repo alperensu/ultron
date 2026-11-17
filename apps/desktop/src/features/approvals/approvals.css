@@ -1,0 +1,19 @@
+.approval-inbox, .policy-form, .trash-list { padding: 16px; display: grid; gap: 12px; min-width: 0; }
+.approval-card { background: var(--ter); border-radius: var(--r-group); padding: 16px; display: grid; gap: 12px; min-width: 0; }
+.approval-card__head, .approval-card__meta, .approval-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.approval-card__head { justify-content: space-between; }
+.approval-card h3 { font-size: var(--fs-headline); }
+.approval-card p, .approval-card__summary { overflow-wrap: anywhere; }
+.approval-card__head > span, .approval-card__meta, .approval-feedback { color: var(--l2); font-size: var(--fs-footnote); }
+.approval-feedback:empty { display: none; }
+.approval-card__summary { font: var(--fs-footnote)/1.5 var(--font-mono); margin: 0; white-space: pre-wrap; max-height: 160px; overflow: auto; }
+.approval-card__meta button { color: var(--blue); padding: 8px 0; }
+.policy-form label { display: grid; gap: 6px; }
+.policy-form textarea, .policy-form input { background: var(--ter); border: 1px solid var(--sep); border-radius: var(--r-group); padding: 12px; width: 100%; }
+.policy-form textarea { min-height: 90px; resize: vertical; font-family: var(--font-mono); }
+.policy-form small, .trash-entry small, .policy-help { color: var(--l2); font-size: var(--fs-footnote); }
+.trash-entry { display: grid; gap: 10px; border-bottom: 1px solid var(--sep); padding-block: 12px; min-width: 0; }
+.trash-entry__path { overflow-wrap: anywhere; }
+.policy-notice { color: var(--orange); white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-count { background: var(--orange); color: var(--bg); border-radius: var(--r-pill); padding: 2px 7px; font-size: var(--fs-footnote); }
+@media (max-width: 600px) { .approval-inbox, .policy-form, .trash-list { padding: 12px; } .approval-card { padding: 12px; } }

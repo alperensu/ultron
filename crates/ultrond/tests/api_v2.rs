@@ -277,6 +277,11 @@ fn variant_name(r: &Request) -> &'static str {
         Request::PolicyCheck { .. } => "policy_check",
         Request::ListApprovals { .. } => "list_approvals",
         Request::ResolveApproval { .. } => "resolve_approval",
+        Request::TrashList => "trash_list",
+        Request::TrashRestore { .. } => "trash_restore",
+        Request::TrashPurge { .. } => "trash_purge",
+        Request::GetPolicyConfig => "get_policy_config",
+        Request::SetPolicyConfig { .. } => "set_policy_config",
     }
 }
 
@@ -322,6 +327,16 @@ async fn every_request_variant_is_implemented() {
         },
         Request::ListApprovals { status: None, limit: None, cursor: None },
         Request::ResolveApproval { id: "olmayan-onay".into(), approve: true, by: "desktop".into() },
+        Request::TrashList,
+        Request::TrashRestore { id: "olmayan-cop".into() },
+        Request::TrashPurge { id: "olmayan-cop".into() },
+        Request::GetPolicyConfig,
+        Request::SetPolicyConfig {
+            settings: ultron_core::ipc::PolicySettings {
+                config: ultron_core::policy::PolicyConfig::default(),
+                trash_retention_days: 30,
+            },
+        },
     ];
     let mut seen = std::collections::BTreeSet::new();
     for req in requests {
@@ -333,6 +348,6 @@ async fn every_request_variant_is_implemented() {
             assert!(!message.contains("henüz uygulanmadı"), "{req:?}: {message}");
         }
     }
-    assert_eq!(seen.len(), 21, "her varyant denenmeli: {seen:?}");
+    assert_eq!(seen.len(), 26,"her varyant denenmeli: {seen:?}");
     h.shutdown().await;
 }

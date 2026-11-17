@@ -4,6 +4,13 @@
   "description": "Ana pencere: çekirdek izinler, özel başlık çubuğu için pencere düğmeleri ve ultrond köprü komutları. fs/shell/http/dialog eklentisi yok.",
   "windows": ["main"],
   "permissions": [
+    "allow-list-approvals",
+    "allow-resolve-approval",
+    "allow-list-trash",
+    "allow-restore-trash",
+    "allow-purge-trash",
+    "allow-get-policy-config",
+    "allow-set-policy-config",
     "core:default",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",

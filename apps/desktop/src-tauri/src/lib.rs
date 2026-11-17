@@ -50,6 +50,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::list_approvals,
+            commands::resolve_approval,
+            commands::list_trash,
+            commands::restore_trash,
+            commands::purge_trash,
+            commands::get_policy_config,
+            commands::set_policy_config,
             commands::list_projects,
             commands::list_chats,
             commands::get_chat,

@@ -144,9 +144,49 @@ export interface SendRequest {
   text: string;
   engine?: EngineId;
   project_id?: string;
+  elevated?: boolean;
+}
+
+export type ApprovalStatus = "pending" | "approved" | "denied" | "expired";
+export type RiskCategory = "Delete" | "GitHistory" | "Deploy" | "Finance" | "Secrets" | "Install" | "SystemConfig" | "Publish";
+/** Servisin maskelediği kalıcı kayıt; onaylayıcı sırrı bu sözleşmenin parçası değildir. */
+export interface Approval {
+  id: string;
+  chat_id: string | null;
+  engine: EngineId;
+  category: RiskCategory;
+  reason: string;
+  action_json: string;
+  status: ApprovalStatus;
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: "desktop" | "telegram" | "approver" | "timeout" | "restart" | null;
+}
+export interface ApprovalPage { approvals: Approval[]; next_cursor: string | null }
+export interface PolicyConfig {
+  finance_paths: string[];
+  protected_paths: string[];
+  deploy_patterns: string[];
+  allow_list: string[];
+}
+export interface PolicySettings { config: PolicyConfig; trash_retention_days: number }
+export interface TrashEntry {
+  id: string;
+  original_path: string;
+  deleted_at: string;
+  chat_id: string | null;
+  size: number;
+  is_dir: boolean;
 }
 
 export interface Bridge {
+  listApprovals(args?: { status?: ApprovalStatus; cursor?: string; limit?: number }): Promise<ApprovalPage>;
+  resolveApproval(id: string, approve: boolean): Promise<{ approval: Approval }>;
+  getPolicyConfig(): Promise<PolicySettings>;
+  setPolicyConfig(settings: PolicySettings): Promise<PolicySettings>;
+  listTrash(): Promise<{ entries: TrashEntry[] }>;
+  restoreTrash(id: string): Promise<{ path: string }>;
+  purgeTrash(id: string): Promise<{ id: string }>;
   listProjects(): Promise<{ projects: ProjectInfo[] }>;
   listChats(args?: { project_id?: string; include_archived?: boolean }): Promise<{ chats: ChatInfo[] }>;
   getChat(chatId: string): Promise<ChatDetail>;
@@ -233,6 +273,13 @@ export function createTauriBridge(): Bridge {
     return listen<T>(name, (e) => handler(e.payload));
   };
   return {
+    listApprovals: (args = {}) => call("list_approvals", args),
+    resolveApproval: (id, approve) => call("resolve_approval", { id, approve }),
+    getPolicyConfig: () => call("get_policy_config"),
+    setPolicyConfig: (settings) => call("set_policy_config", { settings }),
+    listTrash: () => call("list_trash"),
+    restoreTrash: (id) => call("restore_trash", { id }),
+    purgeTrash: (id) => call("purge_trash", { id }),
     listProjects: () => call("list_projects"),
     listChats: (args = {}) => call("list_chats", { include_archived: false, ...args }),
     getChat: (chat_id) => call("get_chat", { chat_id }),
@@ -256,6 +303,9 @@ export function createTauriBridge(): Bridge {
 // --- Sahte köprü (yalnız testler ve /__ui) ---
 
 export interface FakeBridgeOptions {
+  approvals?: Approval[];
+  policySettings?: PolicySettings;
+  trash?: TrashEntry[];
   projects?: ProjectInfo[];
   chats?: ChatInfo[];
   events?: StoredEvent[];
@@ -279,6 +329,8 @@ export interface FakeBridgeOptions {
 }
 
 export interface FakeBridge extends Bridge {
+  /** Sentetik kuyruğa kayıt ekleyip gerçek akışla aynı uyandırma olayını yayınlar. */
+  addApproval(approval: Approval): void;
   /** Canlı olay yayar (test sürücüsü). */
   emit(ev: StoredEvent): void;
   emitDaemonState(state: DaemonState): void;
@@ -288,6 +340,11 @@ export interface FakeBridge extends Bridge {
 }
 
 export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
+  const approvals = new Map((opts.approvals ?? []).map((item) => [item.id, structuredClone(item)]));
+  let policySettings = structuredClone(opts.policySettings ?? {
+    config: { finance_paths: [], protected_paths: [], deploy_patterns: [], allow_list: [] }, trash_retention_days: 30,
+  });
+  const trash = new Map((opts.trash ?? []).map((item) => [item.id, structuredClone(item)]));
   const quota = opts.quota ? structuredClone(opts.quota) : undefined;
   let saved: { version: 1; chats: ChatInfo[]; events: StoredEvent[] } | undefined;
   if (opts.persistenceKey) {
@@ -320,6 +377,11 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
   let streamTimer: ReturnType<typeof setTimeout> | undefined;
   let streamStarted = false;
   const emit = (event: StoredEvent) => {
+    if (event.kind === "approval_resolved" && typeof event.payload === "object" && event.payload !== null) {
+      const payload = event.payload as { approval_id?: string; status?: ApprovalStatus };
+      const approval = payload.approval_id ? approvals.get(payload.approval_id) : undefined;
+      if (approval && payload.status) approval.status = payload.status;
+    }
     events.push(event);
     trackTurn(event);
     persist();
@@ -367,6 +429,54 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
     return c;
   };
   return {
+    addApproval: (approval) => {
+      approvals.set(approval.id, structuredClone(approval));
+      append(approval.chat_id ?? "", "approval_requested", { approval_id: approval.id, category: approval.category, reason: approval.reason, summary: approval.action_json });
+    },
+    listApprovals: (args = {}) => run("list_approvals", [args], () => {
+      const all = [...approvals.values()].filter((item) => !args.status || item.status === args.status)
+        .sort((a, b) => a.id.localeCompare(b.id));
+      const start = args.cursor ? all.findIndex((item) => item.id > args.cursor!) : 0;
+      const page = start < 0 ? [] : all.slice(start, start + Math.max(1, Math.min(32, args.limit ?? 32)));
+      return { approvals: structuredClone(page), next_cursor: start >= 0 && start + page.length < all.length ? page.at(-1)!.id : null };
+    }),
+    resolveApproval: (id, approve) => run("resolve_approval", [id, approve], () => {
+      const item = approvals.get(id);
+      if (!item) throw { kind: "daemon", message: "Onay bulunamadı." } satisfies BridgeError;
+      if (item.status !== "pending") throw { kind: "daemon", message: "Onay zaten çözüldü." } satisfies BridgeError;
+      if (Date.now() >= Date.parse(item.created_at) + 300_000) {
+        item.status = "expired";
+        append(item.chat_id ?? "", "approval_resolved", { approval_id: id, status: "expired", by: "timeout" });
+        throw { kind: "daemon", message: "Onay süresi doldu." } satisfies BridgeError;
+      }
+      item.status = approve ? "approved" : "denied";
+      item.resolved_at = new Date().toISOString();
+      item.resolved_by = "approver";
+      append(item.chat_id ?? "", "approval_resolved", { approval_id: id, status: item.status, by: "approver" });
+      return { approval: structuredClone(item) };
+    }),
+    getPolicyConfig: () => run("get_policy_config", [], () => structuredClone(policySettings)),
+    setPolicyConfig: (settings) => run("set_policy_config", [settings], () => {
+      if (!Number.isInteger(settings.trash_retention_days) || settings.trash_retention_days < 1 || settings.trash_retention_days > 3650) {
+        throw { kind: "daemon", message: "Saklama süresi 1–3650 gün olmalı." } satisfies BridgeError;
+      }
+      if (JSON.stringify(settings.config.deploy_patterns) !== JSON.stringify(policySettings.config.deploy_patterns) || JSON.stringify(settings.config.allow_list) !== JSON.stringify(policySettings.config.allow_list)) {
+        throw { kind: "daemon", message: "Salt okunur kurallar değişmiş; ayarları yeniden yükle." } satisfies BridgeError;
+      }
+      policySettings = structuredClone(settings);
+      return structuredClone(policySettings);
+    }),
+    listTrash: () => run("list_trash", [], () => ({ entries: structuredClone([...trash.values()]) })),
+    restoreTrash: (id) => run("restore_trash", [id], () => {
+      const item = trash.get(id);
+      if (!item) throw { kind: "daemon", message: "Çöp kaydı bulunamadı." } satisfies BridgeError;
+      trash.delete(id);
+      return { path: item.original_path };
+    }),
+    purgeTrash: (id) => run("purge_trash", [id], () => {
+      if (!trash.delete(id)) throw { kind: "daemon", message: "Çöp kaydı bulunamadı." } satisfies BridgeError;
+      return { id };
+    }),
     calls,
     emit,
     dispose: () => {

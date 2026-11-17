@@ -6,6 +6,8 @@ import { useAppState, type CompletedTurn } from "../state/store";
 import { EmptyState, GroupedList, LargeTitle, QuotaRing, Row } from "../ui";
 import { Page, poolName } from "./Page";
 import { tightestWindow } from "./quota";
+import { ApprovalInbox } from "../features/approvals/ApprovalInbox";
+import { useApprovals } from "../features/approvals/ApprovalProvider";
 
 /** Gösterilen "Sen yokken" satırı üst sınırı; fazlası sayıyla belirtilir. */
 const MAX_TURN_ROWS = 20;
@@ -25,12 +27,20 @@ export function Today() {
       {(progress) => (
         <>
           <LargeTitle title="Bugün" summary={summaryLine(turns.length, running)} progress={progress} />
+          <TodayApprovals />
           <AwayTurns turns={turns} />
           <QuotaStrip />
         </>
       )}
     </Page>
   );
+}
+
+/** "Seni bekleyen" yalnız bekleyen onay, yeni verilmiş bir karar veya görünür hata varken çıkar; boş sahte bölüm yok. */
+function TodayApprovals() {
+  const { pending, feedback, error } = useApprovals();
+  if (pending.length === 0 && !feedback && !error) return null;
+  return <ApprovalInbox />;
 }
 
 function AwayTurns({ turns }: { turns: CompletedTurn[] }) {

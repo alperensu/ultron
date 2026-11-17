@@ -1,10 +1,12 @@
-import type { EngineId, StoredEvent } from "../../lib/bridge";
+import type { ApprovalStatus, EngineId, StoredEvent } from "../../lib/bridge";
 import { ENGINE_LABEL } from "../../lib/format";
+import { riskLabel } from "../approvals/labels";
 
 export type ChatRow =
   | { id: string; type: "user" | "assistant"; text: string }
   | { id: string; type: "work"; events: StoredEvent[]; startedAt: string; finishedAt: string }
-  | { id: string; type: "system"; tone: "engine" | "quota" | "error"; text: string };
+  | { id: string; type: "approval"; approvalId: string; status: ApprovalStatus }
+  | { id: string; type: "system"; tone: "engine" | "quota" | "error" | "policy"; text: string };
 
 export interface ChatSnapshot {
   rows: ChatRow[];
@@ -96,6 +98,18 @@ export function createChatTimeline(initialEngine: EngineId | null = null) {
           id: event.id, type: "system", tone: "engine",
           text: `Motor değişti: ${from ? ENGINE_LABEL[from] : "Önceki motor"} → ${to ? ENGINE_LABEL[to] : "Bilinmiyor"}${reason === "quota" ? " · kota nedeniyle" : reason === "error" ? " · hata nedeniyle" : " · isteğinle"}`,
         });
+      } else if (event.kind === "approval_requested") {
+        rows.push({ id: event.id, type: "approval", approvalId: field(event, "approval_id"), status: "pending" });
+      } else if (event.kind === "policy_violation") {
+        rows.push({ id: event.id, type: "system", tone: "policy",
+          text: `Güvenlik kuralı ihlali · ${riskLabel(field(event, "category"))}\nGerçekleşmiş riskli işlem: ${field(event, "command")}\nBu bildirim işlemi geri almaz. Sonucu kontrol et.` });
+      } else if (event.kind === "approval_resolved") {
+        const status = field(event, "status");
+        const existing = rows.findIndex((row) => row.type === "approval" && row.approvalId === field(event, "approval_id"));
+        const row = rows[existing];
+        if (row?.type === "approval" && (status === "approved" || status === "denied" || status === "expired")) {
+          rows[existing] = { ...row, status };
+        } else rows.push({ id: event.id, type: "system", tone: "policy", text: status === "approved" ? "İşlem onaylandı." : status === "denied" ? "İşlem reddedildi." : "Onayın süresi doldu." });
       } else if (event.kind === "quota_exhausted" || event.kind === "error") {
         rows.push({
           id: event.id, type: "system", tone: event.kind === "error" ? "error" : "quota",

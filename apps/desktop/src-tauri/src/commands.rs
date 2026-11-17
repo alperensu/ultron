@@ -14,6 +14,8 @@ use ultron_core::ipc::{
 use ultron_core::quota::QuotaReport;
 
 use crate::bridge::{Bridge, BridgeError};
+use ultron_core::db::approvals::{Approval, ApprovalStatus};
+use ultron_core::trash::TrashEntry;
 
 pub type Shared<'a> = State<'a, Arc<Bridge>>;
 type Out<T> = Result<T, BridgeError>;
@@ -191,6 +193,102 @@ pub struct TextArgs {
 #[derive(Deserialize)]
 pub struct PathArgs {
     pub path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApprovalPage {
+    pub approvals: Vec<Approval>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApprovalResult {
+    pub approval: Approval,
+}
+
+#[derive(Deserialize)]
+pub struct ListApprovalsArgs {
+    pub status: Option<ApprovalStatus>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub struct ResolveApprovalArgs {
+    pub id: String,
+    pub approve: bool,
+}
+
+#[derive(Deserialize)]
+pub struct IdArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrashResult {
+    pub entries: Vec<TrashEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestoredResult {
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn list_approvals(b: Shared<'_>, args: ListApprovalsArgs) -> Out<ApprovalPage> {
+    list_approvals_impl(&b, args).await
+}
+
+pub async fn list_approvals_impl(bridge: &Bridge, args: ListApprovalsArgs) -> Out<ApprovalPage> {
+    request(bridge, Request::ListApprovals {
+        status: args.status,
+        cursor: args.cursor,
+        limit: args.limit.map(|limit| limit.clamp(1, 32)),
+    }).await
+}
+
+#[tauri::command]
+pub async fn resolve_approval(b: Shared<'_>, args: ResolveApprovalArgs) -> Out<ApprovalResult> {
+    resolve_approval_impl(&b, args).await
+}
+
+pub async fn resolve_approval_impl(bridge: &Bridge, args: ResolveApprovalArgs) -> Out<ApprovalResult> {
+    request(bridge, Request::ResolveApproval { id: args.id, approve: args.approve, by: "desktop".into() }).await
+}
+
+#[tauri::command]
+pub async fn list_trash(b: Shared<'_>) -> Out<TrashResult> {
+    request(&b, Request::TrashList).await
+}
+
+#[tauri::command]
+pub async fn restore_trash(b: Shared<'_>, args: IdArgs) -> Out<RestoredResult> {
+    request(&b, Request::TrashRestore { id: args.id }).await
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PurgedResult {
+    pub id: String,
+}
+
+#[derive(Deserialize)]
+pub struct PolicySettingsArgs {
+    pub settings: ultron_core::ipc::PolicySettings,
+}
+
+#[tauri::command]
+pub async fn purge_trash(b: Shared<'_>, args: IdArgs) -> Out<PurgedResult> {
+    request(&b, Request::TrashPurge { id: args.id }).await
+}
+
+#[tauri::command]
+pub async fn get_policy_config(b: Shared<'_>) -> Out<ultron_core::ipc::PolicySettings> {
+    request(&b, Request::GetPolicyConfig).await
+}
+
+#[tauri::command]
+pub async fn set_policy_config(b: Shared<'_>, args: PolicySettingsArgs) -> Out<ultron_core::ipc::PolicySettings> {
+    request(&b, Request::SetPolicyConfig { settings: args.settings }).await
 }
 
 /// Projesiz yeni sohbetin çalışma dizini: kullanıcı ev dizini, yoksa geçerli dizin.

@@ -151,6 +151,24 @@ pub enum Request {
         approve: bool,
         by: String,
     },
+    TrashList,
+    TrashRestore {
+        id: String,
+    },
+    TrashPurge {
+        id: String,
+    },
+    GetPolicyConfig,
+    SetPolicyConfig {
+        settings: PolicySettings,
+    },
+}
+
+/// Masaüstü ayar sözleşmesi; değerlendirme kurallarının davranışını değiştirmez.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySettings {
+    pub config: crate::policy::PolicyConfig,
+    pub trash_retention_days: u32,
 }
 
 fn default_approval_wait_secs() -> u32 {
@@ -347,6 +365,11 @@ impl std::fmt::Debug for Request {
                 .field("chat_id", chat_id)
                 .finish_non_exhaustive(),
             Request::Status => f.write_str("Status"),
+            Request::TrashList => f.write_str("TrashList"),
+            Request::TrashRestore { .. } => f.write_str("TrashRestore { id: <gizli> }"),
+            Request::TrashPurge { .. } => f.write_str("TrashPurge { id: <gizli> }"),
+            Request::GetPolicyConfig => f.write_str("GetPolicyConfig"),
+            Request::SetPolicyConfig { .. } => f.write_str("SetPolicyConfig { settings: <gizli> }"),
             Request::PolicyCheck { .. } => f.write_str("PolicyCheck { action: <gizli> }"),
             Request::ListApprovals { status, .. } => f
                 .debug_struct("ListApprovals")

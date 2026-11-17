@@ -9,6 +9,7 @@ import { ChatRow } from "./ChatRow";
 import { SidebarSearch } from "./SidebarSearch";
 import { buildSidebarRows, ROW_HEIGHT, visibleRange } from "./sidebarRows";
 import "./sidebar.css";
+import { useApprovals } from "../approvals/ApprovalProvider";
 
 interface MenuState {
   chat: ChatInfo;
@@ -24,6 +25,7 @@ export function AppSidebar() {
   const chats = useAppState((s) => s.chats);
   const expanded = useAppState((s) => s.expandedProjects);
   const daemon = useAppState((s) => s.daemon);
+  const approvals = useApprovals();
 
   const [searching, setSearching] = useState(false);
   const [query, setQuery] = useState("");
@@ -101,6 +103,7 @@ export function AppSidebar() {
       </SidebarItem>
       <SidebarItem
         icon="sun"
+        count={approvals.pending.length || undefined}
         active={route.name === "today" && !searching}
         onClick={() => {
           leaveSearch();

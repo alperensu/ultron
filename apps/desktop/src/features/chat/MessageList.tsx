@@ -6,12 +6,14 @@ import { SENT_MESSAGE_LAYOUT_ID } from "../composer/Composer";
 import { Markdown } from "./Markdown";
 import type { ChatRow } from "./model";
 import { WorkSummary } from "./WorkSummary";
+import { InlineApproval } from "../approvals/InlineApproval";
 
 const OVERSCAN = 480;
 
 function estimate(row: ChatRow): number {
   if (row.type === "work") return 62;
   if (row.type === "system") return 64;
+  if (row.type === "approval") return 280;
   return Math.min(800, 46 + Math.ceil(row.text.length / 65) * 22);
 }
 
@@ -160,8 +162,9 @@ const MeasuredRow = memo(function MeasuredRow({ row, top, index, count, measure,
 });
 
 const MessageContent = memo(function MessageContent({ row, shared }: { row: ChatRow; shared: boolean }) {
+  if (row.type === "approval") return <InlineApproval approvalId={row.approvalId} status={row.status} />;
   if (row.type === "work") return <WorkSummary row={row} />;
-  if (row.type === "system") return <p className={`chat-system chat-system--${row.tone}`}>{row.text}</p>;
+  if (row.type === "system") return <p role={row.tone === "policy" ? "status" : undefined} className={`chat-system chat-system--${row.tone}${row.tone === "policy" ? " policy-notice" : ""}`}>{row.text}</p>;
   if (row.type === "user") return shared
     ? <motion.div layoutId={SENT_MESSAGE_LAYOUT_ID} transition={spring(0.5)} className="chat-bubble">{row.text}</motion.div>
     : <div className="chat-bubble">{row.text}</div>;

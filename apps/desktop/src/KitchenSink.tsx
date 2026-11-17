@@ -1,4 +1,6 @@
 import { useState } from "react";
+import { ApprovalCard } from "./features/approvals/ApprovalCard";
+import "./features/approvals/approvals.css";
 import {
   CapsuleButton,
   Chip,
@@ -20,6 +22,8 @@ import {
 export function KitchenSink() {
   const [on, setOn] = useState(true);
   const [sheet, setSheet] = useState<"bottom" | "right" | null>(null);
+  const [approvalResolved, setApprovalResolved] = useState<string | null>(null);
+  const [exampleCreated] = useState(() => new Date().toISOString());
 
   return (
     <div className="ui-shell" data-testid="kitchen-sink">
@@ -55,6 +59,13 @@ export function KitchenSink() {
         <div className="ui-stage">
           <div className="ui-stage__inner">
             <LargeTitle title="Bileşenler" summary="Tasarım sisteminin tüm parçaları. Veriler örnektir." />
+            <GroupedList header="Örnek onay kartı">
+              {approvalResolved ? <div className="approval-inbox"><p role="status">{approvalResolved}</p><CapsuleButton variant="text" onClick={() => setApprovalResolved(null)}>Örneği yeniden göster</CapsuleButton></div> : <div className="approval-inbox"><ApprovalCard approval={{
+                id: "example-approval", chat_id: null, engine: "claude", category: "Delete", reason: "Örnek: dosya silmek için onay gerekiyor.",
+                action_json: JSON.stringify({ Shell: { command: "rm example.txt; token=[MASKED]", cwd: "/example" } }), status: "pending",
+                created_at: exampleCreated, resolved_at: null, resolved_by: null,
+              }} onResolve={(_id, approve) => setApprovalResolved(approve ? "Örnek işlem onaylandı." : "Örnek işlem reddedildi.")} /></div>}
+            </GroupedList>
 
             <GroupedList header="Satırlar" footer="Düğme satırı basınca küçülür; durağan satır küçülmez.">
               <Row index={0} title="Gezinti satırı" subtitle="Alt metin, 13 punto" onClick={() => {}} />

@@ -5,6 +5,8 @@ import { useAppState, useStore } from "../state/store";
 import { CapsuleButton, GroupedList, LargeTitle, Row } from "../ui";
 import { Page } from "./Page";
 import "../features/quota/quota.css";
+import { PolicySettings } from "../features/approvals/PolicySettings";
+import { TrashSettings } from "../features/approvals/TrashSettings";
 
 /** Servis mutasyonlarıyla desteklenmeyen ayarlar salt okunur gösterilir. */
 export function Settings() {
@@ -40,6 +42,8 @@ export function Settings() {
       {(progress) => (
         <>
           <LargeTitle title="Ayarlar" summary="Servis, motorlar ve içe aktarma" progress={progress} />
+          <PolicySettings />
+          <TrashSettings />
           <GroupedList header="Servis">
             <Row
               title="ultrond"

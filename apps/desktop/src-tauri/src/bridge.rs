@@ -94,6 +94,8 @@ impl Bridge {
             || matches!(
                 req,
                 Request::ListApprovals { .. } | Request::ResolveApproval { .. }
+                    | Request::TrashList | Request::TrashRestore { .. }
+                    | Request::TrashPurge { .. } | Request::GetPolicyConfig | Request::SetPolicyConfig { .. }
             )
         {
             // Sır yalnız Rust köprüsünde kalır; normal bağlantıya veya motor ortamına taşınmaz.
@@ -106,9 +108,13 @@ impl Bridge {
             )
             .await
             .map_err(|_| protocol("onaylayıcı bağlantısı kurulamadı"))?;
-            let wait = if admin { ADMIN_REPLY_TIMEOUT } else { REPLY_TIMEOUT };
+            let wait = reply_timeout(&req);
             return match round_trip_timeout(&mut client, &req, wait).await {
                 Ok(Some(resp)) => into_data(resp),
+                // İstek gönderildikten sonra yanıt gelmediyse mutasyon uygulanmış olabilir.
+                _ if is_trash_mutation(&req) => Err(protocol(
+                    "sonuç belirsiz: yanıt alınamadı; işlem uygulanmış olabilir, çöp kutusu listesi yenileniyor",
+                )),
                 _ => Err(protocol("onaylayıcı yanıtı alınamadı")),
             };
         }
@@ -147,6 +153,22 @@ impl Bridge {
     }
 }
 
+/// Çöp kutusu mutasyonları (geri yükle / kalıcı sil) asla yeniden denenmez ve uzun bekler.
+fn is_trash_mutation(req: &Request) -> bool {
+    matches!(req, Request::TrashRestore { .. } | Request::TrashPurge { .. })
+}
+
+/// Yönetim ve çöp mutasyonları uzun süre bekler; diğerleri kısa `REPLY_TIMEOUT` kullanır.
+fn reply_timeout(req: &Request) -> Duration {
+    let admin = matches!(
+        req,
+        Request::ImportProjects { .. }
+            | Request::RemoveImportedChats { .. }
+            | Request::ImportClaudeHistory { .. }
+    );
+    if admin || is_trash_mutation(req) { ADMIN_REPLY_TIMEOUT } else { REPLY_TIMEOUT }
+}
+
 async fn connect_only(paths: &Paths) -> Result<Client> {
     let pipe = ipc::pipe_name()?;
     let token = ipc::read_token(paths)?;
@@ -181,5 +203,19 @@ pub fn into_data(resp: Response) -> Result<Value, BridgeError> {
         Response::Ok { data } => Ok(data),
         Response::Error { message } => Err(BridgeError::Daemon { message }),
         Response::Event(_) => Err(protocol("beklenmeyen olay yanıtı")),
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn trash_mutations_use_long_timeout_and_reads_stay_short() {
+        assert_eq!(reply_timeout(&Request::TrashRestore { id: "x".into() }), ADMIN_REPLY_TIMEOUT);
+        assert_eq!(reply_timeout(&Request::TrashPurge { id: "x".into() }), ADMIN_REPLY_TIMEOUT);
+        assert_eq!(reply_timeout(&Request::TrashList), REPLY_TIMEOUT);
+        assert!(is_trash_mutation(&Request::TrashPurge { id: "x".into() }));
+        assert!(!is_trash_mutation(&Request::TrashList));
     }
 }
