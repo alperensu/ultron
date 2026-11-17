@@ -139,6 +139,15 @@ pub struct QuotaWaitProgress {
     pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
+/// Yetki içermez. Sıra değişiklikleri ve restart boyunca aynı beklemenin planını korur.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuotaWaitSchedule {
+    pub fallback_order: Option<Vec<EngineId>>,
+    pub planned_reset_at: Option<DateTime<Utc>>,
+    pub reset_deadline: Option<DateTime<Utc>>,
+}
+
 pub struct QuotaResumeContext {
     pub wait: QuotaWait,
     pub user_event: StoredEvent,
@@ -294,6 +303,70 @@ pub(super) fn recover_waits_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Resu
 }
 
 impl Db {
+    /// Waiting neslinde ilk fallback zincirini ve her yeni reset'in deadline'ını sabitler.
+    /// Aynı nesilde yarışan scheduler'lar aynı planı alır; nesil/yetki değiştirmez.
+    pub fn prepare_quota_wait_schedule(
+        &self,
+        id: &str,
+        generation: i64,
+        fallback_order: &[EngineId],
+        reset_deadline: Option<DateTime<Utc>>,
+    ) -> Result<Option<QuotaWaitSchedule>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(wait) = load(&tx, id)? else { return Ok(None) };
+        if wait.generation != generation || wait.state != QuotaWaitState::Waiting {
+            return Ok(None);
+        }
+        let json: String = tx.query_row(
+            "SELECT scheduler_json FROM quota_waits WHERE id = ?1", [id], |r| r.get(0),
+        )?;
+        let mut schedule: QuotaWaitSchedule = serde_json::from_str(&json)?;
+        if schedule.fallback_order.is_none() && !fallback_order.is_empty() {
+            ensure!(fallback_order.len() <= 3, "motor zinciri sınırı aşıldı");
+            schedule.fallback_order = Some(fallback_order.to_vec());
+        }
+        if schedule.planned_reset_at != wait.reset_at {
+            schedule.planned_reset_at = wait.reset_at;
+            schedule.reset_deadline = reset_deadline;
+        }
+        tx.execute(
+            "UPDATE quota_waits SET scheduler_json = ?3 WHERE id = ?1 AND generation = ?2 AND state = 'waiting'",
+            params![id, generation, serde_json::to_string(&schedule)?],
+        )?;
+        tx.commit()?;
+        Ok(Some(schedule))
+    }
+
+    /// Yürütücü kabul etmeden ayar nedeniyle bırakılan claim. Running/terminal geri açılmaz.
+    /// Gerçekte başlamayan claim deneme bütçesini tüketmez; eski nesil geçersizleşir.
+    pub fn release_quota_wait_claim(
+        &self,
+        id: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<QuotaWait>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(wait) = load(&tx, id)? else { return Ok(None) };
+        if wait.generation != generation || wait.state != QuotaWaitState::Claimed {
+            return Ok(None);
+        }
+        if references(&tx, &wait)?.is_none() {
+            attention_tx(&tx, id, generation, now)?;
+        } else {
+            tx.execute(
+                "UPDATE quota_waits SET state = 'waiting', generation = generation + 1,
+                 attempt_count = MAX(0, attempt_count - 1), updated_at = ?3
+                 WHERE id = ?1 AND generation = ?2 AND state = 'claimed'",
+                params![id, generation, now.to_rfc3339()],
+            )?;
+        }
+        let wait = load(&tx, id)?;
+        tx.commit()?;
+        Ok(wait)
+    }
+
     /// Yeni bekleme daima generation=0 ile başlar. Bozuk olay referansı dikkat bekler
     /// olarak saklanır; olmayan sohbet/oturum FK hatasıdır ve hiçbir kayıt yazılmaz.
     pub fn create_quota_wait(&self, new: &NewQuotaWait, now: DateTime<Utc>) -> Result<QuotaWait> {

@@ -65,6 +65,77 @@ fn fixture() -> (tempfile::TempDir, Db, NewQuotaWait) {
 }
 
 #[test]
+fn scheduler_plan_persists_fixed_chain_and_deadline_across_restart() {
+    let (tmp, db, mut new) = fixture();
+    let now = Utc::now();
+    let reset = now + Duration::minutes(10);
+    let deadline = reset + Duration::seconds(8);
+    new.reset_at = Some(reset);
+    let wait = db.create_quota_wait(&new, now).unwrap();
+    let first = db.prepare_quota_wait_schedule(
+        &wait.id, wait.generation, &[EngineId::Codex, EngineId::Agy], Some(deadline),
+    ).unwrap().unwrap();
+    assert_eq!(first.planned_reset_at, Some(reset));
+    assert_eq!(first.reset_deadline, Some(deadline));
+    drop(db);
+    let db = Db::open(&tmp.path().join("store.db")).unwrap();
+    let restored = db.prepare_quota_wait_schedule(
+        &wait.id, wait.generation, &[EngineId::Agy, EngineId::Codex], None,
+    ).unwrap().unwrap();
+    assert_eq!(restored, first, "reset geçince veya sıra değişince plan değişmez");
+    let claimed = db.claim_quota_wait(&wait.id, wait.generation, deadline).unwrap().unwrap();
+    assert!(db.prepare_quota_wait_schedule(&wait.id, wait.generation, &[], None).unwrap().is_none());
+    assert!(db.prepare_quota_wait_schedule(&wait.id, claimed.generation, &[], None).unwrap().is_none());
+    let running = db.advance_quota_wait(&wait.id, claimed.generation, State::Running, None, deadline).unwrap().unwrap();
+    let new_reset = reset + Duration::hours(1);
+    let progress = QuotaWaitProgress { checkpoint_seq: 2, next_engine_index: 1, reset_at: Some(new_reset), next_attempt_at: None };
+    let waiting = db.advance_quota_wait(&wait.id, running.generation, State::Waiting, Some(&progress), deadline).unwrap().unwrap();
+    let replanned = db.prepare_quota_wait_schedule(
+        &wait.id, waiting.generation, &[EngineId::Agy, EngineId::Codex], Some(new_reset + Duration::seconds(8)),
+    ).unwrap().unwrap();
+    assert_eq!(replanned.fallback_order, first.fallback_order);
+    assert_eq!(replanned.planned_reset_at, Some(new_reset));
+    assert_eq!(replanned.reset_deadline, Some(new_reset + Duration::seconds(8)));
+}
+
+#[test]
+fn scheduler_migration_preserves_existing_waits_and_events() {
+    let (tmp, db, new) = fixture();
+    let wait = db.create_quota_wait(&new, Utc::now()).unwrap();
+    drop(db);
+    // Önceki v12 şemasını kur; yeniden açılış gerçek ekleyici v13 migration'ını uygular.
+    let conn = rusqlite::Connection::open(tmp.path().join("store.db")).unwrap();
+    conn.execute_batch("ALTER TABLE quota_waits DROP COLUMN scheduler_json; PRAGMA user_version = 12;").unwrap();
+    drop(conn);
+    let db = Db::open(&tmp.path().join("store.db")).unwrap();
+    let restored = db.quota_wait(&wait.id).unwrap().unwrap();
+    assert_eq!(restored.generation, wait.generation);
+    assert_eq!(restored.state, State::Waiting);
+    assert_eq!(restored.policy, ResumePolicy::Workspace);
+    assert_eq!(db.events_for_chat("chat", None).unwrap().len(), 2);
+    assert!(db.prepare_quota_wait_schedule(&wait.id, wait.generation, &[], None).unwrap().is_some());
+}
+
+#[test]
+fn releasing_unstarted_claim_uses_cas_and_never_reopens_running_or_terminal() {
+    let (_tmp, db, new) = fixture();
+    let now = Utc::now();
+    let wait = db.create_quota_wait(&new, now).unwrap();
+    let claimed = db.claim_quota_wait(&wait.id, wait.generation, now).unwrap().unwrap();
+    assert!(db.release_quota_wait_claim(&wait.id, wait.generation, now).unwrap().is_none());
+    let waiting = db.release_quota_wait_claim(&wait.id, claimed.generation, now).unwrap().unwrap();
+    assert_eq!(waiting.state, State::Waiting);
+    assert_eq!(waiting.attempt_count, 0);
+    assert!(waiting.generation > claimed.generation);
+    assert!(db.quota_resume_context(&wait.id, claimed.generation, now).unwrap().is_none());
+    let claimed = db.claim_quota_wait(&wait.id, waiting.generation, now).unwrap().unwrap();
+    let running = db.advance_quota_wait(&wait.id, claimed.generation, State::Running, None, now).unwrap().unwrap();
+    assert!(db.release_quota_wait_claim(&wait.id, running.generation, now).unwrap().is_none());
+    let terminal = db.advance_quota_wait(&wait.id, running.generation, State::NeedsAttention, None, now).unwrap().unwrap();
+    assert!(db.release_quota_wait_claim(&wait.id, terminal.generation, now).unwrap().is_none());
+}
+
+#[test]
 fn wait_restart_roundtrip_preserves_goal_policy_checkpoint_and_unknown_reset() {
     let (tmp, db, new) = fixture();
     let now = Utc::now();

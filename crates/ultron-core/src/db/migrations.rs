@@ -211,6 +211,10 @@ const MIGRATIONS: &[&str] = &[
         WHERE state IN ('waiting', 'claimed', 'running', 'needs_attention');
     CREATE INDEX quota_waits_pending ON quota_waits(state, next_attempt_at);
     "#,
+    // v13: bekleme başına sabit fallback zinciri ve reset toleransı (yalnız ekleyici).
+    r#"
+    ALTER TABLE quota_waits ADD COLUMN scheduler_json TEXT NOT NULL DEFAULT '{}';
+    "#,
 ];
 
 type DupRow = (String, String, Option<String>, Option<String>, Option<String>, i64);
@@ -370,7 +374,7 @@ mod tests {
         assert_eq!(
             conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
                 .unwrap(),
-            12
+            MIGRATIONS.len() as i64
         );
         assert_eq!(
             conn.query_row::<String, _, _>("SELECT payload_json FROM events", [], |r| r.get(0))
