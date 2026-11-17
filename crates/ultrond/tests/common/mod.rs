@@ -59,6 +59,16 @@ pub fn fake_engines(dir: &Path, lines: &[&str]) -> HashMap<EngineId, Arc<dyn Eng
     map
 }
 
+/// Sahte motorlu testlerde gerçek agy özetleyicisi çalışmasın: her tur sonunda gerçek
+/// bir Gemini çağrısı yapar (2-10 sn, ağa bağlı) ve kota harcar.
+pub fn config_without_agy() -> Config {
+    let mut cfg = Config::default();
+    for engine in cfg.engines.iter_mut().filter(|e| e.id == EngineId::Agy) {
+        engine.enabled = false;
+    }
+    cfg
+}
+
 pub fn paths_in(dir: &Path) -> Paths {
     let paths = Paths::from_root(dir.join("ultron"));
     paths.ensure().unwrap();
@@ -69,7 +79,7 @@ pub async fn start_with(paths: &Paths, pipe: &str, lines: &[&str]) -> ServerHand
     server::start(ServerConfig {
         paths: paths.clone(),
         pipe_name: pipe.to_string(),
-        cfg: Config::default(),
+        cfg: config_without_agy(),
         engines: fake_engines(&paths.root, lines),
     })
     .await

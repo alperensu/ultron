@@ -94,6 +94,14 @@ pub trait Engine: Send + Sync {
     fn id(&self) -> EngineId;
     fn capabilities(&self) -> Capabilities;
     fn command(&self, req: &TurnRequest) -> CommandSpec;
+    /// Başlatmadan önce oturuma özel dosya/ortam hazırlığı; hata süreci başlatmaz.
+    fn prepare_command(
+        &self,
+        _req: &TurnRequest,
+        _cmd: &mut tokio::process::Command,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn parse_line(&self, line: &str) -> Vec<EngineEvent>;
 }
 

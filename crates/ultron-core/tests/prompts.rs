@@ -79,7 +79,8 @@ fn claude_command_appends_prompt_file() {
     assert_eq!(command.stdin.as_deref(), Some(req.prompt.as_str()));
     assert!(command.args.contains(&"--resume".into()));
     assert!(!command.args.contains(&"--system-prompt".into()));
-    assert!(!command.args.contains(&"--settings".into()));
+    assert!(command.args.contains(&"--settings".into()));
+    assert!(command.args.contains(&"--include-hook-events".into()));
 }
 
 #[test]

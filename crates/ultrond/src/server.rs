@@ -169,6 +169,8 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
     } = config;
     paths.ensure()?;
     let lock = acquire_lock(&paths.run.join("ultrond.lock"))?;
+    // Kilit alındı: çalışan tur yoktur; önceki çalışmadan kalan hook ayar dosyalarını sil.
+    ultron_core::engine::claude::cleanup_policy_settings(&paths);
 
     let db = Arc::new(Db::open(&paths.db)?);
     let log = Arc::new(EventLog::new(db.clone(), paths.clone()));
@@ -1035,7 +1037,8 @@ mod tests {
         start(ServerConfig {
             paths: paths.clone(),
             pipe_name: pipe.into(),
-            cfg: Config::default(),
+            // Gerçek agy özetleyicisi testlere sızmasın (ağ çağrısı, 2-10 sn dalgalanma).
+            cfg: config_with_agy(false),
             engines,
         })
         .await

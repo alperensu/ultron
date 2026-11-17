@@ -143,6 +143,14 @@ impl Engine for StructuredEngine {
         spec
     }
 
+    fn prepare_command(
+        &self,
+        req: &TurnRequest,
+        cmd: &mut tokio::process::Command,
+    ) -> Result<()> {
+        self.inner.prepare_command(req, cmd)
+    }
+
     fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
         self.inner.parse_line(line)
     }

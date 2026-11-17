@@ -8,6 +8,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 use ultron_core::ipc::{Client, PolicyArg, Request, Response};
 use ultron_core::{EngineId, Paths, StoredEvent};
+use ultron_core::engine::claude::HOOK_REASON_PREFIX;
+use ultron_core::import::mask_secrets;
+use ultron_core::policy::{Action, Decision};
 
 /// Görev Zamanlayıcı görev adı.
 const TASK_NAME: &str = r"Ultron\ultrond";
@@ -21,6 +24,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
+    /// Claude PreToolUse isteğini requester olarak denetler.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyCmd,
+    },
     /// Mesaj gönderir ve olayları akıtarak yazdırır.
     Chat {
         /// Mevcut sohbet kimliği; yoksa yeni sohbet açılır.
@@ -62,6 +70,322 @@ pub enum Cmd {
         #[command(subcommand)]
         action: ServiceCmd,
     },
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum PolicyCmd {
+    /// Hook JSON'unu stdin'den alır; her hata güvenli ret döndürür.
+    Check,
+}
+
+/// Claude hook girdisini doğrular; göreli dosya yollarını hook cwd'sine bağlar.
+/// Bilinmeyen araçlar onayla bile açılmaz; yeni araçlar açıkça eşlenmelidir.
+pub fn hook_action(input: &Value) -> Result<Action> {
+    let field = |object: &Value, key: &str| -> Result<String> {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty() && !s.contains('\0'))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("Hook girdisinde zorunlu alan eksik veya geçersiz"))
+    };
+    let _session = field(input, "session_id")?;
+    if input.get("hook_event_name").and_then(Value::as_str) != Some("PreToolUse") {
+        bail!("Hook olay türü PreToolUse değil");
+    }
+    let cwd = PathBuf::from(field(input, "cwd")?);
+    if !cwd.is_absolute() {
+        bail!("Hook çalışma dizini mutlak olmalıdır");
+    }
+    let tool = field(input, "tool_name")?;
+    let args = input
+        .get("tool_input")
+        .filter(|v| v.is_object())
+        .ok_or_else(|| anyhow!("Hook araç girdisi JSON nesnesi olmalıdır"))?;
+    let path = |key: &str| -> Result<PathBuf> {
+        let path = PathBuf::from(field(args, key)?);
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        })
+    };
+    let string = |key: &str| -> Result<()> {
+        if args.get(key).and_then(Value::as_str).is_none() {
+            bail!("Hook araç girdisinde zorunlu metin alanı eksik");
+        }
+        Ok(())
+    };
+    if tool == "NotebookEdit" && args.get("edit_mode").and_then(Value::as_str) == Some("delete") {
+        // Hücre silme içerik kaybıdır; silme onayı akışına girer.
+        return Ok(Action::FileDelete {
+            path: path("notebook_path")?,
+        });
+    }
+    match tool.as_str() {
+        "Bash" => Ok(Action::Shell {
+            command: field(args, "command")?,
+            cwd,
+        }),
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
+            match tool.as_str() {
+                "Write" => string("content")?,
+                "Edit" => {
+                    string("old_string")?;
+                    string("new_string")?;
+                }
+                "NotebookEdit" => string("new_source")?,
+                "MultiEdit" => {
+                    let edits = args
+                        .get("edits")
+                        .and_then(Value::as_array)
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| anyhow!("MultiEdit düzenlemeleri eksik"))?;
+                    if edits.iter().any(|edit| {
+                        ["old_string", "new_string"]
+                            .iter()
+                            .any(|key| edit.get(key).and_then(Value::as_str).is_none())
+                    }) {
+                        bail!("MultiEdit düzenlemesi geçersiz");
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Ok(Action::FileWrite {
+                path: path(if tool == "NotebookEdit" {
+                    "notebook_path"
+                } else {
+                    "file_path"
+                })?,
+            })
+        }
+        // Yan etkisiz iç araçlar açıkça eşlenir; politika motoru yine ToolCall olarak değerlendirir.
+        "Task" | "Agent" | "BashOutput" | "KillShell" | "LS" | "NotebookRead" | "ExitPlanMode"
+        | "AskUserQuestion" | "Skill" => Ok(Action::ToolCall {
+            tool,
+            input: args.clone(),
+        }),
+        "Read" | "Grep" | "Glob" | "WebFetch" | "WebSearch" | "TodoWrite" => {
+            let mut args = args.clone();
+            match tool.as_str() {
+                "Read" => {
+                    args["file_path"] =
+                        Value::String(path("file_path")?.to_string_lossy().into_owned());
+                }
+                "Grep" | "Glob" => {
+                    field(&args, "pattern")?;
+                    // Arama kapsamı verilmemişse daemon'un kendi cwd'sini kullanma.
+                    args["path"] = Value::String(
+                        if args.get("path").is_some() {
+                            path("path")?
+                        } else {
+                            cwd.clone()
+                        }
+                        .to_string_lossy()
+                        .into_owned(),
+                    );
+                }
+                "WebFetch" => {
+                    field(&args, "url")?;
+                    field(&args, "prompt")?;
+                }
+                "WebSearch" => {
+                    field(&args, "query")?;
+                }
+                "TodoWrite" if !args.get("todos").is_some_and(Value::is_array) => {
+                    bail!("TodoWrite listesi eksik")
+                }
+                _ => {}
+            }
+            Ok(Action::ToolCall { tool, input: args })
+        }
+        other => {
+            let name: String = mask_secrets(other).0.chars().take(64).collect();
+            bail!("Bilinmeyen araç güvenlik nedeniyle reddedildi: {name}")
+        }
+    }
+}
+
+/// Claude'un belgelenmiş karar biçimi; hata ayrıntıları veya ham girdi yazılmaz.
+///
+/// `Allow` yalnız tam yetkili (`Full`) turda `allow` olarak yazılır. Workspace ve salt okunur
+/// turlarda karar verilmez (`{}`): Claude'un kendi izin kipi geçerli kalır, böylece hook
+/// o kipin kısıtını aşamaz. Ret her zaman ret kalır.
+pub fn hook_output(decision: Decision, emit_allow: bool) -> Value {
+    let reason = match decision {
+        Decision::Allow if emit_allow => {
+            return serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "allow",
+                "permissionDecisionReason":
+                    format!("{HOOK_REASON_PREFIX}Ultron politikası işlemi onayladı")
+            }});
+        }
+        Decision::Allow => return serde_json::json!({}),
+        Decision::Deny { reason } if !reason.trim().is_empty() => mask_secrets(&reason).0,
+        Decision::Deny { .. } => "Ultron politikası işlemi reddetti".into(),
+        Decision::Ask { .. } => "Onay tamamlanmadı; işlem reddedildi".into(),
+    };
+    let reason = format!("{HOOK_REASON_PREFIX}{reason}");
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        },
+        "systemMessage": reason
+    })
+}
+
+/// Claude'un stdout kod çözümünden bağımsız olması için ASCII'ye kaçışlanmış JSON.
+pub fn hook_json(value: &Value) -> String {
+    let mut out = String::new();
+    for ch in value.to_string().chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in ch.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
+fn hook_denied(reason: &str) -> Value {
+    hook_output(
+        Decision::Deny {
+            reason: reason.into(),
+        },
+        false,
+    )
+}
+
+/// Hook'un onay beklemesi için üst sınır. Claude hook zaman aşımı (320 sn) bundan çok
+/// büyüktür; ret her zaman Claude'un hook'u iptal etmesinden önce yazılır.
+pub const HOOK_APPROVAL_WAIT_SECS: u32 = 240;
+
+/// Requester bağlantısı: yalnız run/token okunur; servis başlatılmaz, onay çözülmez.
+pub async fn check_hook(
+    input: Value,
+    paths: &Paths,
+    pipe: &str,
+    chat_id: Option<String>,
+    wait_secs: u32,
+    emit_allow: bool,
+) -> Value {
+    let action = match hook_action(&input) {
+        Ok(action) => action,
+        Err(error) => return hook_denied(&error.to_string()),
+    };
+    // Karar özgün eylem üzerinden verilir. Servis, onay kaydı ve olay günlüğüne yazmadan
+    // önce sırları kendisi maskeler; istemci çıktısı da ham girdiyi hiç içermez.
+    if chat_id.as_deref().is_some_and(|id| {
+        id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    }) {
+        return hook_denied("Ultron sohbet kimliği geçersiz; işlem reddedildi");
+    }
+    let wait_secs = wait_secs.min(HOOK_APPROVAL_WAIT_SECS);
+    let request = async {
+        let token = std::fs::read_to_string(ultron_core::ipc::token_path(paths))?;
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Client::connect(pipe, token.trim()),
+        )
+        .await??;
+        client
+            .send(&Request::PolicyCheck {
+                action,
+                chat_id,
+                engine: EngineId::Claude,
+                wait_secs,
+            })
+            .await?;
+        match client.next().await? {
+            Some(Response::Ok { data }) => serde_json::from_value::<Decision>(
+                data.get("decision").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(anyhow::Error::from),
+            _ => bail!("Politika servisi geçerli karar vermedi"),
+        }
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(wait_secs) + 10),
+        request,
+    )
+    .await
+    {
+        Ok(Ok(decision)) => hook_output(decision, emit_allow),
+        Ok(Err(_)) => hook_denied(
+            "Ultron politika servisine ulaşılamadı veya geçersiz yanıt alındı; işlem reddedildi",
+        ),
+        Err(_) => hook_denied("Ultron onayı zaman aşımına uğradı; işlem reddedildi"),
+    }
+}
+
+async fn policy_hook_stdin() -> Value {
+    // Ayrık okuyucu: stdin EOF gelmezse Tokio'nun bloklayan stdin iş parçacığını
+    // kapatmasını beklemeyiz. Boyut ve okuma süresi de sınırlıdır.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let result = std::io::stdin()
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes);
+        let _ = tx.send((result, bytes));
+    });
+    let input = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok((Ok(_), bytes))) if bytes.len() <= 1024 * 1024 => {
+            serde_json::from_slice::<Value>(&bytes).ok()
+        }
+        _ => None,
+    };
+    let Some(input) = input else {
+        return hook_denied("Hook girdisi okunamadı, geçersiz veya sınırı aştı; işlem reddedildi");
+    };
+    let (Ok(paths), Ok(pipe)) = (Paths::resolve(), ultron_core::ipc::pipe_name()) else {
+        return hook_denied("Ultron servis yapılandırması bulunamadı; işlem reddedildi");
+    };
+    let chat = match std::env::var("ULTRON_CHAT_ID") {
+        Ok(id) => Some(id),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return hook_denied("Ultron sohbet kimliği okunamadı; işlem reddedildi"),
+    };
+    let emit_allow = std::env::var("ULTRON_TOOL_POLICY").as_deref() == Ok("full");
+    check_hook(input, &paths, &pipe, chat, HOOK_APPROVAL_WAIT_SECS, emit_allow).await
+}
+
+/// Hook sürecinin beklenmedik bir panikte de güvenle kapanması: Claude yalnız çıkış kodu 2'yi
+/// (veya geçerli ret JSON'unu) engelleme sayar; panik başka kodla çıkarsa araç çalışabilirdi.
+pub fn install_policy_panic_guard() {
+    std::panic::set_hook(Box::new(|_| {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "{HOOK_REASON_PREFIX}Politika kancası beklenmedik bir hata verdi; işlem reddedildi"
+        );
+        std::process::exit(2);
+    }));
+}
+
+/// `ultron policy check`: kararı stdout'a yazar. Yazma başarısızsa (kapalı boru) çıkış 2.
+async fn policy_check_main() -> Result<()> {
+    use std::io::Write;
+    install_policy_panic_guard();
+    let line = hook_json(&policy_hook_stdin().await);
+    let mut out = std::io::stdout().lock();
+    if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{HOOK_REASON_PREFIX}Karar yazılamadı; işlem reddedildi"
+        );
+        std::process::exit(2);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Subcommand)]
@@ -246,6 +570,9 @@ async fn stream(client: &mut Client, verbose: bool) -> Result<Option<Value>> {
 /// Komutu çalıştırır.
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Cmd::Policy {
+            action: PolicyCmd::Check,
+        } => policy_check_main().await,
         Cmd::Service { action } => service(action),
         Cmd::Chat {
             chat,

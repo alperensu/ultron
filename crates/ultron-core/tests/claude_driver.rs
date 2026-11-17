@@ -57,6 +57,216 @@ fn claude_command_includes_stream_json_and_resume() {
 }
 
 #[test]
+fn claude_command_includes_policy_settings() {
+    use ultron_core::engine::claude::{install_policy_settings, policy_settings_path};
+    let eng = ClaudeEngine::new(cfg());
+    for policy in [
+        ToolPolicy::ReadOnly,
+        ToolPolicy::Workspace,
+        ToolPolicy::Full,
+    ] {
+        let req = request(policy, None);
+        let spec = eng.command(&req);
+        let pos = spec
+            .args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .unwrap();
+        let expected =
+            policy_settings_path(&ultron_core::Paths::resolve().unwrap(), &req.chat_id).unwrap();
+        assert_eq!(PathBuf::from(&spec.args[pos + 1]), expected);
+        assert!(spec.args.contains(&"--include-hook-events".into()));
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = ultron_core::Paths::from_root(tmp.path().join("durum klasörü"));
+    let executable = std::env::current_exe().unwrap();
+    let path = install_policy_settings(&paths, "sentetik-sohbet", &executable).unwrap();
+    // Aynı sohbetin sonraki turunda dosya atomik olarak yenilenebilir.
+    assert_eq!(
+        install_policy_settings(&paths, "sentetik-sohbet", &executable).unwrap(),
+        path
+    );
+    assert_eq!(path, paths.run.join("claude-settings-sentetik-sohbet.json"));
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(settings["disableAllHooks"], false);
+    let group = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(group["matcher"], "*");
+    let hook = &group["hooks"][0];
+    assert_eq!(hook["command"], json!(executable));
+    assert_eq!(hook["args"], json!(["policy", "check"]));
+    assert_eq!(hook["onFailure"], "block");
+    assert_eq!(hook["timeout"], 320);
+    assert!(hook.get("async").is_none());
+    assert!(
+        std::fs::read_dir(&paths.run).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .unwrap()
+            == "json")
+    );
+    for invalid in ["", "../escape", "a/b", "a\\b", "a:stream"] {
+        assert!(policy_settings_path(&paths, invalid).is_err());
+    }
+    assert!(install_policy_settings(&paths, "c1", &tmp.path().join("missing.exe")).is_err());
+}
+
+#[test]
+fn claude_hook_preparation_rejects_settings_override_and_invalid_chat() {
+    let mut c = cfg();
+    c.extra_args = vec!["--settings={}".into()];
+    let eng = ClaudeEngine::new(c);
+    let mut cmd = tokio::process::Command::new("never-started");
+    assert!(
+        eng.prepare_command(&request(ToolPolicy::Full, None), &mut cmd)
+            .is_err()
+    );
+    let eng = ClaudeEngine::new(cfg());
+    let mut req = request(ToolPolicy::Full, None);
+    req.chat_id = "../outside".into();
+    assert!(eng.prepare_command(&req, &mut cmd).is_err());
+}
+
+// Gerçek `claude --include-hook-events` çıktısından alınmış satır (içerik sentetik: silme denemesi).
+const REAL_HOOK_DENY: &str = r#"{"type":"system","subtype":"hook_response","hook_id":"95a6ca2a-6b29-4eed-a8bb-0d46e31e9bb2","hook_name":"PreToolUse:Bash","hook_event":"PreToolUse","output":"{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"[Ultron] i\\u015flem reddedildi veya onay s\\u00fcresi doldu\"},\"systemMessage\":\"[Ultron] i\\u015flem reddedildi veya onay s\\u00fcresi doldu\"}\n","stdout":"{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"[Ultron] i\\u015flem reddedildi veya onay s\\u00fcresi doldu\"},\"systemMessage\":\"[Ultron] i\\u015flem reddedildi veya onay s\\u00fcresi doldu\"}\n","stderr":"","exit_code":0,"outcome":"success","uuid":"d22117d5-b9a8-494f-9665-07d8f5e3cbf5","session_id":"23317c08-8a07-483e-af2f-3c6ddafa22e9"}"#;
+
+#[test]
+fn claude_pretooluse_denials_are_attributed_to_ultron_only() {
+    let eng = ClaudeEngine::new(cfg());
+    // Gerçek satır: Ultron öneki taşıyan ret, güvenli bir hata olayına dönüşür.
+    let events = eng.parse_line(REAL_HOOK_DENY);
+    match events.as_slice() {
+        [EngineEvent::Error { message }] => {
+            assert!(message.contains("reddedildi"), "{message}");
+            assert!(!message.starts_with("[Ultron]"));
+        }
+        other => panic!("beklenmeyen olaylar: {other:?}"),
+    }
+    // Ön eksiz (başka hook'a ait) ret ve hata ham içerik sızdırmadan yok sayılır.
+    for event in [
+        json!({"type":"system","subtype":"hook_response","hook_event":"PreToolUse","outcome":"error","exit_code":1,"stderr":"password=synthetic-private"}),
+        json!({"type":"system","subtype":"hook_response","hook_event":"PreToolUse","outcome":"cancelled"}),
+        json!({"type":"system","subtype":"hook_response","hook_event":"PreToolUse","outcome":"success","exit_code":0,
+            "stdout":json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"baska hook password=synthetic-private"}}).to_string()}),
+    ] {
+        assert!(eng.parse_line(&event.to_string()).is_empty());
+    }
+    // Ultron ön ekli ret maskelenir.
+    let masked = json!({"type":"system","subtype":"hook_response","hook_event":"PreToolUse","outcome":"success","exit_code":0,
+        "stdout":json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[Ultron] password=synthetic-private"}}).to_string()});
+    let events = eng.parse_line(&masked.to_string());
+    assert!(matches!(events.as_slice(), [EngineEvent::Error { .. }]));
+    assert!(!format!("{events:?}").contains("synthetic-private"));
+    let allow = json!({"type":"system","subtype":"hook_response","hook_event":"PreToolUse","outcome":"success","exit_code":0,
+        "stdout":json!({"hookSpecificOutput":{"permissionDecision":"allow"}}).to_string()});
+    assert!(eng.parse_line(&allow.to_string()).is_empty());
+}
+
+#[test]
+fn structured_engine_forwards_prepare_command_errors() {
+    let mut c = cfg();
+    c.extra_args = vec!["--bare".into()];
+    let engine = ultron_core::summarizer::StructuredEngine::new(
+        Box::new(ClaudeEngine::new(c)),
+        "{}",
+    );
+    let mut cmd = tokio::process::Command::new("never-started");
+    assert!(
+        engine
+            .prepare_command(&request(ToolPolicy::Full, None), &mut cmd)
+            .is_err()
+    );
+}
+
+#[test]
+fn claude_sets_setting_sources_user_and_rejects_security_flag_overrides() {
+    let eng = ClaudeEngine::new(cfg());
+    let args = eng.command(&request(ToolPolicy::Full, None)).args;
+    let pos = args.iter().position(|a| a == "--setting-sources").unwrap();
+    assert_eq!(args[pos + 1], "user");
+    let mut cmd = tokio::process::Command::new("never-started");
+    for flag in [
+        "--settings",
+        "--setting-sources",
+        "--bare",
+        "--permission-mode",
+        "--dangerously-skip-permissions",
+        "--setting-sources=user,project",
+        "--permission-mode=bypassPermissions",
+    ] {
+        let mut c = cfg();
+        c.extra_args = vec![flag.into()];
+        assert!(
+            ClaudeEngine::new(c)
+                .prepare_command(&request(ToolPolicy::Full, None), &mut cmd)
+                .is_err(),
+            "{flag} reddedilmeli"
+        );
+    }
+}
+
+#[tokio::test]
+async fn instruction_wrapper_preserves_preparation_and_fail_closed_launch() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use ultron_core::engine::{Capabilities, CommandSpec, RestrictionLevel};
+    struct PreparationProbe(Arc<AtomicBool>);
+    impl Engine for PreparationProbe {
+        fn id(&self) -> EngineId {
+            EngineId::Claude
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                streaming: true,
+                resume: false,
+                mid_turn_input: false,
+                tool_restriction: RestrictionLevel::Partial,
+            }
+        }
+        fn command(&self, req: &TurnRequest) -> CommandSpec {
+            CommandSpec {
+                program: "must-never-start.exe".into(),
+                args: vec![],
+                cwd: req.cwd.clone(),
+                stdin: None,
+            }
+        }
+        fn prepare_command(
+            &self,
+            req: &TurnRequest,
+            cmd: &mut tokio::process::Command,
+        ) -> anyhow::Result<()> {
+            cmd.env("ULTRON_CHAT_ID", &req.chat_id);
+            self.0.store(true, Ordering::SeqCst);
+            anyhow::bail!("Sentetik hook hazırlık hatası")
+        }
+        fn parse_line(&self, _: &str) -> Vec<EngineEvent> {
+            vec![]
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let prepared = Arc::new(AtomicBool::new(false));
+    let engine = ultron_core::prompts::with_instructions(
+        Arc::new(PreparationProbe(prepared.clone())),
+        "sentetik",
+        tmp.path(),
+        "c1",
+    )
+    .unwrap();
+    let mut req = request(ToolPolicy::ReadOnly, None);
+    req.cwd = tmp.path().into();
+    let (tx, _rx) = mpsc::channel(8);
+    let error = run_turn(engine.as_ref(), req, tx, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(prepared.load(Ordering::SeqCst));
+    assert_eq!(error.to_string(), "Sentetik hook hazırlık hatası");
+}
+
+#[test]
 fn claude_readonly_policy_limits_tools() {
     let eng = ClaudeEngine::new(cfg());
     let spec = eng.command(&request(ToolPolicy::ReadOnly, None));

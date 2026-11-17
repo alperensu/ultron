@@ -104,6 +104,7 @@ pub async fn run_turn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    engine.prepare_command(&req, &mut cmd)?;
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

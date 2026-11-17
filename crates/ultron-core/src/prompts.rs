@@ -206,6 +206,10 @@ impl Engine for InstructionEngine {
     fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
         self.inner.parse_line(line)
     }
+
+    fn prepare_command(&self, req: &TurnRequest, cmd: &mut tokio::process::Command) -> Result<()> {
+        self.inner.prepare_command(req, cmd)
+    }
 }
 
 pub(crate) fn prefix(instructions: &str, prompt: &str) -> String {

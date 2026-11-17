@@ -292,7 +292,7 @@ async fn start_with_engines(
     server::start(ServerConfig {
         paths: paths.clone(),
         pipe_name: pipe.to_string(),
-        cfg: Config::default(),
+        cfg: config_without_agy(),
         engines,
     })
     .await
