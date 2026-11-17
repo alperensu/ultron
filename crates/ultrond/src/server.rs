@@ -93,7 +93,7 @@ fn read_policy_table(paths: &Paths) -> Result<toml::Table> {
     let mut text = String::new();
     File::open(path)?.take(MAX_POLICY_BYTES + 1).read_to_string(&mut text)?;
     anyhow::ensure!(text.len() as u64 <= MAX_POLICY_BYTES, "policy.toml çok büyük (en çok 64 KiB)");
-    text.parse().context("policy.toml çözümlenemedi")
+    text.parse().map_err(|_| anyhow!("policy.toml çözümlenemedi"))
 }
 
 fn policy_settings(table: &toml::Table) -> Result<ipc::PolicySettings> {
@@ -643,7 +643,7 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
         .map_err(|_| anyhow!("config kilidi zehirlendi"))?;
     let file = paths.root.join("config.toml");
     let mut table: toml::Table = match std::fs::read_to_string(&file) {
-        Ok(text) => text.parse()?,
+        Ok(text) => text.parse().map_err(|_| anyhow!("config.toml çözümlenemedi"))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
         Err(e) => return Err(e.into()),
     };
@@ -662,6 +662,38 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
         return Err(e.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod config_error_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_config_errors_do_not_expose_source_or_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root(tmp.path().join("ultron"));
+        paths.ensure().unwrap();
+        let source = "[telegram]\nallowed_user_ids = [101,,202]\n";
+        for (name, result) in [
+            ("config.toml", true),
+            ("policy.toml", false),
+        ] {
+            let file = paths.root.join(name);
+            std::fs::write(&file, source).unwrap();
+            let error = if result {
+                set_reset_rights(&paths, "claude", 1).unwrap_err()
+            } else {
+                get_policy_settings(&paths).unwrap_err()
+            };
+            let message = format!("{error:#}");
+            assert_eq!(message, format!("{name} çözümlenemedi"));
+            for private in ["101", "202", "allowed_user_ids", "[telegram]"] {
+                assert!(!message.contains(private), "{message}");
+            }
+            assert_eq!(error.chain().count(), 1);
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+        }
+    }
 }
 
 /// Yol, kullanıcının ev dizini mi (büyük/küçük harf ve sembolik bağdan bağımsız)?
@@ -821,6 +853,15 @@ async fn dispatch(
     cancel: &CancellationToken,
 ) -> Result<Flow> {
     match request {
+        Request::TelegramStatus
+        | Request::TelegramSetToken { .. }
+        | Request::TelegramTest
+        | Request::GetTelegramSettings
+        | Request::SetTelegramSettings { .. }
+        | Request::DesktopHeartbeat { .. } => {
+            send_error(writer, "Telegram ağ geçidi henüz bağlanmadı").await;
+            Ok(Flow::Continue)
+        }
         Request::TrashList => {
             require_approver(auth)?;
             let entries = {

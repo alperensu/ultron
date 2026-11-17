@@ -134,3 +134,106 @@ fn summarizer_key_rejects_unknown_value() {
     assert!(toml::from_str::<Config>("summarizer = \"gemini\"").is_err());
     assert!(toml::from_str::<Config>("summarizer = \"Claude-Haiku\"").is_err());
 }
+
+fn load_config_text(text: &str) -> anyhow::Result<Config> {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("config.toml"), text).unwrap();
+    Config::load(&Paths::from_root(tmp.path().to_path_buf()))
+}
+
+#[test]
+fn telegram_defaults_accept_missing_empty_and_old_config() {
+    use ultron_core::config::{NotifyMode, SummarizerMode, TelegramConfig};
+    for text in ["", "[telegram]", "[telegram]\nallowed_user_ids = []"] {
+        let cfg = load_config_text(text).unwrap();
+        assert_eq!(cfg.telegram, TelegramConfig::default());
+        assert_eq!(cfg.telegram.notify, NotifyMode::Always);
+        assert!(cfg.telegram.auto_continue_enabled);
+        assert_eq!(cfg.telegram.auto_continue_wait_minutes, 45);
+        assert!(cfg.telegram.fallback_order.is_empty());
+        assert_eq!(cfg.engines, Config::default().engines);
+    }
+    let old = r#"
+default_engine = "codex"
+context_budget_chars = 17000
+claude_live_quota = false
+summarizer = "none"
+[[engines]]
+id = "codex"
+enabled = false
+binary = "synthetic-engine"
+model = "gpt-6.1-sol"
+effort = "high"
+extra_args = ["--synthetic"]
+[reset_rights]
+claude = 2
+codex = 3
+"#;
+    let before = load_config_text(old).unwrap();
+    let after = load_config_text(&format!("{old}\n[telegram]\nnotify = \"away\"\n")).unwrap();
+    assert_eq!(before.engines, after.engines);
+    assert_eq!(before.reset_rights, after.reset_rights);
+    assert_eq!(after.reset_rights.claude, Some(2));
+    assert_eq!(after.reset_rights.codex, Some(3));
+    assert_eq!(after.summarizer, SummarizerMode::Off);
+    assert!(!after.claude_live_quota);
+    assert_eq!(after.default_engine, EngineId::Codex);
+    assert_eq!(after.context_budget_chars, 17000);
+    assert_eq!(after.telegram.notify, NotifyMode::Away);
+    assert_eq!(load_config_text(&toml::to_string(&after).unwrap()).unwrap(), after);
+}
+
+#[test]
+fn telegram_accepts_positive_ids_and_inclusive_wait_bounds() {
+    for minutes in [1, 45, 1440] {
+        let text = format!(r#"[telegram]
+allowed_user_ids = [101, 202]
+notify = "away"
+auto_continue_enabled = false
+auto_continue_wait_minutes = {minutes}
+fallback_order = ["codex", "agy", "claude"]
+"#);
+        let cfg = load_config_text(&text).unwrap();
+        assert_eq!(cfg.telegram.allowed_user_ids, vec![101, 202]);
+        assert_eq!(cfg.telegram.auto_continue_wait_minutes, minutes);
+        assert!(!cfg.telegram.auto_continue_enabled);
+        assert_eq!(cfg.telegram.fallback_order, vec![EngineId::Codex, EngineId::Agy, EngineId::Claude]);
+        assert!(!format!("{cfg:?}").contains("101"));
+        assert!(!format!("{:?}", cfg.telegram).contains("202"));
+    }
+}
+
+#[test]
+fn telegram_invalid_config_is_rejected_without_ids_in_error_chain() {
+    for entry in [
+        "allowed_user_ids = [0]",
+        "allowed_user_ids = [-101]",
+        "allowed_user_ids = [101, 101]",
+        "allowed_user_ids = [9223372036854775808]",
+        "allowed_user_ids = [\"synthetic-private-id\"]",
+        "allowed_user_ids = [101.5]",
+        "fallback_order = [\"codex\", \"codex\"]",
+        "fallback_order = [\"unknown-engine\"]",
+        "notify = \"unknown-notify\"",
+        "auto_continue_wait_minutes = 0",
+        "auto_continue_wait_minutes = 1441",
+        "auto_continue_wait_minutes = -1",
+    ] {
+        let error = load_config_text(&format!("[telegram]\n{entry}")).unwrap_err();
+        let debug = format!("{error:?} {error:#}");
+        for private in ["101", "9223372036854775808", "synthetic-private-id"] {
+            assert!(!debug.contains(private), "hata kimlik içermemeli");
+        }
+    }
+}
+
+#[test]
+fn telegram_allowlist_is_bounded() {
+    use ultron_core::config::MAX_TELEGRAM_ALLOWED_USERS;
+    let mut cfg = Config::default();
+    cfg.telegram.allowed_user_ids = (1..=MAX_TELEGRAM_ALLOWED_USERS as i64).collect();
+    assert!(cfg.telegram.validate().is_ok());
+    cfg.telegram.allowed_user_ids.push(MAX_TELEGRAM_ALLOWED_USERS as i64 + 1);
+    assert!(cfg.telegram.validate().is_err());
+    assert!(load_config_text(&toml::to_string(&cfg).unwrap()).is_err());
+}

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::config::EngineId;
+use crate::config::{EngineId, NotifyMode, TelegramConfig};
 use crate::db::StoredEvent;
 use crate::engine::ToolPolicy;
 use crate::paths::Paths;
@@ -81,6 +81,22 @@ pub enum Request {
         limit: usize,
     },
     Status,
+    TelegramStatus,
+    /// Yalnız yerel onaylayıcı; token argv veya webview üzerinden alınmaz.
+    TelegramSetToken {
+        token: String,
+    },
+    TelegramTest,
+    GetTelegramSettings,
+    SetTelegramSettings {
+        notify: NotifyMode,
+        auto_continue_enabled: bool,
+        auto_continue_wait_minutes: u32,
+        fallback_order: Vec<EngineId>,
+    },
+    DesktopHeartbeat {
+        instance_id: String,
+    },
     ListProjects,
     ListChats {
         project_id: Option<String>,
@@ -178,6 +194,105 @@ pub struct PolicySettings {
     pub trash_retention_days: u32,
 }
 
+/// İzinli kimlikleri veya token'ı taşımaz; yazma sırasında liste korunur.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramSettings {
+    pub notify: NotifyMode,
+    pub auto_continue_enabled: bool,
+    pub auto_continue_wait_minutes: u32,
+    pub fallback_order: Vec<EngineId>,
+}
+
+impl From<&TelegramConfig> for TelegramSettings {
+    fn from(config: &TelegramConfig) -> Self {
+        Self {
+            notify: config.notify,
+            auto_continue_enabled: config.auto_continue_enabled,
+            auto_continue_wait_minutes: config.auto_continue_wait_minutes,
+            fallback_order: config.fallback_order.clone(),
+        }
+    }
+}
+
+impl TelegramSettings {
+    pub fn validate(&self) -> Result<()> {
+        TelegramConfig {
+            notify: self.notify,
+            auto_continue_enabled: self.auto_continue_enabled,
+            auto_continue_wait_minutes: self.auto_continue_wait_minutes,
+            fallback_order: self.fallback_order.clone(),
+            ..TelegramConfig::default()
+        }.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramConnectionState {
+    Connected,
+    MissingToken,
+    MissingAllowedUsers,
+    Error,
+}
+
+/// Sağlayıcı mesajı veya URL yerine kullanılan kapalı güvenli hata kümesi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelegramErrorCode {
+    NotVerified,
+    InvalidToken,
+    CredentialUnavailable,
+    Network,
+    Timeout,
+    Unauthorized,
+    PollConflict,
+    RateLimited,
+    ProviderUnavailable,
+    InvalidResponse,
+    DeliveryUncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramStatusSnapshot {
+    pub state: TelegramConnectionState,
+    pub allowed_user_count: usize,
+    pub settings: TelegramSettings,
+    pub error: Option<TelegramErrorCode>,
+}
+
+impl TelegramStatusSnapshot {
+    /// `verified` yalnız başarılı Bot API doğrulaması/yoklamasıyla sağlanır.
+    pub fn from_health(
+        allowed_user_count: usize,
+        token_present: bool,
+        verified: bool,
+        error: Option<TelegramErrorCode>,
+        settings: TelegramSettings,
+    ) -> Self {
+        use TelegramConnectionState as State;
+        let (state, error) = if allowed_user_count == 0 {
+            (State::MissingAllowedUsers, None)
+        } else if !token_present {
+            (State::MissingToken, None)
+        } else if let Some(error) = error {
+            (State::Error, Some(error))
+        } else if !verified {
+            (State::Error, Some(TelegramErrorCode::NotVerified))
+        } else {
+            (State::Connected, None)
+        };
+        Self { state, allowed_user_count, settings, error }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramTestReport {
+    pub attempted: usize,
+    pub delivered: usize,
+    pub failed: usize,
+    pub uncertain: usize,
+}
+
 fn default_approval_wait_secs() -> u32 {
     300
 }
@@ -185,6 +300,78 @@ fn default_approval_wait_secs() -> u32 {
 #[cfg(test)]
 mod approval_tests {
     use super::*;
+
+    #[test]
+    fn telegram_requests_roundtrip_and_redact_sensitive_debug() {
+        let requests = [
+            Request::TelegramStatus,
+            Request::TelegramSetToken { token: "synthetic-bot-secret".into() },
+            Request::TelegramTest,
+            Request::GetTelegramSettings,
+            Request::SetTelegramSettings {
+                notify: NotifyMode::Away,
+                auto_continue_enabled: false,
+                auto_continue_wait_minutes: 1440,
+                fallback_order: vec![EngineId::Agy, EngineId::Codex],
+            },
+            Request::DesktopHeartbeat { instance_id: "synthetic-private-instance".into() },
+        ];
+        for request in requests {
+            let wire = serde_json::to_string(&request).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), request);
+            let debug = format!("{request:?}");
+            assert!(!debug.contains("synthetic-bot-secret"));
+            assert!(!debug.contains("synthetic-private-instance"));
+        }
+        assert_eq!(
+            format!("{:?}", Request::TelegramSetToken { token: "synthetic".into() }),
+            "TelegramSetToken { token: <gizli> }"
+        );
+        let wire = serde_json::to_value(Request::SetTelegramSettings {
+            notify: NotifyMode::Always, auto_continue_enabled: true,
+            auto_continue_wait_minutes: 45, fallback_order: vec![],
+        }).unwrap();
+        assert_eq!(wire["type"], "set_telegram_settings");
+        assert!(wire.get("allowed_user_ids").is_none());
+    }
+
+    #[test]
+    fn telegram_status_priority_verification_and_safe_wire_contract() {
+        use TelegramConnectionState as State;
+        let settings = TelegramSettings::from(&TelegramConfig::default());
+        for (count, token, verified, error, expected) in [
+            (0, false, false, None, State::MissingAllowedUsers),
+            (0, true, true, Some(TelegramErrorCode::Network), State::MissingAllowedUsers),
+            (1, false, true, Some(TelegramErrorCode::Network), State::MissingToken),
+            (1, true, false, None, State::Error),
+            (1, true, true, Some(TelegramErrorCode::Network), State::Error),
+            (1, true, true, None, State::Connected),
+        ] {
+            let status = TelegramStatusSnapshot::from_health(count, token, verified, error, settings.clone());
+            assert_eq!(status.state, expected);
+            let wire = serde_json::to_value(&status).unwrap();
+            assert!(wire.get("token").is_none());
+            assert!(wire.get("allowed_user_ids").is_none());
+            assert!(wire["settings"].get("allowed_user_ids").is_none());
+            assert_eq!(serde_json::from_value::<TelegramStatusSnapshot>(wire).unwrap(), status);
+        }
+        assert!(settings.validate().is_ok());
+        let mut invalid = settings.clone();
+        invalid.auto_continue_wait_minutes = 0;
+        assert!(invalid.validate().is_err());
+        invalid.auto_continue_wait_minutes = 1441;
+        assert!(invalid.validate().is_err());
+        invalid.auto_continue_wait_minutes = 45;
+        invalid.fallback_order = vec![EngineId::Claude, EngineId::Claude];
+        assert!(invalid.validate().is_err());
+        assert!(serde_json::from_value::<Request>(serde_json::json!({
+            "type": "set_telegram_settings", "notify": "never", "auto_continue_enabled": true,
+            "auto_continue_wait_minutes": 45, "fallback_order": []
+        })).is_err());
+        let report = TelegramTestReport { attempted: 3, delivered: 1, failed: 1, uncertain: 1 };
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(serde_json::from_value::<TelegramTestReport>(wire).unwrap(), report);
+    }
 
     #[test]
     fn send_without_elevated_keeps_legacy_default() {
@@ -372,6 +559,12 @@ impl std::fmt::Debug for Request {
                 .field("chat_id", chat_id)
                 .finish_non_exhaustive(),
             Request::Status => f.write_str("Status"),
+            Request::TelegramStatus => f.write_str("TelegramStatus"),
+            Request::TelegramSetToken { .. } => f.write_str("TelegramSetToken { token: <gizli> }"),
+            Request::TelegramTest => f.write_str("TelegramTest"),
+            Request::GetTelegramSettings => f.write_str("GetTelegramSettings"),
+            Request::SetTelegramSettings { .. } => f.write_str("SetTelegramSettings { .. }"),
+            Request::DesktopHeartbeat { .. } => f.write_str("DesktopHeartbeat { instance_id: <gizli> }"),
             Request::TrashList => f.write_str("TrashList"),
             Request::TrashPut { .. } => f.write_str("TrashPut { paths: <gizli>, token: <gizli> }"),
             Request::TrashRestore { .. } => f.write_str("TrashRestore { id: <gizli> }"),

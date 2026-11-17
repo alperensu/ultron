@@ -263,6 +263,12 @@ fn variant_name(r: &Request) -> &'static str {
         Request::Events { .. } => "events",
         Request::HistorySearch { .. } => "history_search",
         Request::Status => "status",
+        Request::TelegramStatus => "telegram_status",
+        Request::TelegramSetToken { .. } => "telegram_set_token",
+        Request::TelegramTest => "telegram_test",
+        Request::GetTelegramSettings => "get_telegram_settings",
+        Request::SetTelegramSettings { .. } => "set_telegram_settings",
+        Request::DesktopHeartbeat { .. } => "desktop_heartbeat",
         Request::ListProjects => "list_projects",
         Request::ListChats { .. } => "list_chats",
         Request::GetChat { .. } => "get_chat",
@@ -287,7 +293,7 @@ fn variant_name(r: &Request) -> &'static str {
 }
 
 #[tokio::test]
-async fn every_request_variant_is_implemented() {
+async fn every_request_variant_is_implemented_or_explicitly_not_yet_wired() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = paths_in(tmp.path());
     let cwd = abs_dir(tmp.path());
@@ -348,8 +354,44 @@ async fn every_request_variant_is_implemented() {
         // Yanıt Ok/Event ya da tipli bir doğrulama hatası olabilir; "uygulanmadı" olamaz.
         if let Response::Error { message } = next(&mut c).await.expect("yanıt yok") {
             assert!(!message.contains("henüz uygulanmadı"), "{req:?}: {message}");
+            assert_ne!(message, "Telegram ağ geçidi henüz bağlanmadı", "{req:?}");
         }
     }
-    assert_eq!(seen.len(), 27,"her varyant denenmeli: {seen:?}");
+    // Task 10 bu istekleri gerçek beklentilerle uygulanmış gruba taşır.
+    let not_yet_wired = [
+        Request::TelegramStatus,
+        Request::TelegramSetToken { token: "synthetic-token".into() },
+        Request::TelegramTest,
+        Request::GetTelegramSettings,
+        Request::SetTelegramSettings {
+            notify: ultron_core::config::NotifyMode::Away,
+            auto_continue_enabled: false,
+            auto_continue_wait_minutes: 45,
+            fallback_order: vec![],
+        },
+        Request::DesktopHeartbeat { instance_id: "synthetic-instance".into() },
+    ];
+    for req in not_yet_wired {
+        seen.insert(variant_name(&req));
+        assert_eq!(error_of(&h, req).await, "Telegram ağ geçidi henüz bağlanmadı");
+    }
+    assert_eq!(seen.len(), 33,"her varyant denenmeli: {seen:?}");
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn set_reset_rights_does_not_expose_malformed_config_over_ipc() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let h = start_with(&paths, &unique_pipe(), &LINES).await;
+    let source = "[telegram]\nallowed_user_ids = [101,,202]\n";
+    let file = paths.root.join("config.toml");
+    std::fs::write(&file, source).unwrap();
+    let message = error_of(&h, Request::SetResetRights { pool: "claude".into(), count: 1 }).await;
+    assert_eq!(message, "config.toml çözümlenemedi");
+    for private in ["101", "202", "allowed_user_ids", "[telegram]"] {
+        assert!(!message.contains(private), "{message}");
+    }
+    assert_eq!(std::fs::read_to_string(file).unwrap(), source);
     h.shutdown().await;
 }

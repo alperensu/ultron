@@ -44,6 +44,31 @@ pub enum EngineEvent {
         message: String,
         resets_at: Option<DateTime<Utc>>,
     },
+    QuotaWaitStarted {
+        logical_turn_id: String,
+        engine: EngineId,
+        resets_at: Option<DateTime<Utc>>,
+        reason: QuotaWaitReason,
+    },
+    QuotaResumed {
+        logical_turn_id: String,
+        engine: EngineId,
+        resets_at: Option<DateTime<Utc>>,
+        reason: QuotaWaitReason,
+    },
+    QuotaHandoff {
+        logical_turn_id: String,
+        from: EngineId,
+        to: EngineId,
+        resets_at: Option<DateTime<Utc>>,
+        reason: QuotaWaitReason,
+    },
+    QuotaWaitStopped {
+        logical_turn_id: String,
+        engine: EngineId,
+        resets_at: Option<DateTime<Utc>>,
+        reason: QuotaWaitReason,
+    },
     TurnCompleted,
     Error {
         message: String,
@@ -107,6 +132,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quota_lifecycle_events_roundtrip_with_safe_reasons() {
+        let resets_at = Some(DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().with_timezone(&Utc));
+        let events = [
+            EngineEvent::QuotaWaitStarted { logical_turn_id: "synthetic-turn".into(), engine: EngineId::Codex, resets_at, reason: QuotaWaitReason::ResetScheduled },
+            EngineEvent::QuotaResumed { logical_turn_id: "synthetic-turn".into(), engine: EngineId::Codex, resets_at, reason: QuotaWaitReason::ResetReached },
+            EngineEvent::QuotaHandoff { logical_turn_id: "synthetic-turn".into(), from: EngineId::Codex, to: EngineId::Agy, resets_at: None, reason: QuotaWaitReason::FallbackSelected },
+            EngineEvent::QuotaWaitStopped { logical_turn_id: "synthetic-turn".into(), engine: EngineId::Agy, resets_at: None, reason: QuotaWaitReason::NeedsAttention },
+        ];
+        for (event, kind) in events.into_iter().zip(["quota_wait_started", "quota_resumed", "quota_handoff", "quota_wait_stopped"]) {
+            let wire = serde_json::to_value(&event).unwrap();
+            assert_eq!(wire["type"], kind);
+            assert_eq!(serde_json::from_value::<EngineEvent>(wire).unwrap(), event);
+        }
+    }
+
+    #[test]
     fn policy_violation_masks_and_bounds_wire_fields() {
         let secret = ["sentetik", "deger"].join("_");
         let event = EngineEvent::PolicyViolation {
@@ -135,6 +176,25 @@ pub enum SwitchReason {
     User,
     Quota,
     Error,
+}
+
+/// Ham motor/sağlayıcı metni yerine kullanılan kalıcı ve güvenli durum gerekçesi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaWaitReason {
+    ResetScheduled,
+    ResetReached,
+    ResetUnknown,
+    ResetBeyondWait,
+    FallbackSelected,
+    FallbackExhausted,
+    RetryBackoff,
+    Disabled,
+    Cancelled,
+    Superseded,
+    Completed,
+    NeedsAttention,
+    LocalApprovalRequired,
 }
 
 impl EngineEvent {

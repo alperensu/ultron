@@ -2,7 +2,10 @@
 //! testler sunucuyu süreç içinde başlatır.
 
 pub mod keepawake;
+pub mod auto_continue;
 pub mod server;
+pub mod telegram;
+pub mod turn_service;
 pub(crate) mod trash_ops;
 
 use std::collections::HashMap;

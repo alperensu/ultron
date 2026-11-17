@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::Paths;
@@ -82,6 +82,71 @@ pub enum SummarizerMode {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyMode {
+    #[default]
+    Always,
+    Away,
+}
+
+pub const MAX_TELEGRAM_ALLOWED_USERS: usize = 128;
+
+/// Kimlik listesi yalnız yerel config tarafından yönetilir; Debug bunu göstermez.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    pub allowed_user_ids: Vec<i64>,
+    pub notify: NotifyMode,
+    pub auto_continue_enabled: bool,
+    pub auto_continue_wait_minutes: u32,
+    pub fallback_order: Vec<EngineId>,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            allowed_user_ids: Vec::new(),
+            notify: NotifyMode::Always,
+            auto_continue_enabled: true,
+            auto_continue_wait_minutes: 45,
+            fallback_order: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("allowed_user_ids", &"<gizli>")
+            .field("notify", &self.notify)
+            .field("auto_continue_enabled", &self.auto_continue_enabled)
+            .field("auto_continue_wait_minutes", &self.auto_continue_wait_minutes)
+            .field("fallback_order", &self.fallback_order)
+            .finish()
+    }
+}
+
+impl TelegramConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.allowed_user_ids.len() > MAX_TELEGRAM_ALLOWED_USERS {
+            bail!("telegram izinli kullanıcı sayısı sınırı aşıldı");
+        }
+        let mut ids = std::collections::HashSet::new();
+        if self.allowed_user_ids.iter().any(|id| *id <= 0 || !ids.insert(*id)) {
+            bail!("telegram izinli kullanıcı listesi pozitif ve tekrarsız olmalı");
+        }
+        if !(1..=1440).contains(&self.auto_continue_wait_minutes) {
+            bail!("telegram otomatik devam süresi 1–1440 dakika olmalı");
+        }
+        let mut engines = std::collections::HashSet::new();
+        if self.fallback_order.iter().any(|engine| !engines.insert(*engine)) {
+            bail!("telegram fallback sırası tekrarsız olmalı");
+        }
+        Ok(())
+    }
+}
+
 /// Ultron genel yapılandırması (`root\config.toml`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -95,6 +160,7 @@ pub struct Config {
     pub claude_live_quota: bool,
     /// Özetleyici seçimi: `auto` (varsayılan), `agy`, `claude-haiku` veya `none`.
     pub summarizer: SummarizerMode,
+    pub telegram: TelegramConfig,
 }
 
 /// Havuz başına kalan sıfırlama hakları; `None` = bilinmiyor.
@@ -116,6 +182,7 @@ impl Default for Config {
             reset_rights: ResetRights::default(),
             claude_live_quota: true,
             summarizer: SummarizerMode::Auto,
+            telegram: TelegramConfig::default(),
         }
     }
 }
@@ -126,13 +193,15 @@ impl Config {
         let file = paths.root.join("config.toml");
         let cfg: Config = if file.exists() {
             let text = std::fs::read_to_string(&file)?;
-            toml::from_str(&text)?
+            // TOML hata bağlamı kaynak satırını (izinli kimlikleri de) içerebilir.
+            toml::from_str(&text).map_err(|_| anyhow!("config.toml çözümlenemedi"))?
         } else {
             Config::default()
         };
         for engine in &cfg.engines {
             engine.validate()?;
         }
+        cfg.telegram.validate()?;
         Ok(cfg)
     }
 }
