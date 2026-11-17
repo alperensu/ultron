@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use common::{connect, next, paths_in, unique_pipe};
-use ultron_core::db::approvals::{Approval, ApprovalStatus, ResolvedBy};
+use ultron_core::db::approvals::{Approval, ApprovalKind, ApprovalStatus, ResolvedBy};
 use ultron_core::ipc::{Client, Request, Response};
 use ultron_core::policy::{Action, Decision};
 use ultron_core::{Config, Db, EngineId, Paths};
@@ -108,6 +108,7 @@ async fn requester_cannot_resolve_or_list_another_connections_approvals() {
     }
     let mut checking = begin(&h, &paths, None, 30).await;
     let row = pending(&h).await;
+    assert_eq!(row.kind, ApprovalKind::PolicyTool);
     let mut requester = connect(&h).await;
     requester
         .send(&Request::ListApprovals {

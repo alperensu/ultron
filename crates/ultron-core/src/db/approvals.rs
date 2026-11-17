@@ -100,6 +100,206 @@ impl Approval {
             && serde_json::from_str::<Action>(&self.action_json)
                 .is_ok_and(|action| !is_elevation(&action))
     }
+
+    /// Telegram'dan onaylanabilecek araç kümesi (koordinatör kararı, Faz 4 Görev 6):
+    /// yalnız Delete ve GitHistory kategorileri ile düz dosya yazma/silme onayları
+    /// (`rm`/`del`, `git push|reset|rebase|commit`, Write/Edit/Delete araçları).
+    /// Install, Deploy, Publish, Secrets, SystemConfig, Finance, tur yükseltmesi,
+    /// Unknown ve her `ultron.*` idari eylemi yalnız masaüstünde onaylanır
+    /// ("masaüstünde onay gerekli", düğmesiz). İdari işaretler araç adına ve
+    /// korunan çalışma zamanı yol bölümlerine karşı eşleştirilir; serbest metin
+    /// (dal, dosya adı, commit mesajı) idari sayılmaz. Bu ek yetenek filtresi
+    /// politika değerlendirmesini veya yerel onayı değiştirmez.
+    pub fn is_telegram_tool(&self) -> bool {
+        if !self.is_policy_tool()
+            || !matches!(self.category, RiskCategory::Delete | RiskCategory::GitHistory)
+            || self.action_json.contains("[MASKED]")
+        {
+            return false;
+        }
+        serde_json::from_str::<Action>(&self.action_json).is_ok_and(|action| remote_action(&action))
+    }
+
+    /// Telegram bildirimi için kısa özet (en çok 48 karakter): program/araç başı ve
+    /// hedefin yalnız dosya adı. Kontrol karakterleri atılır, metin gizli bilgi
+    /// maskesinden geçer; ham eylem JSON'u veya tam yol asla dönmez.
+    pub fn telegram_summary(&self) -> String {
+        let Ok(action) = serde_json::from_str::<Action>(&self.action_json) else { return String::new(); };
+        let raw = match &action {
+            Action::FileWrite { path } => format!("yaz {}", basename(&path.to_string_lossy())),
+            Action::FileDelete { path } => format!("sil {}", basename(&path.to_string_lossy())),
+            Action::Shell { command, .. } => shell_summary(command),
+            Action::ToolCall { tool, input } => match input.as_object() {
+                Some(fields) if matches!(tool.to_ascii_lowercase().as_str(), "bash" | "shell" | "powershell" | "run_command") => {
+                    fields.get("command").and_then(Value::as_str).map(shell_summary).unwrap_or_default()
+                }
+                Some(fields) => {
+                    let target = fields.get("path").or_else(|| fields.get("file_path")).and_then(Value::as_str)
+                        .map(basename).unwrap_or_default();
+                    format!("{} {}", tool, target)
+                }
+                None => String::new(),
+            },
+            Action::Network { .. } => String::new(),
+        };
+        let clean: String = raw.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
+        let masked = mask_secrets(&crate::turn_grant::mask_live(&clean)).0;
+        let squeezed = masked.split_whitespace().collect::<Vec<_>>().join(" ");
+        if squeezed.chars().count() > 48 {
+            format!("{}…", squeezed.chars().take(47).collect::<String>())
+        } else {
+            squeezed
+        }
+    }
+}
+
+fn basename(path: &str) -> String {
+    path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default().to_owned()
+}
+
+fn shell_summary(command: &str) -> String {
+    let Some(tokens) = shell_tokens(command) else { return String::new(); };
+    let Some(program) = tokens.first() else { return String::new(); };
+    let program = basename(program).to_lowercase();
+    if program == "git" {
+        let sub = tokens.get(1).map(String::as_str).unwrap_or_default();
+        let target = if sub == "commit" { None } else {
+            tokens.iter().skip(2).rfind(|token| !token.starts_with('-')).map(|token| basename(token))
+        };
+        return format!("git {sub} {}", target.unwrap_or_default());
+    }
+    let target = tokens.iter().skip(1).rfind(|token| !token.starts_with('-')).map(|token| basename(token));
+    format!("{program} {}", target.unwrap_or_default())
+}
+
+/// Korunan çalışma zamanı yol bölümleri ve dosya adları (idari yazma hedefleri).
+fn protected_path(text: &str) -> bool {
+    text.split(['/', '\\']).any(|segment| {
+        let seg = segment.to_ascii_lowercase();
+        matches!(seg.as_str(), ".ultron" | ".git" | ".ssh" | ".claude" | ".codex" | ".gnupg"
+            | "config.toml" | "policy.toml" | "approver" | "approver.token" | "token")
+    })
+}
+
+fn remote_path(path: &std::path::Path) -> bool {
+    let text = path.to_string_lossy();
+    !text.is_empty()
+        && !text.chars().any(|ch| ch.is_control() || "$%`*?[]".contains(ch))
+        && !protected_path(&text)
+}
+
+/// Tek komut için jeton ayırıcı: yalnız güvenli karakterler; çift tırnak yalnız
+/// `git commit` iletisi içindir. `; | & $ ` ( ) < >`, satır sonu ve kaçışlar reddedilir.
+fn shell_tokens(command: &str) -> Option<Vec<String>> {
+    const OUTSIDE: &str = " -_./\\:=@+,~*";
+    const INSIDE: &str = " -_./:,@#+=?'";
+    let mut tokens = Vec::new();
+    let (mut current, mut started, mut quoted) = (String::new(), false, false);
+    let mut used_quote = false;
+    for ch in command.chars() {
+        if quoted {
+            match ch {
+                '"' => quoted = false,
+                ch if ch.is_alphanumeric() || INSIDE.contains(ch) => current.push(ch),
+                _ => return None,
+            }
+        } else if ch == '"' {
+            quoted = true;
+            started = true;
+            used_quote = true;
+        } else if ch == ' ' {
+            if started { tokens.push(std::mem::take(&mut current)); started = false; }
+        } else if ch.is_alphanumeric() || OUTSIDE.contains(ch) {
+            current.push(ch);
+            started = true;
+        } else {
+            return None;
+        }
+    }
+    if quoted { return None; }
+    if started { tokens.push(current); }
+    let git_commit = tokens.first().is_some_and(|t| t.eq_ignore_ascii_case("git"))
+        && tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("commit"));
+    if used_quote && !git_commit { return None; }
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+/// `rm`/`del` hedefi: tek basit glob (`build/*`) olabilir; kök, ev, üst dizin ve çıplak `*` olamaz.
+fn remote_delete_target(token: &str) -> bool {
+    let trimmed = token.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || matches!(trimmed, "." | ".." | "~") || trimmed.ends_with(':')
+        || token.starts_with('~') || token.contains('=')
+    {
+        return false;
+    }
+    if let Some(star) = token.find('*') {
+        let prefix = &token[..star];
+        let name_start = prefix.rfind(['/', '\\']).map_or(0, |i| i + 1);
+        // Yıldız yalnız son bölümde; öncesinde gerçek bir dizin adı bulunmalı.
+        let dir = prefix[..name_start].trim_end_matches(['/', '\\']);
+        let rest = &token[star..];
+        if rest.contains(['/', '\\']) || dir.is_empty() || matches!(dir, "." | "..") || dir.ends_with(':') {
+            return false;
+        }
+    }
+    !protected_path(token)
+}
+
+fn remote_shell(command: &str) -> bool {
+    // Script, alt kabuk, zincir ve dinamik genişletme sınıflandırılmaz.
+    let Some(tokens) = shell_tokens(command) else { return false; };
+    let leaf = basename(&tokens[0]).to_lowercase();
+    let program = leaf.strip_suffix(".exe").unwrap_or(&leaf);
+    let args = &tokens[1..];
+    match program {
+        "rm" | "del" | "erase" | "remove-item" => {
+            let mut targets = 0;
+            for arg in args {
+                let flag = arg.starts_with('-')
+                    || (arg.len() == 2 && arg.starts_with('/') && program != "rm");
+                if flag { continue; }
+                if !remote_delete_target(arg) { return false; }
+                targets += 1;
+            }
+            targets > 0
+        }
+        "git" => {
+            let Some(sub) = args.first().map(|s| s.to_ascii_lowercase()) else { return false; };
+            matches!(sub.as_str(), "push" | "reset" | "rebase" | "commit")
+                && !args.iter().skip(1).any(|arg| {
+                    let lower = arg.to_ascii_lowercase();
+                    lower.contains('*') || lower == "-c" || lower == "-x" || lower.starts_with("--exec")
+                        || lower.starts_with("--config") || lower.starts_with("--upload-pack")
+                        || lower.starts_with("--receive-pack")
+                })
+        }
+        _ => false,
+    }
+}
+
+fn remote_action(action: &Action) -> bool {
+    match action {
+        Action::FileWrite { path } | Action::FileDelete { path } => remote_path(path),
+        Action::Shell { command, cwd } => remote_path(cwd) && remote_shell(command),
+        Action::Network { .. } => false,
+        Action::ToolCall { tool, input } => {
+            let Some(fields) = input.as_object() else { return false; };
+            match tool.to_ascii_lowercase().as_str() {
+                "bash" | "shell" | "powershell" | "run_command" => {
+                    fields.keys().all(|key| matches!(key.as_str(), "command" | "cwd"))
+                        && fields.get("command").and_then(Value::as_str).is_some_and(remote_shell)
+                        && fields.get("cwd").is_none_or(|value| value.as_str().is_some_and(|path| remote_path(path.as_ref())))
+                }
+                "read" | "write" | "edit" | "delete" | "file_read" | "file_write" | "file_delete" => {
+                    fields.keys().all(|key| matches!(key.as_str(), "path" | "file_path" | "content" | "old_string" | "new_string" | "replace_all"))
+                        && fields.get("path").or_else(|| fields.get("file_path"))
+                            .and_then(Value::as_str).is_some_and(|path| remote_path(path.as_ref()))
+                        && fields.get("file_path").is_none_or(|value| value.as_str().is_some_and(|path| remote_path(path.as_ref())))
+                }
+                _ => false,
+            }
+        }
+    }
 }
 
 fn is_elevation(action: &Action) -> bool {
@@ -513,6 +713,128 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telegram_filter_keeps_unknown_elevation_admin_and_ambiguous_actions_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db.sqlite")).unwrap();
+        let actions = [
+            (Action::FileDelete { path: "synthetic.txt".into() }, true),
+            (Action::Shell { command: "rm synthetic.txt".into(), cwd: "synthetic/workspace".into() }, true),
+            (Action::Shell { command: "git push origin main".into(), cwd: "synthetic/workspace".into() }, true),
+            (Action::Shell { command: "ultron trash restore synthetic".into(), cwd: "synthetic/workspace".into() }, false),
+            (Action::Shell { command: "rm synthetic.txt; ultron telegram set-token".into(), cwd: "synthetic/workspace".into() }, false),
+            (Action::Shell { command: "powershell -EncodedCommand synthetic".into(), cwd: "synthetic/workspace".into() }, false),
+            (Action::FileWrite { path: "synthetic/config.toml".into() }, false),
+            (Action::FileWrite { path: "synthetic/policy.toml".into() }, false),
+            (Action::ToolCall { tool: "ultron.trash.purge".into(), input: serde_json::json!({}) }, false),
+            (Action::ToolCall { tool: "ultron.settings".into(), input: serde_json::json!({ "allowed_user_ids": [101] }) }, false),
+            (Action::ToolCall { tool: "import_catalog".into(), input: serde_json::json!({}) }, false),
+            (Action::ToolCall { tool: "future_unknown_tool".into(), input: serde_json::json!({}) }, false),
+            (Action::ToolCall { tool: "Write".into(), input: serde_json::json!({ "path": "synthetic.txt", "command": "admin" }) }, false),
+            (Action::ToolCall { tool: "Write".into(), input: serde_json::json!({ "path": "synthetic.txt", "content": "synthetic" }) }, true),
+            (Action::ToolCall { tool: "Bash".into(), input: serde_json::json!({ "command": "rm synthetic.txt" }) }, true),
+            (Action::FileDelete { path: "$dynamic".into() }, false),
+        ];
+        for (action, expected) in actions {
+            let row = db.create_policy_tool_approval(None, EngineId::Claude, RiskCategory::Delete, "synthetic", &action, None).unwrap();
+            assert_eq!(row.is_telegram_tool(), expected, "{action:?}");
+            let mut unknown = row.clone(); unknown.kind = ApprovalKind::Unknown;
+            assert!(!unknown.is_telegram_tool());
+            let mut elevation = row.clone(); elevation.kind = ApprovalKind::TurnElevation;
+            assert!(!elevation.is_telegram_tool());
+            for category in [RiskCategory::Secrets, RiskCategory::SystemConfig] {
+                let mut sensitive = row.clone(); sensitive.category = category;
+                assert!(!sensitive.is_telegram_tool());
+            }
+            let mut malformed = row; malformed.action_json = "not-json".into();
+            assert!(!malformed.is_telegram_tool());
+        }
+    }
+
+    #[test]
+    fn telegram_decision_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db.sqlite")).unwrap();
+        let cwd = "synthetic/workspace";
+        let shell = |command: &str| Action::Shell { command: command.into(), cwd: cwd.into() };
+        let rows = [
+            // (kategori, eylem, Telegram'dan onaylanabilir mi)
+            (RiskCategory::GitHistory, shell("git push origin feature/import-csv"), true),
+            (RiskCategory::GitHistory, shell("git push origin fix/restore-policy-docs"), true),
+            (RiskCategory::GitHistory, shell("git commit -m \"fix import of policy docs\""), true),
+            (RiskCategory::GitHistory, shell("git commit -am \"don't panic\""), true),
+            (RiskCategory::GitHistory, shell("git reset --hard HEAD~1"), true),
+            (RiskCategory::GitHistory, shell("git rebase main"), true),
+            (RiskCategory::Delete, shell("rm -rf imports"), true),
+            (RiskCategory::Delete, shell("rm -rf build/*"), true),
+            (RiskCategory::Delete, shell("rm restore_notes.txt"), true),
+            (RiskCategory::Delete, Action::FileDelete { path: "synthetic/import_policy.txt".into() }, true),
+            (RiskCategory::Delete, Action::FileWrite { path: "synthetic/src/main.rs".into() }, true),
+            (RiskCategory::Delete, Action::ToolCall { tool: "Write".into(), input: serde_json::json!({ "file_path": "synthetic/a.txt", "content": "x" }) }, true),
+            // Zincir, yönlendirme, genişletme, alt kabuk ve satır sonu reddedilir.
+            (RiskCategory::GitHistory, shell("git push origin main; rm -rf x"), false),
+            (RiskCategory::GitHistory, shell("git push origin main && git reset --hard"), false),
+            (RiskCategory::GitHistory, shell("git commit -m \"$(whoami)\""), false),
+            (RiskCategory::GitHistory, shell("git commit -m \"a `b`\""), false),
+            (RiskCategory::GitHistory, shell("git commit -m \"a | b\""), false),
+            (RiskCategory::GitHistory, shell("git commit -m \"a\nb\""), false),
+            (RiskCategory::GitHistory, shell("git push > out.txt"), false),
+            (RiskCategory::GitHistory, shell("git rebase --exec \"make\" main"), false),
+            (RiskCategory::GitHistory, shell("git -c core.hooksPath=x push"), false),
+            (RiskCategory::GitHistory, shell("git status"), false),
+            (RiskCategory::Delete, shell("echo \"hi\""), false),
+            (RiskCategory::Delete, shell("rm -rf *"), false),
+            (RiskCategory::Delete, shell("rm -rf /"), false),
+            (RiskCategory::Delete, shell("rm -rf ~"), false),
+            (RiskCategory::Delete, shell("rm -rf ."), false),
+            (RiskCategory::Delete, shell("rm -rf (x)"), false),
+            (RiskCategory::Delete, shell("rm -rf $HOME"), false),
+            (RiskCategory::Delete, shell("rm -rf"), false),
+            (RiskCategory::Delete, shell("rm a\nrm b"), false),
+            // İdari araç adı, korunan yol ve idari komutlar masaüstünde kalır.
+            (RiskCategory::Delete, shell("ultron trash restore synthetic"), false),
+            (RiskCategory::Delete, shell("rm ~/.ultron/config.toml"), false),
+            (RiskCategory::Delete, shell("rm -rf synthetic/.git"), false),
+            (RiskCategory::Delete, Action::FileWrite { path: "synthetic/config.toml".into() }, false),
+            (RiskCategory::Delete, Action::FileWrite { path: "synthetic/.ultron/x".into() }, false),
+            (RiskCategory::Delete, Action::ToolCall { tool: "ultron.trash.purge".into(), input: serde_json::json!({}) }, false),
+            (RiskCategory::Delete, Action::ToolCall { tool: "ultron.settings".into(), input: serde_json::json!({}) }, false),
+            // Kategori kararı: Install/Deploy/Publish/Secrets/SystemConfig/Finance yalnız masaüstü.
+            (RiskCategory::Install, shell("rm synthetic.txt"), false),
+            (RiskCategory::Deploy, shell("git push origin main"), false),
+            (RiskCategory::Publish, shell("git push origin main"), false),
+            (RiskCategory::Secrets, Action::FileWrite { path: "synthetic/a.txt".into() }, false),
+            (RiskCategory::SystemConfig, Action::FileWrite { path: "synthetic/a.txt".into() }, false),
+            (RiskCategory::Finance, Action::FileWrite { path: "synthetic/a.txt".into() }, false),
+        ];
+        for (category, action, expected) in rows {
+            let row = db.create_policy_tool_approval(None, EngineId::Claude, category, "synthetic", &action, None).unwrap();
+            assert_eq!(row.is_telegram_tool(), expected, "{category:?} {action:?}");
+            drain(&db);
+            db.resolve_approval(&row.id, false, ResolvedBy::Timeout).unwrap();
+            drain(&db);
+        }
+    }
+
+    #[test]
+    fn telegram_summary_is_short_masked_and_path_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db.sqlite")).unwrap();
+        let make = |action: Action| db.create_policy_tool_approval(None, EngineId::Claude, RiskCategory::Delete, "r", &action, None).unwrap();
+        let file = make(Action::FileDelete { path: "synthetic/dir/note.txt".into() });
+        assert_eq!(file.telegram_summary(), "sil note.txt");
+        let git = make(Action::Shell { command: "git push origin feature/import-csv".into(), cwd: "w".into() });
+        assert_eq!(git.telegram_summary(), "git push import-csv");
+        let rm = make(Action::Shell { command: "rm -rf synthetic/dir/build".into(), cwd: "w".into() });
+        assert_eq!(rm.telegram_summary(), "rm build");
+        let long = make(Action::FileWrite { path: format!("d/{}", "x".repeat(200)).into() });
+        assert!(long.telegram_summary().chars().count() <= 48);
+        let secret = make(Action::FileWrite { path: "d/password=synthetic-secret.txt".into() });
+        assert!(!secret.telegram_summary().contains("synthetic-secret"));
+        let control = make(Action::FileWrite { path: "d/a\nb\u{1b}c.txt".into() });
+        assert!(!control.telegram_summary().chars().any(char::is_control));
+    }
 
     fn action() -> Action {
         Action::FileDelete {

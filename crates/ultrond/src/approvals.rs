@@ -1,7 +1,7 @@
 //! Daemon onay kuyruğu. Kalıcı karar tek kaynaktır; oneshot yalnız bekleyeni uyandırır.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -11,6 +11,10 @@ use ultron_core::db::StoredEvent;
 use ultron_core::db::approvals::{Approval, ApprovalStatus, ResolvedBy};
 use ultron_core::policy::{self, Action, Decision, PolicyConfig, PolicyContext};
 use ultron_core::{Db, EngineId, EventLog, Paths};
+use ultron_core::config::TelegramConfig;
+
+use crate::telegram::contracts::{BoxFuture, GatewayError, TurnOrigin};
+use crate::turn_service::ToolApprovalResolver;
 
 pub struct Approvals {
     db: Arc<Db>,
@@ -43,6 +47,48 @@ impl Approvals {
 
     pub fn subscribe_global(&self) -> broadcast::Receiver<StoredEvent> {
         self.global.subscribe()
+    }
+
+    pub fn get(&self, id: &str) -> Result<Option<Approval>> {
+        self.db.get_approval(id)
+    }
+
+    /// Bildirim teslimi bekleyenin özgün (en çok 300 sn) süresini uzatamaz.
+    pub fn remaining_wait(&self, id: &str) -> Result<Option<Duration>> {
+        let waiters = self.waiters.lock().map_err(|_| anyhow!("onay kilidi zehirlendi"))?;
+        Ok(waiters.get(id).map(|waiter| waiter.deadline.saturating_duration_since(Instant::now())))
+    }
+
+    /// Local yalnız IPC require_approver sonrasında kullanılmalıdır. Telegram kaynağı
+    /// nonce doğrulayan daemon iç capability'sidir; istemciden serileştirilmez.
+    pub fn resolve_tool_approval(
+        &self,
+        origin: TurnOrigin,
+        id: &str,
+        approve: bool,
+        telegram: &TelegramConfig,
+    ) -> Result<ApprovalStatus, GatewayError> {
+        if let TurnOrigin::Telegram { user_id, private_chat_id, update_id } = origin {
+            if telegram.validate().is_err() || user_id <= 0 || private_chat_id != user_id
+                || update_id < 0 || !telegram.allowed_user_ids.contains(&user_id)
+            {
+                return Err(GatewayError::Unauthorized);
+            }
+            let row = self.get(id).map_err(|_| GatewayError::Unavailable)?
+                .ok_or(GatewayError::NotFound)?;
+            if !row.is_telegram_tool() { return Err(GatewayError::Unauthorized); }
+            if row.status != ApprovalStatus::Pending { return Err(GatewayError::InvalidInput); }
+            // Kalıcı yaş sınırı, kaybolmuş waiter veya saat geri atlamasında da izin vermez.
+            let age = chrono::Utc::now().signed_duration_since(row.created_at);
+            if age < chrono::Duration::zero()
+                || age >= chrono::Duration::seconds(i64::from(MAX_APPROVAL_WAIT_SECS))
+            {
+                let _ = self.resolve(id, false, ResolvedBy::Timeout);
+                return Err(GatewayError::InvalidInput);
+            }
+        }
+        self.resolve(id, approve, ResolvedBy::Approver)
+            .map(|row| row.status).map_err(|_| GatewayError::Unavailable)
     }
 
     /// Oturum yöneticisinin oluşturduğu onayları da aynı kalıcı outbox yoluyla yayınlar.
@@ -199,7 +245,8 @@ impl Approvals {
                 .waiters
                 .lock()
                 .map_err(|_| anyhow!("onay kilidi zehirlendi"))?;
-            let row = self.db.create_owned_approval(
+            // Elevation nitelikli eylem burada PolicyTool kaynağı kazanamaz.
+            let row = self.db.create_policy_tool_approval(
                 chat_id.as_deref(),
                 engine,
                 category,
@@ -250,6 +297,30 @@ impl Approvals {
             Decision::Deny {
                 reason: "işlem reddedildi veya onay süresi doldu".into(),
             }
+        })
+    }
+}
+
+/// TurnService ve approver IPC aynı resolver yolunu paylaşır. Ayar okuma kilidi
+/// karar bitene kadar tutulur; izinli listeden çıkarma eski snapshot ile yarışmaz.
+pub struct SharedToolApprovalResolver {
+    approvals: Arc<Approvals>,
+    telegram: Arc<RwLock<TelegramConfig>>,
+}
+
+impl SharedToolApprovalResolver {
+    pub fn new(approvals: Arc<Approvals>, telegram: Arc<RwLock<TelegramConfig>>) -> Self {
+        Self { approvals, telegram }
+    }
+}
+
+impl ToolApprovalResolver for SharedToolApprovalResolver {
+    fn resolve<'a>(&'a self, origin: TurnOrigin, approval_id: &'a str, approve: bool)
+        -> BoxFuture<'a, Result<ApprovalStatus, GatewayError>>
+    {
+        Box::pin(async move {
+            let telegram = self.telegram.read().map_err(|_| GatewayError::Unavailable)?;
+            self.approvals.resolve_tool_approval(origin, approval_id, approve, &telegram)
         })
     }
 }
