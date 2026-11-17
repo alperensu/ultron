@@ -109,13 +109,22 @@ export function Settings() {
 }
 
 function HistoryImportReport({ report }: { report: ProjectImportReport }) {
+  const failed = report.rows.filter((row) => row.note_status.startsWith("hata")).length;
+  const attempted = report.rows.filter((row) => row.note_updated || row.note_status.startsWith("hata")).length;
+  const message = failed === 0
+    ? "Projeler içe aktarıldı."
+    : failed === attempted
+      ? "Projeler alındı ancak hiçbir not yazılamadı."
+      : "Projeler içe aktarıldı; bazı notlar yazılamadı.";
   return (
     <div role="status" aria-label="Proje içe aktarma sonucu">
-      <p>Projeler içe aktarıldı.</p>
+      <p>{message}</p>
       <dl className="settings-report">
         <div><dt>Proje</dt><dd>{report.rows.length}</dd></div>
         <div><dt>Yeni proje</dt><dd>{report.created}</dd></div>
         <div><dt>Güncellenen not</dt><dd>{report.notes_updated}</dd></div>
+        <div><dt>Başarısız not</dt><dd>{failed}</dd></div>
+        <div><dt>Eşleşmeyen oturum</dt><dd>{report.unmatched_sessions}</dd></div>
       </dl>
     </div>
   );

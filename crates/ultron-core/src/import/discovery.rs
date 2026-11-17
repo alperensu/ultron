@@ -620,7 +620,14 @@ pub fn discover(home: &Path, filters: &Filters) -> Discovery {
             unmatched += 1;
             continue;
         }
-        let Some(disp) = cand.get(&key) else { continue };
+        let Some(disp) = cand.get(&key) else {
+            // Worktree'den çözülen ana checkout kabul edilmediyse (profil dışı, geçersiz...)
+            // oturum eşleşmemiş sayılır; doğrudan elenen klasörler sessizce atlanır.
+            if matches!(t, Target::Path(_)) && key != normalized_project_path(&raw.cwd) {
+                unmatched += 1;
+            }
+            continue;
+        };
         let entry = out.entry(key).or_insert_with(|| FoundProject {
             path: disp.clone(),
             ..FoundProject::default()

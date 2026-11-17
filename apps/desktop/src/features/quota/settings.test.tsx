@@ -5,10 +5,10 @@ import { createFakeBridge, type ProjectImportReport } from "../../lib/bridge";
 import { Settings } from "../../screens/Settings";
 import { createAppStore, StoreProvider } from "../../state/store";
 
-function setup() {
+function setup(override?: ProjectImportReport) {
   const bridge = createFakeBridge({
     catalogImportReport: { imported: 3, updated: 2 },
-    projectImportReport: {
+    projectImportReport: override ?? {
       dry_run: false,
       rows: [
         { path: "/ornek/a", name: "a", claude_sessions: 2, codex_sessions: 1, worker_sessions: 0, project_created: true, note_updated: true, note_status: "güncellendi" },
@@ -36,10 +36,29 @@ it("import_report_rendered", async () => {
 
   await user.click(screen.getByRole("button", { name: "Projeleri içe aktar" }));
   const history = await screen.findByRole("status", { name: "Proje içe aktarma sonucu" });
-  for (const [label, count] of [["Proje", 2], ["Yeni proje", 1], ["Güncellenen not", 1]] as const) {
+  for (const [label, count] of [["Proje", 2], ["Yeni proje", 1], ["Güncellenen not", 1], ["Başarısız not", 0], ["Eşleşmeyen oturum", 0]] as const) {
     expect(within(history).getByText(label).nextElementSibling).toHaveTextContent(String(count));
   }
   expect(bridge.calls).toContainEqual({ cmd: "import_projects", args: [] });
+});
+
+it("project_import_does_not_claim_success_when_all_notes_failed", async () => {
+  const row = { path: "/ornek/a", name: "a", claude_sessions: 1, codex_sessions: 0, worker_sessions: 0, project_created: true, note_updated: false, note_status: "hata: motor çöktü" };
+  setup({
+    dry_run: false,
+    rows: [row, { ...row, path: "/ornek/b", name: "b" }],
+    created: 2,
+    notes_updated: 0,
+    summarizer: "agy",
+    unmatched_sessions: 4,
+  });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Projeleri içe aktar" }));
+  const report = await screen.findByRole("status", { name: "Proje içe aktarma sonucu" });
+  expect(within(report).getByText("Projeler alındı ancak hiçbir not yazılamadı.")).toBeVisible();
+  expect(within(report).queryByText("Projeler içe aktarıldı.")).not.toBeInTheDocument();
+  expect(within(report).getByText("Başarısız not").nextElementSibling).toHaveTextContent("2");
+  expect(within(report).getByText("Eşleşmeyen oturum").nextElementSibling).toHaveTextContent("4");
 });
 
 it("history_import_has_pending_and_error_states_without_duplicate_submission", async () => {

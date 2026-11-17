@@ -71,7 +71,9 @@ fn plan(
     };
     // Özetleyici yokken özetlenmiş bir notu ham alıntılı nota düşürme.
     if kind == "null" && !prev.summarizer.is_empty() && prev.summarizer != "null" {
-        return Plan::Skip("güncel");
+        // Not korunur; kaynaklar değiştiyse eski kaldığı açıkça bildirilir.
+        let changed = stamp > prev.source_stamp || total != prev.claude_sessions + prev.codex_sessions;
+        return Plan::Skip(if changed { "bayat (özetleyici yok)" } else { "güncel" });
     }
     let kind_changed = prev.summarizer != kind;
     let prev_total = prev.claude_sessions + prev.codex_sessions;

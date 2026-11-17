@@ -6,7 +6,17 @@ test("settings_live_quota_is_read_only_note", async ({ page }) => {
     ...sampleBridge(),
     defaultEngine: "codex",
     catalogImportReport: { imported: 2, updated: 1 },
-    historyImportReport: { files: 3, chats: 2, messages: 12, skipped: 1, masked: 4 },
+    projectImportReport: {
+      dry_run: false,
+      rows: [
+        { path: "/ornek/a", name: "a", claude_sessions: 2, codex_sessions: 1, worker_sessions: 0, project_created: true, note_updated: true, note_status: "güncellendi" },
+        { path: "/ornek/b", name: "b", claude_sessions: 1, codex_sessions: 0, worker_sessions: 3, project_created: true, note_updated: false, note_status: "hata: motor çöktü" },
+      ],
+      created: 2,
+      notes_updated: 1,
+      summarizer: "agy",
+      unmatched_sessions: 5,
+    },
   });
   await page.goto("/ayarlar");
   await expect(page.getByRole("heading", { name: "Ayarlar", level: 1 })).toBeVisible();
@@ -20,13 +30,14 @@ test("settings_live_quota_is_read_only_note", async ({ page }) => {
   await page.getByRole("textbox", { name: "Katalog dosyasının yolu" }).fill("/ornek/katalog.md");
   await page.getByRole("button", { name: "Proje kataloğunu içe aktar" }).click();
   await expect(page.getByRole("status", { name: "Katalog içe aktarma sonucu" })).toContainText("Eklenen proje2");
-  await page.getByRole("button", { name: "Claude Code geçmişini içe aktar" }).click();
-  const report = page.getByRole("status", { name: "Geçmiş içe aktarma sonucu" });
-  await expect(report).toContainText("Dosya3");
-  await expect(report).toContainText("Sohbet2");
-  await expect(report).toContainText("Mesaj12");
-  await expect(report).toContainText("Atlanan1");
-  await expect(report).toContainText("Maskelenen4");
+  await page.getByRole("button", { name: "Projeleri içe aktar" }).click();
+  const report = page.getByRole("status", { name: "Proje içe aktarma sonucu" });
+  await expect(report).toContainText("Projeler içe aktarıldı; bazı notlar yazılamadı.");
+  await expect(report).toContainText("Proje2");
+  await expect(report).toContainText("Yeni proje2");
+  await expect(report).toContainText("Güncellenen not1");
+  await expect(report).toContainText("Başarısız not1");
+  await expect(report).toContainText("Eşleşmeyen oturum5");
 });
 
 test("quota_sheet_opens_from_ring", async ({ page }) => {

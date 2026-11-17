@@ -149,25 +149,101 @@ const MIGRATIONS: &[&str] = &[
         codex_sessions INTEGER NOT NULL
     );
     "#,
-    // v11: NOT ekleyici. Aynı `path_key`li yinelenen proje satırlarını en küçük kimlikte
-    // birleştirir (sohbetler ve notlar ona taşınır, yinelenenler silinir), sonra `path_key`
-    // üzerinde benzersiz indeks kurar; notlara özetleyici türü sütunu eklenir.
+    // v11: NOT ekleyici. Önce (Rust tarafında, `dedupe_projects`) aynı `path_key`li yinelenen
+    // proje satırları birleştirilir; sonra `path_key` üzerinde benzersiz indeks kurulur ve
+    // notlara özetleyici türü sütunu eklenir.
     r#"
     ALTER TABLE project_notes ADD COLUMN summarizer TEXT NOT NULL DEFAULT '';
-    UPDATE chats SET project_id = (
-        SELECT MIN(p2.id) FROM projects p2
-        WHERE p2.path_key = (SELECT p1.path_key FROM projects p1 WHERE p1.id = chats.project_id))
-    WHERE project_id IN (
-        SELECT p.id FROM projects p WHERE p.path_key != ''
-          AND p.id != (SELECT MIN(q.id) FROM projects q WHERE q.path_key = p.path_key));
-    DELETE FROM project_notes WHERE project_id IN (
-        SELECT p.id FROM projects p WHERE p.path_key != ''
-          AND p.id != (SELECT MIN(q.id) FROM projects q WHERE q.path_key = p.path_key));
-    DELETE FROM projects WHERE path_key != ''
-      AND id != (SELECT MIN(q.id) FROM projects q WHERE q.path_key = projects.path_key);
     CREATE UNIQUE INDEX projects_path_key_unique ON projects(path_key) WHERE path_key != '';
     "#,
 ];
+
+type DupRow = (String, String, Option<String>, Option<String>, Option<String>, i64);
+
+/// Aynı `path_key`li projeleri tek satırda toplar. Tutulan satır deterministiktir: en çok
+/// sohbeti olan, sonra en yeni `last_active_at`, sonra en küçük kimlik. Üst veri birleştirilir
+/// (boş ad/açıklama doldurulur, takma adların birleşimi, en yeni etkinlik); sohbetler taşınır;
+/// tutulan satırın notu yoksa yinelenenin notu ona taşınır, aksi halde silinir.
+fn dedupe_projects(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    use std::collections::BTreeMap;
+    let rows: Vec<(String, DupRow)> = {
+        let mut stmt = tx.prepare(
+            "SELECT p.path_key, p.id, p.name, p.aliases_json, p.description, p.last_active_at,
+                    (SELECT COUNT(*) FROM chats c WHERE c.project_id = p.id)
+             FROM projects p WHERE p.path_key != ''",
+        )?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    let mut groups: BTreeMap<String, Vec<DupRow>> = BTreeMap::new();
+    for (key, row) in rows {
+        groups.entry(key).or_default().push(row);
+    }
+    for (_, mut group) in groups {
+        if group.len() < 2 {
+            continue;
+        }
+        // (kimlik, ad, takma adlar JSON, açıklama, son etkinlik, sohbet sayısı)
+        group.sort_by(|a, b| {
+            b.5.cmp(&a.5)
+                .then_with(|| b.4.cmp(&a.4)) // Some > None, daha yeni önce
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let (keeper, dups) = group.split_first().expect("grup en az iki satırlı");
+        let mut name = keeper.1.clone();
+        let mut description = keeper.3.clone().filter(|d| !d.trim().is_empty());
+        let mut last = keeper.4.clone();
+        let mut aliases: Vec<String> =
+            serde_json::from_str(keeper.2.as_deref().unwrap_or("[]")).unwrap_or_default();
+        for d in dups {
+            if name.trim().is_empty() {
+                name = d.1.clone();
+            }
+            if description.is_none() {
+                description = d.3.clone().filter(|x| !x.trim().is_empty());
+            }
+            last = last.max(d.4.clone());
+            let extra: Vec<String> =
+                serde_json::from_str(d.2.as_deref().unwrap_or("[]")).unwrap_or_default();
+            for a in extra {
+                if !aliases.contains(&a) {
+                    aliases.push(a);
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE projects SET name = ?2, description = ?3, last_active_at = ?4, aliases_json = ?5
+             WHERE id = ?1",
+            rusqlite::params![keeper.0, name, description, last, serde_json::to_string(&aliases)?],
+        )?;
+        for d in dups {
+            tx.execute(
+                "UPDATE chats SET project_id = ?2 WHERE project_id = ?1",
+                rusqlite::params![d.0, keeper.0],
+            )?;
+            let keeper_has_note: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM project_notes WHERE project_id = ?1",
+                [&keeper.0],
+                |r| r.get(0),
+            )?;
+            if keeper_has_note == 0 {
+                tx.execute(
+                    "UPDATE project_notes SET project_id = ?2 WHERE project_id = ?1",
+                    rusqlite::params![d.0, keeper.0],
+                )?;
+            } else {
+                tx.execute("DELETE FROM project_notes WHERE project_id = ?1", [&d.0])?;
+            }
+            tx.execute("DELETE FROM projects WHERE id = ?1", [&d.0])?;
+        }
+    }
+    Ok(())
+}
 
 /// Bekleyen migrasyonları `user_version` üzerinden sırayla uygular.
 pub fn apply(conn: &Connection) -> Result<()> {
@@ -178,6 +254,9 @@ pub fn apply(conn: &Connection) -> Result<()> {
             continue;
         }
         let tx = conn.unchecked_transaction()?;
+        if version == 11 {
+            dedupe_projects(&tx)?;
+        }
         tx.execute_batch(sql)?;
         if version == 6 {
             // SQLite LOWER yalnız ASCII işler; uygulamayla aynı Unicode kuralını kullan.
@@ -221,28 +300,47 @@ mod tests {
     }
 
     #[test]
-    fn v11_merges_duplicate_projects_moves_chats_and_adds_unique_index() {
+    fn v11_merges_duplicate_projects_deterministically_and_adds_unique_index() {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         for (idx, sql) in MIGRATIONS.iter().take(10).enumerate() {
             conn.execute_batch(sql).unwrap();
             conn.pragma_update(None, "user_version", (idx + 1) as i64).unwrap();
         }
-        for id in ["b", "a"] {
-            conn.execute("INSERT INTO projects(id, name, path, path_key) VALUES (?1, 'p', 'C:/x', 'c:/x')", [id]).unwrap();
+        // Grup 1: `b` en çok sohbetli (tutulur); `a` daha küçük kimlikli ama sohbetsiz.
+        conn.execute("INSERT INTO projects(id, name, path, path_key, aliases_json, description, last_active_at) VALUES ('a', 'ad-a', 'C:/x', 'c:/x', '[\"x\"]', 'aciklama-a', '2026-03-01T00:00:00+00:00')", []).unwrap();
+        conn.execute("INSERT INTO projects(id, name, path, path_key, aliases_json, description, last_active_at) VALUES ('b', 'ad-b', 'C:/x', 'c:/x', '[\"y\"]', NULL, '2026-02-01T00:00:00+00:00')", []).unwrap();
+        conn.execute("INSERT INTO chats(id, project_id, title, created_at) VALUES ('k', 'b', 't', '2026-01-01T00:00:00Z')", []).unwrap();
+        // Yalnız yinelenen `a`nın notu var: tutulan `b`ye taşınmalı.
+        conn.execute("INSERT INTO project_notes(project_id, markdown, updated_at, source_stamp, claude_sessions, codex_sessions) VALUES ('a', 'not-a', 'x', 1, 1, 0)", []).unwrap();
+        // Grup 2: sohbet yok, etkinlik eşit değil -> en yeni etkinlik (`n2`) tutulur; ikisinin de notu var.
+        conn.execute("INSERT INTO projects(id, name, path, path_key, last_active_at) VALUES ('n1', 'n1', 'C:/z', 'c:/z', '2026-01-01T00:00:00+00:00')", []).unwrap();
+        conn.execute("INSERT INTO projects(id, name, path, path_key, last_active_at) VALUES ('n2', 'n2', 'C:/z', 'c:/z', '2026-05-01T00:00:00+00:00')", []).unwrap();
+        for id in ["n1", "n2"] {
+            conn.execute("INSERT INTO project_notes(project_id, markdown, updated_at, source_stamp, claude_sessions, codex_sessions) VALUES (?1, ?1, 'x', 1, 1, 0)", [id]).unwrap();
         }
         conn.execute("INSERT INTO projects(id, name, path, path_key) VALUES ('c', 'q', 'C:/y', 'c:/y')", []).unwrap();
-        conn.execute("INSERT INTO chats(id, project_id, title, created_at) VALUES ('k', 'b', 't', '2026-01-01T00:00:00Z')", []).unwrap();
-        conn.execute("INSERT INTO project_notes(project_id, markdown, updated_at, source_stamp, claude_sessions, codex_sessions) VALUES ('b', 'n', 'x', 1, 1, 0)", []).unwrap();
+        apply(&conn).unwrap();
         apply(&conn).unwrap();
         let ids: Vec<String> = conn
             .prepare("SELECT id FROM projects ORDER BY id").unwrap()
             .query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(ids, ["a", "c"]);
+        assert_eq!(ids, ["b", "c", "n2"]);
         let owner: String = conn.query_row("SELECT project_id FROM chats WHERE id = 'k'", [], |r| r.get(0)).unwrap();
-        assert_eq!(owner, "a");
-        let notes: i64 = conn.query_row("SELECT COUNT(*) FROM project_notes", [], |r| r.get(0)).unwrap();
-        assert_eq!(notes, 0);
+        assert_eq!(owner, "b");
+        // Üst veri birleşti: açıklama dolduruldu, takma adlar birleşti, en yeni etkinlik alındı.
+        let meta: (String, Option<String>, String, Option<String>) = conn.query_row(
+            "SELECT name, description, aliases_json, last_active_at FROM projects WHERE id = 'b'", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!(meta.0, "ad-b");
+        assert_eq!(meta.1.as_deref(), Some("aciklama-a"));
+        assert_eq!(meta.2, "[\"y\",\"x\"]");
+        assert_eq!(meta.3.as_deref(), Some("2026-03-01T00:00:00+00:00"));
+        // Notlar: `a`nın notu `b`ye taşındı; `n1`in notu silindi, `n2`ninki kaldı.
+        let notes: Vec<(String, String)> = conn
+            .prepare("SELECT project_id, markdown FROM project_notes ORDER BY project_id").unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(notes, [("b".into(), "not-a".into()), ("n2".into(), "n2".into())]);
         assert!(conn.execute("INSERT INTO projects(id, name, path, path_key) VALUES ('z', 'p', 'C:/X', 'c:/x')", []).is_err());
     }
 
@@ -281,10 +379,10 @@ mod tests {
         apply(&conn).unwrap();
         apply(&conn).unwrap();
         let keys: Vec<String> = conn.prepare("SELECT path_key FROM projects ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        // v11 yinelenen satırı en küçük kimlikte (p1) birleştirir; sohbet p1'e taşınır.
+        // v11 yinelenen satırı en çok sohbetli olanda (p2) birleştirir.
         assert_eq!(keys, ["c:/work/alpha", "c:/ödeme"]);
         let row: (String, String, String) = conn.query_row("SELECT path, aliases_json, project_id FROM projects JOIN chats ON projects.id = chats.project_id", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
-        assert_eq!(row, (r"C:\Work\Alpha\".into(), "[\"kept\"]".into(), "p1".into()));
+        assert_eq!(row, ("c:/work/alpha".into(), "[\"kept\"]".into(), "p2".into()));
         let state: (i64, i64, i64) = conn.query_row("SELECT byte_offset, file_size, generation FROM import_state", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         assert_eq!(state, (42, 42, 0));
     }

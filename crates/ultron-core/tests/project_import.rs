@@ -546,6 +546,35 @@ async fn note_keeps_history_when_sessions_shrink_and_refreshes_on_summarizer_cha
     let r = import_projects(&db, &NullSummarizer, &w.home, &w.filters, false).await.unwrap();
     assert!(r.rows.iter().all(|row| !row.note_updated));
     assert_eq!(note_of(&db).markdown, before);
+    assert!(r.rows.iter().all(|row| row.note_status != "bayat (özetleyici yok)"));
+
+    // Kaynaklar değişti ama özetleyici yok: not korunur, bayat olduğu bildirilir.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    claude_session(&w.home, "iyi", "s10", &good_s, "sonradan gelen is", "on");
+    let r = import_projects(&db, &NullSummarizer, &w.home, &w.filters, false).await.unwrap();
+    let row = r.rows.iter().find(|row| row.path.to_lowercase() == good_s.to_lowercase()).unwrap();
+    assert_eq!(row.note_status, "bayat (özetleyici yok)");
+    assert!(!row.note_updated);
+    assert_eq!(note_of(&db).markdown, before);
+}
+
+#[test]
+fn linked_worktree_with_main_outside_profile_is_unmatched_not_a_project() {
+    let w = world();
+    // Ana checkout profil dışında (katalogda yok); worktree profil içinde.
+    let outside_repo = w.outside.parent().unwrap().join("dis-repo");
+    std::fs::create_dir_all(outside_repo.join(".git/worktrees/x")).unwrap();
+    std::fs::write(outside_repo.join(".git/worktrees/x/commondir"), "../..
+").unwrap();
+    let wt = w.work.join("dis-worktree");
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}
+", outside_repo.join(".git/worktrees/x").display())).unwrap();
+    claude_session(&w.home, "dw", "s1", &wt.to_string_lossy(), "worktree istegi", "x");
+    let d = discover(&w.home, &w.filters);
+    assert_eq!(d.projects.len(), 4);
+    assert!(d.projects.iter().all(|p| !p.path.to_lowercase().contains("dis-repo") && !p.path.contains("dis-worktree")));
+    assert_eq!(d.unmatched_sessions, 3);
 }
 
 #[test]

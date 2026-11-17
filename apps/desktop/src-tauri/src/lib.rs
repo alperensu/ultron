@@ -63,7 +63,6 @@ pub fn run() {
             commands::set_reset_rights,
             commands::route_message,
             commands::import_catalog,
-            commands::import_claude_history,
             commands::import_projects,
             commands::status,
         ])
