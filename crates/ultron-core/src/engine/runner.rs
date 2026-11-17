@@ -83,6 +83,28 @@ pub fn resolve_binary_in(binary: &str, dirs: &[std::path::PathBuf]) -> Result<St
     Ok(binary.to_string())
 }
 
+/// Tüm motorlar için ortak ortam hazırlığı: tur kapsamlı çöp kutusu belirteci
+/// (`ULTRON_TURN_TOKEN`) ve `ultron` ikilisinin bulunduğu dizinin PATH başına eklenmesi.
+pub fn apply_turn_env(req: &TurnRequest, cmd: &mut Command) {
+    match crate::turn_grant::token_for_chat(&req.chat_id) {
+        Some(token) => cmd.env("ULTRON_TURN_TOKEN", token),
+        None => cmd.env_remove("ULTRON_TURN_TOKEN"),
+    };
+    let ultron_dir = std::env::current_exe()
+        .ok()
+        .map(|exe| exe.with_file_name("ultron.exe"))
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    if let Some(dir) = ultron_dir {
+        let mut entries = vec![dir];
+        if let Some(existing) = std::env::var_os("PATH") {
+            entries.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(joined) = std::env::join_paths(entries) {
+            cmd.env("PATH", joined);
+        }
+    }
+}
+
 /// Motor komutunu çalıştırır; stdout'taki her tam satırı olaya çevirip `sink`'e yollar.
 /// Yarım son satır (süreç ölünce ya da iptalde) atılır.
 pub async fn run_turn(
@@ -105,6 +127,7 @@ pub async fn run_turn(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     engine.prepare_command(&req, &mut cmd)?;
+    apply_turn_env(&req, &mut cmd);
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

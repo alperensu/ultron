@@ -291,6 +291,12 @@ fn claude_workspace_policy_denies_destructive_commands() {
         .expect("--disallowedTools bayrağı yok");
     assert!(spec.args[pos + 1].contains("Bash(rm:*)"));
     assert!(spec.args[pos + 1].contains("Bash(git push:*)"));
+    let allow = spec
+        .args
+        .iter()
+        .position(|a| a == "--allowedTools")
+        .expect("--allowedTools bayrağı yok");
+    assert_eq!(spec.args[allow + 1], "Bash(ultron trash:*)");
     let mode = spec.args.iter().position(|a| a == "--permission-mode").unwrap();
     assert_eq!(spec.args[mode + 1], "acceptEdits");
 }

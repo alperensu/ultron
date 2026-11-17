@@ -68,6 +68,12 @@ pub enum Cmd {
         #[command(subcommand)]
         action: ImportCmd,
     },
+    /// Dosyaları Ultron çöp kutusuna taşır (`trash <yol>...`), listeler (`trash list`) ya da
+    /// geri yükler (`trash restore <id>`, `trash purge <id>`). Dosya adı `list` ise `./list` yazın.
+    Trash {
+        #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Servis durumunu gösterir.
     Status,
     /// ultrond'u oturum açılışında başlatan görevi kurar ya da kaldırır.
@@ -122,8 +128,8 @@ pub fn hook_action(input: &Value) -> Result<Action> {
         Ok(())
     };
     if tool == "NotebookEdit" && args.get("edit_mode").and_then(Value::as_str) == Some("delete") {
-        // Hücre silme içerik kaybıdır; silme onayı akışına girer.
-        return Ok(Action::FileDelete {
+        // Hücre silme bir düzenlemedir (not defterinin kendisi silinmez): yazma eylemi sayılır.
+        return Ok(Action::FileWrite {
             path: path("notebook_path")?,
         });
     }
@@ -535,6 +541,7 @@ pub fn render_event(ev: &StoredEvent, verbose: bool) -> Option<String> {
             clip(&one_line(&s("summary")), 160)
         )),
         "quota_exhausted" => Some(format!("!! KOTA DOLDU: {}", s("message"))),
+        "policy_notice" => Some(format!("[Ultron] {}", s("message"))),
         "error" => Some(format!("HATA: {}", s("message"))),
         other => verbose.then(|| format!("[{other}]")),
     }
@@ -596,6 +603,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             action: PolicyCmd::Check,
         } => policy_check_main().await,
         Cmd::Service { action } => service(action),
+        Cmd::Trash { args } => trash_main(args).await,
         Cmd::Chat {
             chat,
             engine,
@@ -807,4 +815,75 @@ fn service(action: ServiceCmd) -> Result<()> {
         bail!("schtasks başarısız oldu ({status})");
     }
     Ok(())
+}
+
+async fn one_reply(client: &mut Client, request: &Request) -> Result<Value> {
+    client.send(request).await?;
+    match client.next().await? {
+        Some(Response::Ok { data }) => Ok(data),
+        Some(Response::Error { message }) => bail!("{message}"),
+        _ => bail!("servis geçerli yanıt vermedi"),
+    }
+}
+
+async fn trash_main(args: Vec<String>) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => {
+            let mut client = connect_approver().await?;
+            let data = one_reply(&mut client, &Request::TrashList).await?;
+            let entries = data["entries"].as_array().cloned().unwrap_or_default();
+            if entries.is_empty() {
+                println!("çöp kutusu boş");
+            }
+            for e in entries {
+                println!(
+                    "{}  {}  {}",
+                    e["id"].as_str().unwrap_or("?"),
+                    e["deleted_at"].as_str().unwrap_or("?"),
+                    e["original_path"].as_str().unwrap_or("?")
+                );
+            }
+            Ok(())
+        }
+        Some(cmd @ ("restore" | "purge")) if args.len() == 2 => {
+            let mut client = connect_approver().await?;
+            let id = args[1].clone();
+            if cmd == "restore" {
+                let data = one_reply(&mut client, &Request::TrashRestore { id }).await?;
+                println!("geri yüklendi: {}", data["path"].as_str().unwrap_or("?"));
+            } else {
+                one_reply(&mut client, &Request::TrashPurge { id }).await?;
+                println!("çöp kaydı kalıcı silindi");
+            }
+            Ok(())
+        }
+        Some("restore" | "purge") => bail!("kullanım: ultron trash restore|purge <id>"),
+        _ => {
+            let paths = args
+                .iter()
+                .map(|arg| {
+                    std::path::absolute(arg)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .map_err(anyhow::Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut client = connect_or_start().await?;
+            let data = one_reply(
+                &mut client,
+                &Request::TrashPut {
+                    paths,
+                    token: std::env::var("ULTRON_TURN_TOKEN").unwrap_or_default(),
+                },
+            )
+            .await?;
+            for e in data["entries"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "çöp kutusuna taşındı: {} (id {})",
+                    e["original_path"].as_str().unwrap_or("?"),
+                    e["id"].as_str().unwrap_or("?")
+                );
+            }
+            Ok(())
+        }
+    }
 }

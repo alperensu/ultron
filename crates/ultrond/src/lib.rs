@@ -3,6 +3,7 @@
 
 pub mod keepawake;
 pub mod server;
+pub(crate) mod trash_ops;
 
 use std::collections::HashMap;
 use std::sync::Arc;

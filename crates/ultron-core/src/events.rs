@@ -72,6 +72,10 @@ pub enum EngineEvent {
         by: crate::db::approvals::ResolvedBy,
     },
     /// Gerçekleşmiş bir eylemin tur sonu denetiminde saptanan politika ihlali.
+    /// Ultron'un hata olmayan bilgilendirmesi (ör. onaylı silmenin `ultron trash` yönlendirmesi).
+    PolicyNotice {
+        message: String,
+    },
     PolicyViolation {
         #[serde(serialize_with = "serialize_violation_command", deserialize_with = "deserialize_violation_command")]
         command: String,

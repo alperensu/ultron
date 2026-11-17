@@ -22,6 +22,8 @@ pub struct EventLog {
     paths: Paths,
     seq_lock: Mutex<()>,
     tx: broadcast::Sender<StoredEvent>,
+    /// Sohbet başına akış maskeleyicisi (olay sınırlarına yayılan tur belirteçleri için).
+    streams: Mutex<std::collections::HashMap<String, crate::turn_grant::StreamMasker>>,
 }
 
 impl EventLog {
@@ -32,6 +34,7 @@ impl EventLog {
             paths,
             seq_lock: Mutex::new(()),
             tx,
+            streams: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -43,7 +46,50 @@ impl EventLog {
         ev: EngineEvent,
     ) -> Result<StoredEvent> {
         validate_chat_id(chat_id)?;
-        let payload = serde_json::to_value(&ev)?;
+        // Sıra korunsun diye akış kilidi tüm kalıcılaştırma boyunca tutulur.
+        let mut streams = self
+            .streams
+            .lock()
+            .map_err(|_| anyhow!("akış maskeleme kilidi zehirlendi"))?;
+        let tokens = crate::turn_grant::live_tokens();
+        let masker = streams.entry(chat_id.to_owned()).or_default();
+        let ev = match ev {
+            EngineEvent::AssistantText { text } => {
+                let out = masker.push(&text, &tokens);
+                if out.is_empty() && !text.is_empty() {
+                    // Tamamen tutuldu (olası belirteç öneki): kalıcılaştırılmaz; dönen kayıt
+                    // yer tutucudur (seq 0), çağıranlar değerini kullanmaz.
+                    return Ok(StoredEvent {
+                        id: Uuid::new_v4().to_string(),
+                        chat_id: chat_id.to_string(),
+                        session_id: session_id.map(str::to_string),
+                        seq: 0,
+                        ts: Utc::now(),
+                        kind: "assistant_text".into(),
+                        payload: serde_json::json!({"type": "assistant_text", "text": ""}),
+                    });
+                }
+                EngineEvent::AssistantText { text: out }
+            }
+            other => {
+                if let Some(held) = masker.flush(&tokens) {
+                    self.persist(chat_id, session_id, EngineEvent::AssistantText { text: held })?;
+                }
+                other
+            }
+        };
+        self.persist(chat_id, session_id, ev)
+    }
+
+    fn persist(
+        &self,
+        chat_id: &str,
+        session_id: Option<&str>,
+        ev: EngineEvent,
+    ) -> Result<StoredEvent> {
+        let mut payload = serde_json::to_value(&ev)?;
+        // Etkin tur belirteçleri hiçbir olay alanında kalıcılaşmaz veya yayınlanmaz.
+        crate::turn_grant::mask_live_value(&mut payload);
         let kind = payload
             .get("type")
             .and_then(Value::as_str)

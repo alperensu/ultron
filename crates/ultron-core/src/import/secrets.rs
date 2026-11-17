@@ -192,7 +192,8 @@ fn mask_yaml_blocks(s: &str) -> (String, usize) {
 
 /// Gizli bilgi desenlerini `[MASKED]` yapar; (yeni metin, maskelenen sayısı) döner.
 pub fn mask_secrets(s: &str) -> (String, usize) {
-    let (out, mut count) = mask_yaml_blocks(s);
+    let live = crate::turn_grant::mask_live(s);
+    let (out, mut count) = mask_yaml_blocks(&live);
     let (mut out, named_count) = mask_named_values(&out);
     count += named_count;
     for rule in rules() {

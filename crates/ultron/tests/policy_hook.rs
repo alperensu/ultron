@@ -290,7 +290,15 @@ async fn hook_waits_for_user_decision_and_times_out_closed() {
             ));
         };
         let (output, ()) = tokio::join!(check, resolve);
-        assert_eq!(permission(&output), if approve { "allow" } else { "deny" });
+        // Onaylı silmeyi Ultron yapar (çöp kutusu); ham komut hiçbir koşulda allow olmaz.
+        assert_eq!(permission(&output), "deny");
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("ultron trash"),
+            approve
+        );
     }
     let output = check_hook(
         input("Bash", json!({"command":"rm test.txt"}), tmp.path()),
@@ -470,7 +478,7 @@ fn harmless_internal_tools_map_to_tool_call_and_unknown_names_are_reported() {
 }
 
 #[test]
-fn notebook_delete_mode_becomes_file_delete() {
+fn notebook_cell_delete_is_an_edit_not_a_file_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let action = hook_action(&input(
         "NotebookEdit",
@@ -478,7 +486,7 @@ fn notebook_delete_mode_becomes_file_delete() {
         tmp.path(),
     ))
     .unwrap();
-    assert_eq!(action, Action::FileDelete { path: tmp.path().join("n.ipynb") });
+    assert_eq!(action, Action::FileWrite { path: tmp.path().join("n.ipynb") });
 }
 
 #[test]

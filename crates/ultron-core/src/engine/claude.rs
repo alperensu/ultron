@@ -115,6 +115,9 @@ pub fn install_policy_settings(paths: &Paths, chat: &str, ultron: &Path) -> Resu
 }
 
 /// Workspace politikasında engellenen komut desenleri.
+/// Çöp kutusuna taşıma/listeleme; Claude'un kendi izin istemine takılmaması için.
+const WORKSPACE_ALLOW: &str = "Bash(ultron trash:*)";
+
 const WORKSPACE_DENY: &str = "Bash(rm:*),Bash(del:*),Bash(Remove-Item:*),Bash(git push:*)";
 
 /// MCP sunucusu içermeyen satır içi yapılandırma (`--strict-mcp-config` ile birlikte).
@@ -208,6 +211,9 @@ impl Engine for ClaudeEngine {
                 "acceptEdits".into(),
                 "--disallowedTools".into(),
                 WORKSPACE_DENY.into(),
+                // Silme için tek izinli yol; hook yine her çağrıyı denetler (restore/purge onaya düşer).
+                "--allowedTools".into(),
+                WORKSPACE_ALLOW.into(),
             ]),
             ToolPolicy::Full => {}
         }
@@ -348,6 +354,16 @@ fn hook_response_events(raw: &Value) -> Vec<EngineEvent> {
         .and_then(Value::as_str)
         .filter(|s| s.starts_with(HOOK_REASON_PREFIX));
     match reason {
+        // Onaylı silmenin `ultron trash` yönlendirmesi hata değil, bilgi olayıdır.
+        Some(reason)
+            if denied
+                && reason.trim_start_matches(HOOK_REASON_PREFIX)
+                    == crate::policy::APPROVED_DELETE_REDIRECT =>
+        {
+            vec![EngineEvent::PolicyNotice {
+                message: crate::policy::APPROVED_DELETE_REDIRECT.to_owned(),
+            }]
+        }
         Some(reason) if denied || failed => vec![EngineEvent::Error {
             // Yalnız maskeli gerekçe günlüğe geçer; ham stdout/stderr aktarılmaz.
             message: crate::import::mask_secrets(reason.trim_start_matches(HOOK_REASON_PREFIX))

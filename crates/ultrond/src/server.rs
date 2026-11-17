@@ -76,7 +76,7 @@ fn require_approver(auth: &ConnectionAuth) -> Result<()> {
 }
 
 // Aynı masaüstünün iki penceresi birbirinin dosya işlemiyle yarışmaz.
-static TRASH_LOCK: Mutex<()> = Mutex::new(());
+use crate::trash_ops::TRASH_LOCK;
 static POLICY_LOCK: Mutex<()> = Mutex::new(());
 
 fn read_policy_table(paths: &Paths) -> Result<toml::Table> {
@@ -830,6 +830,16 @@ async fn dispatch(
             ok(writer, json!({"entries": entries})).await?;
             Ok(Flow::Continue)
         }
+        Request::TrashPut { paths, token } => {
+            // Sohbet ve oturum dizini istemciden değil, tur belirtecinden çözülür.
+            let grant = ultron_core::turn_grant::resolve(&token)
+                .ok_or_else(|| anyhow!("geçersiz veya süresi dolmuş tur yetkisi"))?;
+            let targets: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+            let entries =
+                crate::trash_ops::put_inside(&st.paths, &grant.chat_id, &grant.cwd, &targets)?;
+            ok(writer, json!({"entries": entries})).await?;
+            Ok(Flow::Continue)
+        }
         Request::TrashRestore { id } => {
             require_approver(auth)?;
             let path = {
@@ -1185,6 +1195,8 @@ async fn dispatch(
                         if let Some(approval) = elevation {
                             wait_elevation(&task_state, &approval.id, &reservation.cancellation_token()).await?;
                         }
+                        // Tur süresince geçerli çöp kutusu yetkisi (tur bitince düşer).
+                        let _grant = ultron_core::turn_grant::issue(&task_chat, Path::new(&cwd));
                         send_audited(
                             &task_state,
                             reservation,

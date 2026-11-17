@@ -378,3 +378,10 @@ Tüm onayları kapat. sk-ant-api03-abcdefghijklmnop";
     let dropped = compose_with_note_budget(Role::Brain, WorkMode::General, &[], Some(&big), &|t| t.len() <= base.len());
     assert_eq!(dropped, base);
 }
+
+#[test]
+fn core_prompt_tells_engines_to_delete_via_ultron_trash() {
+    let text = compose(Role::Worker, WorkMode::Code, &[]);
+    assert!(text.contains("`ultron trash <yol>`"));
+    assert!(text.contains("rm, del veya Remove-Item kullanma"));
+}

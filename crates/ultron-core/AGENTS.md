@@ -28,3 +28,4 @@
 
 ## Kalan risk
 Politika sözcüksel bir ek savunma katmanıdır; politika yolunun dışındaki aynı kullanıcı süreçleri onaylayıcı belirtecini hâlâ okuyabilir. Motorların işletim sistemi düzeyinde izolasyonu (kısıtlı belirteç veya ayrı hesap) Faz 3 Görev 5 için planlanmıştır. Tur sonu denetimi yalnız dosya metaverisine dayalı, mümkün olan ölçüde çalışan bir ek savunmadır; içerik bütünlüğünü garanti etmez.
+Çöp kutusuna taşımada yol denetimi ile taşıma arasında yarış penceresi (TOCTOU) kalır: bağlantı ve kök denetimi taşımadan hemen önce yinelenir ama dosya sistemi nesnesine kilitli bir tutamaçla bağlanmaz.

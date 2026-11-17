@@ -237,7 +237,15 @@ impl Approvals {
             }
         };
         Ok(if status == ApprovalStatus::Approved {
-            Decision::Allow
+            // Silme içeren her onaylı eylem (kategoriden bağımsız) ham olarak çalışmaz: Claude
+            // `ultron trash` ile silmeye yönlendirilir; orada TrashPut kendi denetimlerini yapar.
+            if category == policy::RiskCategory::Delete || policy::is_delete_like(&action) {
+                Decision::Deny {
+                    reason: policy::APPROVED_DELETE_REDIRECT.into(),
+                }
+            } else {
+                Decision::Allow
+            }
         } else {
             Decision::Deny {
                 reason: "işlem reddedildi veya onay süresi doldu".into(),
@@ -793,7 +801,12 @@ mod tests {
                 assert!(events.try_recv().is_err());
             };
             let (decision, ()) = tokio::join!(checking, resolving);
-            assert_eq!(decision.unwrap() == Decision::Allow, approve);
+            let decision = decision.unwrap();
+            assert!(matches!(decision, Decision::Deny { .. }), "ham silme Allow olmaz");
+            assert_eq!(
+                matches!(&decision, Decision::Deny { reason } if reason.contains("ultron trash")),
+                approve
+            );
         }
         assert_eq!(db.events_for_chat("chat", None).unwrap().len(), 2);
         assert!(queue.waiters.lock().unwrap().is_empty());

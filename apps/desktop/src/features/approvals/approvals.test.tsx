@@ -129,3 +129,14 @@ it("policy_violation_is_in_the_timeline_without_stopping_the_turn", () => {
   expect(snapshot.rows.at(-1)).toMatchObject({ type: "system", tone: "policy", text: expect.stringContaining("rm example.txt") });
   expect(snapshot.running).toBe(true);
 });
+
+it("policy_notice_is_not_an_error_and_keeps_the_turn_running", () => {
+  const timeline = createChatTimeline();
+  const snapshot = timeline.append([
+    { id: "example-start", chat_id: "example", session_id: null, seq: 1, ts: new Date().toISOString(), kind: "session_started", payload: {} },
+    { id: "example-notice", chat_id: "example", session_id: null, seq: 2, ts: new Date().toISOString(), kind: "policy_notice", payload: { message: "Onaylandı: silmek için `ultron trash <yol>` kullan." } },
+  ]);
+  expect(snapshot.rows.at(-1)).toMatchObject({ type: "system", tone: "policy", text: expect.stringContaining("ultron trash") });
+  expect(snapshot.rows.at(-1)).not.toMatchObject({ tone: "error" });
+  expect(snapshot.running).toBe(true);
+});

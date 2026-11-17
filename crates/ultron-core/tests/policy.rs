@@ -995,3 +995,97 @@ fn ultron_admin_commands_from_engine_shell_always_ask() {
         assert_eq!(shell(command, &PolicyConfig::default()), Decision::Allow, "{command}");
     }
 }
+
+#[test]
+fn ultron_trash_restore_and_purge_ask_but_list_and_put_allow() {
+    let cfg = PolicyConfig::default();
+    for command in [
+        "ultron trash restore 00000000-0000-4000-8000-000000000000",
+        "ultron.exe trash purge 00000000-0000-4000-8000-000000000000",
+        "cmd /c \"ultron trash restore x\"",
+    ] {
+        assert!(
+            matches!(shell(command, &cfg), Decision::Ask { .. }),
+            "{command}"
+        );
+    }
+    assert_eq!(shell("ultron trash list", &cfg), Decision::Allow);
+    assert_eq!(shell("ultron trash a.txt b.txt", &cfg), Decision::Allow);
+}
+
+#[test]
+fn delete_like_is_lexical_and_category_independent() {
+    use ultron_core::policy::is_delete_like;
+    let cwd = PathBuf::from("C:/workspace/project");
+    let sh = |c: &str| Action::Shell { command: c.into(), cwd: cwd.clone() };
+    for command in ["rm \"$TARGET\"", "cmd /c del a.txt", "Remove-Item a,b", "echo x; rd /s y"] {
+        assert!(is_delete_like(&sh(command)), "{command}");
+    }
+    assert!(is_delete_like(&Action::FileDelete { path: "a".into() }));
+    assert!(!is_delete_like(&sh("git status")));
+    assert!(!is_delete_like(&sh("ultron trash a.txt")));
+}
+
+#[test]
+fn delete_like_catches_escaped_quoted_and_encoded_forms() {
+    use ultron_core::policy::is_delete_like;
+    let cwd = PathBuf::from("C:/workspace/project");
+    let sh = |c: &str| Action::Shell { command: c.into(), cwd: cwd.clone() };
+    for command in [
+        "powershell -Command 'Remove-`Item (Join-Path . victim.txt)'",
+        "TARGET=victim.txt; r''m \"$TARGET\"",
+        "powershell -NoProfile -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAAeAA=",
+        "pwsh -enc AAAA",
+        "cmd /c d^el victim.txt",
+    ] {
+        assert!(is_delete_like(&sh(command)), "{command}");
+    }
+}
+
+#[test]
+fn environment_dumps_are_secret_access() {
+    let cfg = PolicyConfig::default();
+    for command in [
+        "printenv",
+        "printenv ULTRON_TURN_TOKEN",
+        "env",
+        "set",
+        "cmd /c set",
+        "Get-ChildItem env:",
+        "gci env:ULTRON_TURN_TOKEN",
+        "echo $env:ULTRON_TURN_TOKEN",
+        "echo %ULTRON_TURN_TOKEN%",
+        "[Environment]::GetEnvironmentVariables()",
+    ] {
+        assert!(
+            matches!(shell(command, &cfg), Decision::Ask { category: RiskCategory::Secrets, .. }),
+            "{command}: {:?}",
+            shell(command, &cfg)
+        );
+    }
+    assert_eq!(shell("set FOO=1", &cfg), Decision::Allow);
+}
+
+#[test]
+fn ultron_trash_exemption_applies_only_to_a_bare_invocation() {
+    let cfg = PolicyConfig {
+        protected_paths: vec![PathBuf::from("C:/workspace/project/korumali")],
+        ..Default::default()
+    };
+    assert_eq!(shell("ultron trash victim.txt", &cfg), Decision::Allow);
+    for command in [
+        "ultron trash victim.txt > korumali/kayit.txt",
+        "ultron trash victim.txt >> korumali/kayit.txt",
+        "ultron trash victim.txt 2> korumali/kayit.txt",
+        "ultron trash victim.txt && rm y",
+        "ultron trash victim.txt; rm y",
+        "ultron trash $(rm y)",
+        "ultron trash `rm y`",
+    ] {
+        assert!(
+            matches!(shell(command, &cfg), Decision::Ask { .. }),
+            "{command}: {:?}",
+            shell(command, &cfg)
+        );
+    }
+}

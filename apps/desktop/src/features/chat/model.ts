@@ -100,6 +100,9 @@ export function createChatTimeline(initialEngine: EngineId | null = null) {
         });
       } else if (event.kind === "approval_requested") {
         rows.push({ id: event.id, type: "approval", approvalId: field(event, "approval_id"), status: "pending" });
+      } else if (event.kind === "policy_notice") {
+        // Hata değil: ham silme yerine `ultron trash` yönlendirmesi; tur sürüyor olabilir.
+        rows.push({ id: event.id, type: "system", tone: "policy", text: field(event, "message") });
       } else if (event.kind === "policy_violation") {
         rows.push({ id: event.id, type: "system", tone: "policy",
           text: `Güvenlik kuralı ihlali · ${riskLabel(field(event, "category"))}\nGerçekleşmiş riskli işlem: ${field(event, "command")}\nBu bildirim işlemi geri almaz. Sonucu kontrol et.` });

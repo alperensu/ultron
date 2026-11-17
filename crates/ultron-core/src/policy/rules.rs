@@ -121,6 +121,10 @@ fn evaluate_shell(command: &str, cwd: &Path, cfg: &PolicyConfig, ctx: &PolicyCon
     {
         return denied();
     }
+    // Ortam dökümü (tur belirteci dahil) sır erişimidir; allow_list ile açılamaz.
+    if env_dump(command, &parsed.commands) {
+        return ask(RiskCategory::Secrets);
+    }
     if parsed.uncertain {
         return uncertain();
     }
@@ -145,9 +149,15 @@ fn evaluate_shell(command: &str, cwd: &Path, cfg: &PolicyConfig, ctx: &PolicyCon
         });
         return ask(category.unwrap_or(RiskCategory::Secrets));
     }
+    // `ultron trash` muafiyeti yalnız yalın, tek çağrı içindir (yönlendirme, boru, zincir,
+    // alt kabuk ve ters tırnak yok).
+    let bare_trash = parsed.commands.len() == 1
+        && !command.contains([
+            '>', '<', '|', ';', '&', '`', '(', ')', '$', '\n', '\r',
+        ]);
     let mut decision = Decision::Allow;
     for args in &parsed.commands {
-        let category = command_risk(args, cwd, cfg, ctx);
+        let category = command_risk(args, cwd, cfg, ctx, bare_trash);
         if let Some(category) = category
             && decision == Decision::Allow
         {
@@ -162,6 +172,26 @@ fn evaluate_shell(command: &str, cwd: &Path, cfg: &PolicyConfig, ctx: &PolicyCon
         return Decision::Allow;
     }
     decision
+}
+
+fn env_dump(command: &str, commands: &[Vec<String>]) -> bool {
+    let lower = command.to_lowercase();
+    if lower.contains("$env")
+        || lower.contains("ultron_turn_token")
+        || lower.contains("%ultron")
+        || lower.contains("[environment]::")
+    {
+        return true;
+    }
+    commands.iter().any(|args| {
+        let program = args.first().map(|a| executable(a)).unwrap_or_default();
+        program == "printenv"
+            || (matches!(program.as_str(), "env" | "set") && args.len() == 1)
+            || args
+                .iter()
+                .skip(1)
+                .any(|arg| arg.to_lowercase().starts_with("env:"))
+    })
 }
 
 fn creates_link(args: &[String]) -> bool {
@@ -254,14 +284,20 @@ fn command_risk(
     cwd: &Path,
     cfg: &PolicyConfig,
     ctx: &PolicyContext,
+    bare_trash: bool,
 ) -> Option<RiskCategory> {
     let first = args.first()?;
     let program = executable(first);
     // Yalnız bu komut geri alınabilir silme arabirimidir; zincirin kalanı ayrı taranır.
+    // `restore` ve `purge` yönetici işlemidir; motor kabuğundan onaya düşer.
     if program == "ultron"
+        && bare_trash
         && args
             .get(1)
             .is_some_and(|arg| arg.eq_ignore_ascii_case("trash"))
+        && !args.get(2).is_some_and(|arg| {
+            arg.eq_ignore_ascii_case("restore") || arg.eq_ignore_ascii_case("purge")
+        })
     {
         return None;
     }
@@ -312,6 +348,44 @@ fn command_risk(
     None
 }
 
+/// Eylem bir silme içeriyor olabilir mi? Kasıtlı olarak muhafazakârdır (sözcüksel): ham metin,
+/// tırnak/ters tırnak/`^` atılmış metin ve ayrıştırıcının normalleştirdiği tokenlar birlikte
+/// taranır; kodlanmış PowerShell her zaman silme sayılır. Bulgu onaydan sonra da ham çalıştırılmaz.
+pub fn is_delete_like(action: &Action) -> bool {
+    match action {
+        Action::FileDelete { .. } => true,
+        Action::Shell { command, .. } => {
+            let lower = command.to_lowercase();
+            if lower
+                .split_whitespace()
+                .any(|word| matches!(word, "-e" | "-ec" | "-enc" | "-encodedcommand"))
+            {
+                return true;
+            }
+            let stripped: String = lower
+                .chars()
+                .filter(|c| !matches!(c, '`' | '\'' | '"' | '^'))
+                .collect();
+            let delete_word = |word: &str| {
+                is_delete(word) || matches!(word, "unlink" | "shred" | "wipe" | "format")
+            };
+            let scan = |text: &str| {
+                text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+                    .any(delete_word)
+            };
+            let parsed = parse(command);
+            scan(&lower)
+                || scan(&stripped)
+                || parsed
+                    .commands
+                    .iter()
+                    .flatten()
+                    .any(|arg| scan(&arg.to_lowercase()))
+        }
+        _ => false,
+    }
+}
+
 fn is_delete(program: &str) -> bool {
     matches!(
         program,
@@ -342,8 +416,10 @@ fn builtin(
         "ultron"
             if !matches!(
                 (verb, rest.get(1).map(String::as_str)),
-                ("policy", Some("check")) | ("history", Some("search")) | ("status", _) | ("trash", _)
-            ) =>
+                ("policy", Some("check")) | ("history", Some("search")) | ("status", _)
+                    | ("trash", _)
+            ) || (verb == "trash"
+                && matches!(rest.get(1).map(String::as_str), Some("restore" | "purge"))) =>
         {
             return Some(RiskCategory::SystemConfig);
         }
@@ -660,7 +736,7 @@ fn evaluate_tool(tool: &str, input: &Value, cfg: &PolicyConfig, ctx: &PolicyCont
                 parsed
                     .commands
                     .iter()
-                    .find_map(|args| command_risk(args, base(ctx), cfg, ctx))
+                    .find_map(|args| command_risk(args, base(ctx), cfg, ctx, false))
             }
             Value::Array(values) => values.iter().find_map(|value| visit(value, cfg, ctx)),
             Value::Object(values) => values.values().find_map(|value| visit(value, cfg, ctx)),

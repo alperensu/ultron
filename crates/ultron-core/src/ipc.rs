@@ -152,6 +152,13 @@ pub enum Request {
         by: String,
     },
     TrashList,
+    /// Yolları çöp kutusuna taşır; requester da kullanabilir, yollar oturum dizini içinde olmalı.
+    TrashPut {
+        paths: Vec<String>,
+        /// Motor ortamındaki tur belirteci (`ULTRON_TURN_TOKEN`); sohbet ve oturum dizini
+        /// yalnız bundan çözülür, istemcinin sohbet kimliğine güvenilmez.
+        token: String,
+    },
     TrashRestore {
         id: String,
     },
@@ -366,6 +373,7 @@ impl std::fmt::Debug for Request {
                 .finish_non_exhaustive(),
             Request::Status => f.write_str("Status"),
             Request::TrashList => f.write_str("TrashList"),
+            Request::TrashPut { .. } => f.write_str("TrashPut { paths: <gizli>, token: <gizli> }"),
             Request::TrashRestore { .. } => f.write_str("TrashRestore { id: <gizli> }"),
             Request::TrashPurge { .. } => f.write_str("TrashPurge { id: <gizli> }"),
             Request::GetPolicyConfig => f.write_str("GetPolicyConfig"),

@@ -278,6 +278,7 @@ fn variant_name(r: &Request) -> &'static str {
         Request::ListApprovals { .. } => "list_approvals",
         Request::ResolveApproval { .. } => "resolve_approval",
         Request::TrashList => "trash_list",
+        Request::TrashPut { .. } => "trash_put",
         Request::TrashRestore { .. } => "trash_restore",
         Request::TrashPurge { .. } => "trash_purge",
         Request::GetPolicyConfig => "get_policy_config",
@@ -328,6 +329,7 @@ async fn every_request_variant_is_implemented() {
         Request::ListApprovals { status: None, limit: None, cursor: None },
         Request::ResolveApproval { id: "olmayan-onay".into(), approve: true, by: "desktop".into() },
         Request::TrashList,
+        Request::TrashPut { paths: vec![], token: String::new() },
         Request::TrashRestore { id: "olmayan-cop".into() },
         Request::TrashPurge { id: "olmayan-cop".into() },
         Request::GetPolicyConfig,
@@ -348,6 +350,6 @@ async fn every_request_variant_is_implemented() {
             assert!(!message.contains("henüz uygulanmadı"), "{req:?}: {message}");
         }
     }
-    assert_eq!(seen.len(), 26,"her varyant denenmeli: {seen:?}");
+    assert_eq!(seen.len(), 27,"her varyant denenmeli: {seen:?}");
     h.shutdown().await;
 }

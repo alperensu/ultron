@@ -73,6 +73,14 @@ async fn pending(h: &ServerHandle) -> Approval {
     .expect("bekleyen onay oluşmadı")
 }
 
+/// Onaylanan silmeyi Ultron kendisi yapar; oturum dizini bilinmiyorsa ham komut çalışmaz.
+fn assert_approved_delete_not_run(decision: Decision) {
+    match decision {
+        Decision::Deny { reason } => assert!(reason.contains("ultron trash"), "{reason}"),
+        other => panic!("onaylı silme Allow dönmemeli: {other:?}"),
+    }
+}
+
 async fn decision(client: &mut Client) -> Decision {
     let Response::Ok { data } = next(client).await.unwrap() else {
         panic!("karar Ok olmalı");
@@ -144,7 +152,7 @@ async fn requester_cannot_resolve_or_list_another_connections_approvals() {
         .await,
         Response::Ok { .. }
     ));
-    assert_eq!(decision(&mut checking).await, Decision::Allow);
+    assert_approved_delete_not_run(decision(&mut checking).await);
     // Etiket telegram olsa da kimlik onaylayıcı bağlantısından türetilir.
     assert_eq!(
         Db::open(&paths.db)
@@ -254,7 +262,7 @@ async fn ask_creates_pending_and_approve_allows() {
         .await,
         Response::Ok { .. }
     ));
-    assert_eq!(decision(&mut checking).await, Decision::Allow);
+    assert_approved_delete_not_run(decision(&mut checking).await);
     assert!(
         matches!(next(&mut global).await, Some(Response::Event(ev)) if ev.kind == "approval_resolved")
     );
@@ -360,8 +368,10 @@ async fn approval_resolves_once() {
         .get_approval(&row.id)
         .unwrap()
         .unwrap();
+    let outcome = decision(&mut checking).await;
+    assert!(matches!(outcome, Decision::Deny { .. }), "ham silme asla Allow olmaz");
     assert_eq!(
-        matches!(decision(&mut checking).await, Decision::Allow),
+        matches!(&outcome, Decision::Deny { reason } if reason.contains("ultron trash")),
         stored.status == ApprovalStatus::Approved
     );
     h.shutdown().await;

@@ -6,6 +6,7 @@
 - `events`: Olay günlüğünü (eventlog) listeler ve filtreler.
 - `history search`: Oturum geçmişi içinde arama yapar.
 - `import projects [--dry-run]`: Claude/Codex oturumlarından proje klasörlerini bulur, projeleri oluşturur, "Şimdiye kadar yapılanlar" notunu yazar (sohbet içe aktarmaz). `import remove-chats [--dry-run]`: eski içe aktarıcının sohbetlerini yedek alarak siler. `--dry-run` motor çağırmaz, yazmaz.
+- `trash <yol>...|list|restore <id>|purge <id>`: Dosyaları Ultron çöp kutusuna taşır (motor ortamındaki `ULTRON_TURN_TOKEN` tur yetkisiyle); list/restore/purge onaylayıcı belirteciyle çalışır.
 - `status`: Daemon ve sistem durumunu görüntüler.
 - `service install`: ultrond arka plan servisini zamanlanmış görev olarak kurar.
 

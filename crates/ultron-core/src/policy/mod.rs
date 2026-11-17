@@ -15,7 +15,10 @@ use serde_json::Value;
 use crate::Paths;
 
 pub use command::normalize_shell;
-pub use rules::evaluate;
+pub use rules::{evaluate, is_delete_like};
+
+/// Onaylanan silmenin ham çalışmak yerine döndüğü gerekçe (Claude `ultron trash` kullanır).
+pub const APPROVED_DELETE_REDIRECT: &str = "Onaylandı: silmek için `ultron trash <yol>` kullan; dosya çöp kutusuna gider ve geri alınabilir.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
