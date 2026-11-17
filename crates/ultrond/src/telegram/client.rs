@@ -532,6 +532,9 @@ mod tests {
                     serde_json::json!(["message", "callback_query"])
                 );
             }
+            if method == "sendMessage" || method == "editMessageText" {
+                assert_eq!(body["link_preview_options"]["is_disabled"], true);
+            }
             if method == "sendMessage" {
                 assert_eq!(body["text"], message().text);
             }

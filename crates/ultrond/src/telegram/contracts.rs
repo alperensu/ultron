@@ -93,23 +93,64 @@ pub struct InlineKeyboardMarkup {
     pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
 }
 
-/// parse_mode alanı bilerek yoktur; metin düz gönderilir.
 #[derive(Serialize)]
+struct LinkPreviewOptions { is_disabled: bool }
+const NO_PREVIEW: LinkPreviewOptions = LinkPreviewOptions { is_disabled: true };
+
+/// parse_mode alanı bilerek yoktur; metin düz gönderilir. Link önizlemesi
+/// serileştirmede koşulsuz kapatılır (prompt-injection ile sızdırma önlemi);
+/// alan yapıda olmadığından çağıranlar onu açamaz.
 pub struct SendMessage {
     pub chat_id: i64,
     pub text: String,
     pub disable_notification: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_markup: Option<InlineKeyboardMarkup>,
 }
 
-#[derive(Serialize)]
+impl Serialize for SendMessage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("SendMessage", 5)?;
+        s.serialize_field("chat_id", &self.chat_id)?;
+        s.serialize_field("text", &self.text)?;
+        s.serialize_field("disable_notification", &self.disable_notification)?;
+        if let Some(markup) = &self.reply_markup { s.serialize_field("reply_markup", markup)?; }
+        s.serialize_field("link_preview_options", &NO_PREVIEW)?;
+        s.end()
+    }
+}
+
 pub struct EditMessageText {
     pub chat_id: i64,
     pub message_id: i64,
     pub text: String,
     /// Boş klavye, karar sonrası düğmeleri kaldırır.
     pub reply_markup: InlineKeyboardMarkup,
+}
+
+impl Serialize for EditMessageText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("EditMessageText", 5)?;
+        s.serialize_field("chat_id", &self.chat_id)?;
+        s.serialize_field("message_id", &self.message_id)?;
+        s.serialize_field("text", &self.text)?;
+        s.serialize_field("reply_markup", &self.reply_markup)?;
+        s.serialize_field("link_preview_options", &NO_PREVIEW)?;
+        s.end()
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn link_previews_are_always_disabled_on_the_wire() {
+        let send = serde_json::to_value(SendMessage { chat_id: 1, text: "https://x.invalid/?d=1".into(), disable_notification: false, reply_markup: None }).unwrap();
+        assert_eq!(send["link_preview_options"]["is_disabled"], true);
+        let edit = serde_json::to_value(EditMessageText { chat_id: 1, message_id: 2, text: "t".into(), reply_markup: InlineKeyboardMarkup { inline_keyboard: vec![] } }).unwrap();
+        assert_eq!(edit["link_preview_options"]["is_disabled"], true);
+    }
 }
 
 #[derive(Serialize)]
