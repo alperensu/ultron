@@ -253,3 +253,19 @@ async fn client_autostarts_daemon_when_pipe_absent() {
     assert!(text.contains("ultrond çalışıyor"), "{text}");
     std::thread::sleep(std::time::Duration::from_millis(500));
 }
+
+#[test]
+fn import_commands_parse_and_render_reports() {
+    use serde_json::json;
+    use ultron::commands::{ImportCmd, render_project_report, render_remove_report};
+    let cli = Cli::try_parse_from(["ultron", "import", "projects", "--dry-run"]).unwrap();
+    assert!(matches!(cli.command, Cmd::Import { action: ImportCmd::Projects { dry_run: true } }));
+    let cli = Cli::try_parse_from(["ultron", "import", "remove-chats"]).unwrap();
+    assert!(matches!(cli.command, Cmd::Import { action: ImportCmd::RemoveChats { dry_run: false } }));
+    let table = render_project_report(&json!({"dry_run": true, "created": 1, "notes_updated": 1, "summarizer": "null", "unmatched_sessions": 3,
+        "rows": [{"path": "/sentetik/proje", "claude_sessions": 2, "codex_sessions": 1, "worker_sessions": 7, "note_updated": true, "note_status": "güncellenecek"}]}));
+    assert!(table.contains("/sentetik/proje") && table.contains("evet") && table.contains("dry-run"));
+    assert!(table.contains("ISCI") && table.contains("3 eşleşmeyen oturum") && table.contains(" 7 "));
+    let out = render_remove_report(&json!({"dry_run": false, "chats": 3, "events": 9, "backup": "x.backup"}));
+    assert!(out.contains("3 içe aktarılmış sohbet") && out.contains("Yedek: x.backup"));
+}

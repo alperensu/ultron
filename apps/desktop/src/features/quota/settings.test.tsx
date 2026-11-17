@@ -1,14 +1,24 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, it, vi } from "vitest";
-import { createFakeBridge, type ImportReport } from "../../lib/bridge";
+import { createFakeBridge, type ProjectImportReport } from "../../lib/bridge";
 import { Settings } from "../../screens/Settings";
 import { createAppStore, StoreProvider } from "../../state/store";
 
-function setup() {
+function setup(override?: ProjectImportReport) {
   const bridge = createFakeBridge({
     catalogImportReport: { imported: 3, updated: 2 },
-    historyImportReport: { files: 4, chats: 3, messages: 18, skipped: 2, masked: 5 },
+    projectImportReport: override ?? {
+      dry_run: false,
+      rows: [
+        { path: "/ornek/a", name: "a", claude_sessions: 2, codex_sessions: 1, worker_sessions: 0, project_created: true, note_updated: true, note_status: "güncellendi" },
+        { path: "/ornek/b", name: "b", claude_sessions: 1, codex_sessions: 0, worker_sessions: 3, project_created: false, note_updated: false, note_status: "güncel" },
+      ],
+      created: 1,
+      notes_updated: 1,
+      summarizer: "null",
+      unmatched_sessions: 0,
+    },
   });
   render(<StoreProvider value={createAppStore(bridge)}><Settings /></StoreProvider>);
   return bridge;
@@ -24,28 +34,47 @@ it("import_report_rendered", async () => {
   expect(within(catalog).getByText("Güncellenen proje").nextElementSibling).toHaveTextContent("2");
   expect(bridge.calls).toContainEqual({ cmd: "import_catalog", args: ["/ornek/katalog.md"] });
 
-  await user.click(screen.getByRole("button", { name: "Claude Code geçmişini içe aktar" }));
-  const history = await screen.findByRole("status", { name: "Geçmiş içe aktarma sonucu" });
-  for (const [label, count] of [["Dosya", 4], ["Sohbet", 3], ["Mesaj", 18], ["Atlanan", 2], ["Maskelenen", 5]] as const) {
+  await user.click(screen.getByRole("button", { name: "Projeleri içe aktar" }));
+  const history = await screen.findByRole("status", { name: "Proje içe aktarma sonucu" });
+  for (const [label, count] of [["Proje", 2], ["Yeni proje", 1], ["Güncellenen not", 1], ["Başarısız not", 0], ["Eşleşmeyen oturum", 0]] as const) {
     expect(within(history).getByText(label).nextElementSibling).toHaveTextContent(String(count));
   }
-  expect(bridge.calls).toContainEqual({ cmd: "import_claude_history", args: [undefined] });
+  expect(bridge.calls).toContainEqual({ cmd: "import_projects", args: [] });
+});
+
+it("project_import_does_not_claim_success_when_all_notes_failed", async () => {
+  const row = { path: "/ornek/a", name: "a", claude_sessions: 1, codex_sessions: 0, worker_sessions: 0, project_created: true, note_updated: false, note_status: "hata: motor çöktü" };
+  setup({
+    dry_run: false,
+    rows: [row, { ...row, path: "/ornek/b", name: "b" }],
+    created: 2,
+    notes_updated: 0,
+    summarizer: "agy",
+    unmatched_sessions: 4,
+  });
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Projeleri içe aktar" }));
+  const report = await screen.findByRole("status", { name: "Proje içe aktarma sonucu" });
+  expect(within(report).getByText("Projeler alındı ancak hiçbir not yazılamadı.")).toBeVisible();
+  expect(within(report).queryByText("Projeler içe aktarıldı.")).not.toBeInTheDocument();
+  expect(within(report).getByText("Başarısız not").nextElementSibling).toHaveTextContent("2");
+  expect(within(report).getByText("Eşleşmeyen oturum").nextElementSibling).toHaveTextContent("4");
 });
 
 it("history_import_has_pending_and_error_states_without_duplicate_submission", async () => {
   const bridge = setup();
   let reject!: (reason: unknown) => void;
-  const pending = new Promise<ImportReport>((_resolve, rejectPromise) => { reject = rejectPromise; });
-  const command = vi.spyOn(bridge, "importClaudeHistory").mockReturnValue(pending);
+  const pending = new Promise<ProjectImportReport>((_resolve, rejectPromise) => { reject = rejectPromise; });
+  const command = vi.spyOn(bridge, "importProjects").mockReturnValue(pending);
   const user = userEvent.setup();
-  await user.dblClick(screen.getByRole("button", { name: "Claude Code geçmişini içe aktar" }));
+  await user.dblClick(screen.getByRole("button", { name: "Projeleri içe aktar" }));
   expect(command).toHaveBeenCalledTimes(1);
-  expect(screen.getByRole("button", { name: "Geçmiş içe aktarılıyor…" })).toBeDisabled();
-  expect(screen.getByText("Dosyalar işleniyor; işlem bitince sonuç burada görünecek.")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Projeler içe aktarılıyor…" })).toBeDisabled();
+  expect(screen.getByText("Oturumlar işleniyor; işlem bitince sonuç burada görünecek.")).toBeVisible();
   await act(async () => { reject({ kind: "daemon", message: "Geçmiş okunamadı" }); });
   expect(await screen.findByRole("alert")).toHaveTextContent("Geçmiş okunamadı");
-  expect(screen.queryByRole("status", { name: "Geçmiş içe aktarma sonucu" })).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Claude Code geçmişini içe aktar" })).toBeEnabled();
+  expect(screen.queryByRole("status", { name: "Proje içe aktarma sonucu" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Projeleri içe aktar" })).toBeEnabled();
 });
 
 it("unbacked_settings_are_read_only_and_catalog_requires_a_path", () => {

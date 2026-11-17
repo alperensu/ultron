@@ -60,9 +60,26 @@ struct State {
     paths: Paths,
     quota: ultron_core::quota::QuotaService,
     approvals: approvals::Approvals,
+    /// İçe aktarma/silme işlemleri tek seferde bir tane çalışır.
+    import_lock: tokio::sync::Mutex<()>,
 }
 
-/// Çalışan sunucunun tutamacı.
+/// Yalnız testlerde `home` geçersiz kılmasını açar (üretimde her zaman USERPROFILE).
+const HOME_OVERRIDE_ENV: &str = "ULTRON_TEST_ALLOW_HOME_OVERRIDE";
+
+fn require_approver(auth: &ConnectionAuth) -> Result<()> {
+    if auth.role != ConnectionRole::Approver {
+        return Err(anyhow!("yetkisiz: onaylayıcı rolü gerekli"));
+    }
+    Ok(())
+}
+
+fn reject_remote_path(path: &str) -> Result<()> {
+    if ultron_core::import::discovery::is_remote_or_verbatim(path) {
+        return Err(anyhow!("UNC ve verbatim biçimli yollar kabul edilmez"));
+    }
+    Ok(())
+}
 pub struct ServerHandle {
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
@@ -207,6 +224,7 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
         paths: paths.clone(),
         quota: ultron_core::quota::QuotaService::from_env(),
         approvals,
+        import_lock: tokio::sync::Mutex::new(()),
     });
 
     let cancel = CancellationToken::new();
@@ -504,9 +522,7 @@ async fn dispatch(
         }
         Request::ResolveApproval { id, approve, by } => {
             use ultron_core::db::approvals::ResolvedBy;
-            if auth.role != ConnectionRole::Approver {
-                return Err(anyhow!("yetkisiz: onaylayıcı rolü gerekli"));
-            }
+            require_approver(auth)?;
             if !matches!(by.as_str(), "desktop" | "telegram") {
                 return Err(anyhow!("geçersiz onay etiketi (desktop|telegram)"));
             }
@@ -604,8 +620,16 @@ async fn dispatch(
             Ok(Flow::Continue)
         }
         Request::ImportClaudeHistory { root } => {
+            require_approver(auth)?;
+            let _guard = st
+                .import_lock
+                .try_lock()
+                .map_err(|_| anyhow!("başka bir içe aktarma/silme işlemi çalışıyor"))?;
             let root = match root {
-                Some(r) => std::path::PathBuf::from(r),
+                Some(r) => {
+                    reject_remote_path(&r)?;
+                    std::path::PathBuf::from(r)
+                }
                 None => std::env::var_os("USERPROFILE")
                     .map(|h| std::path::PathBuf::from(h).join(".claude").join("projects"))
                     .ok_or_else(|| anyhow!("USERPROFILE tanımlı değil"))?,
@@ -614,6 +638,66 @@ async fn dispatch(
             let report = tokio::task::spawn_blocking(move || {
                 let mut state = ultron_core::import::ImportState::load(&db)?;
                 ultron_core::import::import_claude_history(&db, &root, &mut state)
+            })
+            .await??;
+            ok(writer, json!({"report": report})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::ImportProjects { dry_run, home } => {
+            require_approver(auth)?;
+            let _guard = st
+                .import_lock
+                .try_lock()
+                .map_err(|_| anyhow!("başka bir içe aktarma/silme işlemi çalışıyor"))?;
+            // `home` yalnız test ortamında dikkate alınır; üretimde daima USERPROFILE.
+            let override_ok = std::env::var_os(HOME_OVERRIDE_ENV).is_some_and(|v| v == "1");
+            let home = match home.filter(|_| override_ok) {
+                Some(h) => {
+                    reject_remote_path(&h)?;
+                    std::path::PathBuf::from(h)
+                }
+                None => std::env::var_os("USERPROFILE")
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| anyhow!("USERPROFILE tanımlı değil"))?,
+            };
+            reject_remote_path(&home.to_string_lossy())?;
+            let cfg = ultron_core::Config::load(&st.paths)?;
+            let filters = ultron_core::import::discovery::Filters::system(&home);
+            // Dry-run motor çağırmaz ve dizin oluşturmaz.
+            let (summarizer, kind): (Box<dyn Summarizer>, &str) = if dry_run {
+                let kind = if cfg.engines.iter().any(|e| e.id == EngineId::Agy && e.enabled) {
+                    "agy"
+                } else {
+                    "null"
+                };
+                (Box::new(NullSummarizer), kind)
+            } else {
+                let sum = select_summarizer(&st.paths, &cfg)?;
+                let kind = sum.kind();
+                (sum, kind)
+            };
+            let mut report = ultron_core::import::import_projects(
+                &st.db,
+                summarizer.as_ref(),
+                &home,
+                &filters,
+                dry_run,
+            )
+            .await?;
+            report.summarizer = kind.to_string();
+            ok(writer, json!({"report": report})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::RemoveImportedChats { dry_run } => {
+            require_approver(auth)?;
+            let _guard = st
+                .import_lock
+                .try_lock()
+                .map_err(|_| anyhow!("başka bir içe aktarma/silme işlemi çalışıyor"))?;
+            let db = st.db.clone();
+            let db_path = st.paths.db.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                ultron_core::import::remove_imported_chats(&db, &db_path, dry_run)
             })
             .await??;
             ok(writer, json!({"report": report})).await?;

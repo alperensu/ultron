@@ -13,7 +13,7 @@ test = false
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["backup"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

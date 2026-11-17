@@ -82,12 +82,24 @@ export interface QuotaReport {
   fetched_at: string;
 }
 
-export interface ImportReport {
-  files: number;
-  chats: number;
-  messages: number;
-  skipped: number;
-  masked: number;
+/** `importProjects` sonucu (Rust `ProjectImportReport`). */
+export interface ProjectImportRow {
+  path: string;
+  name: string;
+  claude_sessions: number;
+  codex_sessions: number;
+  worker_sessions: number;
+  project_created: boolean;
+  note_updated: boolean;
+  note_status: string;
+}
+export interface ProjectImportReport {
+  dry_run: boolean;
+  rows: ProjectImportRow[];
+  created: number;
+  notes_updated: number;
+  summarizer: string;
+  unmatched_sessions: number;
 }
 
 /** `importCatalog` sonucu (Rust `CatalogImportReport`). */
@@ -148,7 +160,7 @@ export interface Bridge {
   setResetRights(pool: string, count: number): Promise<ResetRightsResult>;
   routeMessage(text: string): Promise<RouteResult>;
   importCatalog(path: string): Promise<CatalogImportReport>;
-  importClaudeHistory(root?: string): Promise<ImportReport>;
+  importProjects(): Promise<ProjectImportReport>;
   status(): Promise<{ version: string; pid: number; running_turns: number; default_engine: EngineId }>;
   /** `ultron://event` aboneliği; dönen işlev aboneliği bırakır. */
   onEvent(handler: (ev: StoredEvent) => void): Promise<() => void>;
@@ -234,7 +246,7 @@ export function createTauriBridge(): Bridge {
     setResetRights: (pool, count) => call("set_reset_rights", { pool, count }),
     routeMessage: (text) => call("route_message", { text }),
     importCatalog: (path) => call("import_catalog", { path }),
-    importClaudeHistory: (root) => call("import_claude_history", { root }),
+    importProjects: () => call("import_projects", {}),
     status: () => call("status"),
     onEvent: (handler) => listenTo<StoredEvent>(EVENT_NAME, handler),
     onDaemonState: (handler) => listenTo<DaemonState>(DAEMON_EVENT, handler),
@@ -255,7 +267,7 @@ export interface FakeBridgeOptions {
   quota?: QuotaReport;
   /** Sentetik içe aktarma sonuçları; gerçek dosya okunmaz. */
   catalogImportReport?: CatalogImportReport;
-  historyImportReport?: ImportReport;
+  projectImportReport?: ProjectImportReport;
   /** Testlerde servis ayarlarının salt okunur görünümü. */
   defaultEngine?: EngineId;
   /** `historySearch` sonuçları (sorguyu içeren metinler süzülür). */
@@ -447,8 +459,8 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
       run("route_message", [text], () => (opts.route ? opts.route(text) : reject("yönlendirme"))),
     // Sahte köprü: gerçek dosya okumaz; boş rapor, gerçek servisle aynı biçimde.
     importCatalog: (path) => run("import_catalog", [path], () => ({ ...(opts.catalogImportReport ?? { imported: 0, updated: 0 }) })),
-    importClaudeHistory: (root) =>
-      run("import_claude_history", [root], () => ({ ...(opts.historyImportReport ?? { files: 0, chats: 0, messages: 0, skipped: 0, masked: 0 }) })),
+    importProjects: () =>
+      run("import_projects", [], () => ({ ...(opts.projectImportReport ?? { dry_run: false, rows: [], created: 0, notes_updated: 0, summarizer: "null", unmatched_sessions: 0 }) })),
     status: () =>
       run("status", [], () => ({ version: "test", pid: 0, running_turns: activeChats.size, default_engine: opts.defaultEngine ?? "claude" })),
     onEvent: async (h) => {

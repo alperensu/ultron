@@ -118,7 +118,7 @@ describe("komut JSON sözleşmesi (Rust testindeki alan listeleriyle aynı)", ()
     expect((await b.getQuota()).pools[0]!.reset_rights).toBe(2);
     expect(sorted(await b.routeMessage("Sentetik"))).toEqual(["alternatives", "confidence", "project_id", "reason"]);
     expect(sorted(await b.importCatalog("x.md"))).toEqual(["imported", "updated"]);
-    expect(sorted(await b.importClaudeHistory())).toEqual(["chats", "files", "masked", "messages", "skipped"]);
+    expect(sorted(await b.importProjects())).toEqual(["created", "dry_run", "notes_updated", "rows", "summarizer", "unmatched_sessions"]);
     expect(sorted(await b.status())).toEqual(["default_engine", "pid", "running_turns", "version"]);
   });
 

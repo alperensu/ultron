@@ -15,7 +15,7 @@ fn main() {
             "set_reset_rights",
             "route_message",
             "import_catalog",
-            "import_claude_history",
+            "import_projects",
             "status",
         ]),
     ))

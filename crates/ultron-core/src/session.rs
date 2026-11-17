@@ -149,10 +149,12 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("motor kayıtlı değil: {engine:?}"))?;
         self.db.insert_chat(chat_id, None, "", Utc::now())?;
 
-        let project_bound = self
-            .db
-            .get_chat(chat_id)?
-            .is_some_and(|chat| chat.project_id.is_some());
+        let project_id = self.db.get_chat(chat_id)?.and_then(|chat| chat.project_id);
+        let project_bound = project_id.is_some();
+        let project_note = match &project_id {
+            Some(id) => self.db.get_project_note(id)?.map(|n| n.markdown),
+            None => None,
+        };
         let mode = prompts::work_mode(project_bound, cwd);
         let project_files = if project_bound {
             ["AGENTS.md", "CLAUDE.md"]
@@ -162,7 +164,18 @@ impl SessionManager {
         } else {
             Vec::new()
         };
-        let instructions = prompts::compose(Role::Brain, mode, &project_files);
+        let instructions = if engine == EngineId::Agy {
+            // agy komut satırı sınırı: not bütçeye sığmazsa kırpılır veya atılır, tur başarısız olmaz.
+            prompts::compose_with_note_budget(
+                Role::Brain,
+                mode,
+                &project_files,
+                project_note.as_deref(),
+                &crate::engine::agy::instructions_fit,
+            )
+        } else {
+            prompts::compose_with_note(Role::Brain, mode, &project_files, project_note.as_deref())
+        };
         let run_dir = crate::paths::Paths::resolve()?.run;
         let driver = prompts::with_instructions(driver, &instructions, &run_dir, chat_id)?;
 

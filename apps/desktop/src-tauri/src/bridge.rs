@@ -14,6 +14,8 @@ use ultron_core::ipc::{self, Client, Request, Response};
 
 /// Tek bir yanıt için beklenen en uzun süre (kısa istekler).
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Uzun süren yönetim işleri (proje içe aktarma, sohbet silme) için yanıt süresi.
+const ADMIN_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Webview'e giden tipli hata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -80,10 +82,20 @@ impl Bridge {
 
     /// Tek istek, tek yanıt (paylaşılan bağlantı; kopmuşsa bir kez yeniden bağlanır).
     pub async fn request(&self, req: Request) -> Result<Value, BridgeError> {
-        if matches!(
+        // Yönetim istekleri onaylayıcı rolü ister, uzun sürebilir ve asla yeniden denenmez
+        // (çift çalıştırma olmasın).
+        let admin = matches!(
             req,
-            Request::ListApprovals { .. } | Request::ResolveApproval { .. }
-        ) {
+            Request::ImportProjects { .. }
+                | Request::RemoveImportedChats { .. }
+                | Request::ImportClaudeHistory { .. }
+        );
+        if admin
+            || matches!(
+                req,
+                Request::ListApprovals { .. } | Request::ResolveApproval { .. }
+            )
+        {
             // Sır yalnız Rust köprüsünde kalır; normal bağlantıya veya motor ortamına taşınmaz.
             let _ready = self.connect().await?;
             let secret = std::fs::read_to_string(ipc::approver_token_path(&self.paths))
@@ -94,7 +106,8 @@ impl Bridge {
             )
             .await
             .map_err(|_| protocol("onaylayıcı bağlantısı kurulamadı"))?;
-            return match round_trip(&mut client, &req).await {
+            let wait = if admin { ADMIN_REPLY_TIMEOUT } else { REPLY_TIMEOUT };
+            return match round_trip_timeout(&mut client, &req, wait).await {
                 Ok(Some(resp)) => into_data(resp),
                 _ => Err(protocol("onaylayıcı yanıtı alınamadı")),
             };
@@ -147,8 +160,16 @@ fn protocol(message: &str) -> BridgeError {
 }
 
 async fn round_trip(client: &mut Client, req: &Request) -> Result<Option<Response>> {
+    round_trip_timeout(client, req, REPLY_TIMEOUT).await
+}
+
+async fn round_trip_timeout(
+    client: &mut Client,
+    req: &Request,
+    wait: Duration,
+) -> Result<Option<Response>> {
     client.send(req).await?;
-    match tokio::time::timeout(REPLY_TIMEOUT, client.next()).await {
+    match tokio::time::timeout(wait, client.next()).await {
         Ok(r) => r,
         Err(_) => Err(anyhow::anyhow!("servis yanıtı zaman aşımına uğradı")),
     }

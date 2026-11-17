@@ -268,6 +268,8 @@ fn variant_name(r: &Request) -> &'static str {
         Request::GetQuota => "get_quota",
         Request::ImportCatalog { .. } => "import_catalog",
         Request::ImportClaudeHistory { .. } => "import_claude_history",
+        Request::ImportProjects { .. } => "import_projects",
+        Request::RemoveImportedChats { .. } => "remove_imported_chats",
         Request::Route { .. } => "route",
         Request::SetResetRights { .. } => "set_reset_rights",
         Request::PolicyCheck { .. } => "policy_check",
@@ -308,6 +310,8 @@ async fn every_request_variant_is_implemented() {
         Request::GetQuota,
         Request::ImportCatalog { path: tmp.path().join("yok.md").to_string_lossy().into_owned() },
         Request::ImportClaudeHistory { root: Some(empty.to_string_lossy().into_owned()) },
+        Request::ImportProjects { dry_run: true, home: Some(empty.to_string_lossy().into_owned()) },
+        Request::RemoveImportedChats { dry_run: true },
         Request::Route { text: "devam".into() },
         Request::SetResetRights { pool: "claude".into(), count: 1 },
         Request::PolicyCheck {
@@ -327,6 +331,6 @@ async fn every_request_variant_is_implemented() {
             assert!(!message.contains("henüz uygulanmadı"), "{req:?}: {message}");
         }
     }
-    assert_eq!(seen.len(), 19, "her varyant denenmeli: {seen:?}");
+    assert_eq!(seen.len(), 21, "her varyant denenmeli: {seen:?}");
     h.shutdown().await;
 }

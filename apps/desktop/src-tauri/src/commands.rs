@@ -8,7 +8,7 @@ use tauri::State;
 use ultron_core::EngineId;
 use ultron_core::db::{SearchHit, StoredEvent};
 use ultron_core::ipc::{
-    CatalogImportReport, ChatDetail, ChatInfo, ImportReport, PolicyArg, ProjectInfo, Request,
+    CatalogImportReport, ChatDetail, ChatInfo, PolicyArg, ProjectInfo, Request,
     Response, RouteResult,
 };
 use ultron_core::quota::QuotaReport;
@@ -75,8 +75,8 @@ struct QuotaEnvelope {
 }
 
 #[derive(Deserialize)]
-struct HistoryImportEnvelope {
-    report: ImportReport,
+struct ProjectImportEnvelope {
+    report: ultron_core::ipc::ProjectImportReport,
 }
 
 /// Tür uyuşmazlıkları webview'e bozuk veri yerine `protocol` hatası olarak gider.
@@ -177,12 +177,6 @@ pub struct PathArgs {
     pub path: String,
 }
 
-#[derive(Deserialize)]
-pub struct HistoryArgs {
-    #[serde(default)]
-    pub root: Option<String>,
-}
-
 /// Projesiz yeni sohbetin çalışma dizini: kullanıcı ev dizini, yoksa geçerli dizin.
 fn default_cwd() -> String {
     std::env::var_os("USERPROFILE")
@@ -275,13 +269,6 @@ pub async fn read_chat_detail(bridge: &Bridge, chat_id: &str) -> Out<ChatDetail>
     )
     .await?;
     Ok(data.chat)
-}
-
-/// `ImportClaudeHistory`: servis `{report: ImportReport}` döner; webview doğrudan raporu alır.
-pub async fn read_history_import(bridge: &Bridge, root: Option<String>) -> Out<ImportReport> {
-    let data: HistoryImportEnvelope =
-        request(bridge, Request::ImportClaudeHistory { root }).await?;
-    Ok(data.report)
 }
 
 #[tauri::command]
@@ -437,12 +424,21 @@ pub async fn import_catalog_impl(bridge: &Bridge, args: PathArgs) -> Out<Catalog
 }
 
 #[tauri::command]
-pub async fn import_claude_history(b: Shared<'_>, args: HistoryArgs) -> Out<ImportReport> {
-    import_claude_history_impl(&b, args).await
+pub async fn import_projects(b: Shared<'_>) -> Out<ultron_core::ipc::ProjectImportReport> {
+    import_projects_impl(&b).await
 }
 
-pub async fn import_claude_history_impl(bridge: &Bridge, args: HistoryArgs) -> Out<ImportReport> {
-    read_history_import(bridge, args.root).await
+/// `ImportProjects`: projeleri bulur ve geçmiş notlarını yazar; sohbet içe aktarmaz.
+pub async fn import_projects_impl(bridge: &Bridge) -> Out<ultron_core::ipc::ProjectImportReport> {
+    let data: ProjectImportEnvelope = request(
+        bridge,
+        Request::ImportProjects {
+            dry_run: false,
+            home: None,
+        },
+    )
+    .await?;
+    Ok(data.report)
 }
 
 #[tauri::command]

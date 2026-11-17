@@ -336,6 +336,17 @@ fn builtin(
         return Some(RiskCategory::Delete);
     }
     match program.as_str() {
+        // Ultron yönetim komutları (`import`, `service`, `switch`...) motor kabuğundan asla
+        // sessizce çalışmaz; yalnız salt okunur `policy check`, `history search`, `status` ve
+        // geri alınabilir `trash` serbesttir.
+        "ultron"
+            if !matches!(
+                (verb, rest.get(1).map(String::as_str)),
+                ("policy", Some("check")) | ("history", Some("search")) | ("status", _) | ("trash", _)
+            ) =>
+        {
+            return Some(RiskCategory::SystemConfig);
+        }
         "git" => return git_risk(args),
         "vercel" | "ssh" | "scp" | "rsync" | "systemctl" => return Some(RiskCategory::Deploy),
         "wrangler" if has("deploy") || has("publish") => return Some(RiskCategory::Deploy),

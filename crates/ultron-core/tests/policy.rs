@@ -976,3 +976,22 @@ fn unknown_wrappers_preserve_risky_subcommand_arguments() {
         );
     }
 }
+
+#[test]
+fn ultron_admin_commands_from_engine_shell_always_ask() {
+    for command in [
+        "ultron import remove-chats",
+        "ultron import projects --dry-run",
+        "ultron.exe import projects",
+        r"C:\tools\ultron.exe service install",
+        "cmd /c ultron import remove-chats",
+        "echo x && ultron import projects",
+        "ultron",
+    ] {
+        ask(command, RiskCategory::SystemConfig);
+    }
+    // Salt okunur / geri alınabilir alt komutlar serbest kalır.
+    for command in ["ultron policy check", "ultron history search \"x\"", "ultron status"] {
+        assert_eq!(shell(command, &PolicyConfig::default()), Decision::Allow, "{command}");
+    }
+}

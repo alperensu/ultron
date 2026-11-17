@@ -1036,24 +1036,6 @@ async fn command_json_shapes_match_ts_types() {
     );
     assert!(route["alternatives"].is_array());
 
-    // importClaudeHistory: zarf açılır, doğrudan ImportReport.
-    let root = tmp.path().join("claude-projects");
-    std::fs::create_dir_all(&root).unwrap();
-    let report = json(
-        import_claude_history_impl(
-            &bridge,
-            HistoryArgs {
-                root: Some(root.to_string_lossy().into_owned()),
-            },
-        )
-        .await
-        .unwrap(),
-    );
-    assert_eq!(
-        keys(&report),
-        ["chats", "files", "masked", "messages", "skipped"]
-    );
-
     // status.
     let status = json(status_impl(&bridge).await.unwrap());
     assert_eq!(
