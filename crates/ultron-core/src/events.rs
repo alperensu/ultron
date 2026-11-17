@@ -60,6 +60,17 @@ pub enum EngineEvent {
     ExternalChanges {
         summary: String,
     },
+    ApprovalRequested {
+        approval_id: String,
+        category: crate::policy::RiskCategory,
+        reason: String,
+        summary: String,
+    },
+    ApprovalResolved {
+        approval_id: String,
+        status: crate::db::approvals::ApprovalStatus,
+        by: crate::db::approvals::ResolvedBy,
+    },
 }
 
 /// Motor değişiminin nedeni.

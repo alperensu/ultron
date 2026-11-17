@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use ultron_core::db::StoredEvent;
+use ultron_core::db::approvals::{Approval, ApprovalStatus};
+use ultron_core::events::EngineEvent;
 use ultron_core::ipc::{ChatInfo, Client, Request, Response};
 
 use crate::bridge::{Bridge, BridgeError};
@@ -62,6 +64,107 @@ struct Sync {
     cursors: Cursors,
     known: HashMap<String, String>,
     initialized: bool,
+    global_approvals: HashMap<String, ApprovalStatus>,
+}
+
+impl Sync {
+    fn accept_global_approval(&mut self, ev: &StoredEvent) -> bool {
+        let Some(id) = ev.payload["approval_id"].as_str() else {
+            return false;
+        };
+        let status = match ev.kind.as_str() {
+            "approval_requested" => ApprovalStatus::Pending,
+            "approval_resolved" => {
+                let Ok(status) = serde_json::from_value(ev.payload["status"].clone()) else {
+                    return false;
+                };
+                status
+            }
+            _ => return false,
+        };
+        if self
+            .global_approvals
+            .get(id)
+            .is_some_and(|previous| *previous == status || *previous != ApprovalStatus::Pending)
+        {
+            return false;
+        }
+        self.global_approvals.insert(id.into(), status);
+        true
+    }
+
+    fn restore_global_approval<F: FnMut(StoredEvent)>(
+        &mut self,
+        row: Approval,
+        emit: &mut F,
+    ) -> anyhow::Result<()> {
+        if row.chat_id.is_some() {
+            return Ok(());
+        }
+        let event = if row.status == ApprovalStatus::Pending {
+            EngineEvent::ApprovalRequested {
+                approval_id: row.id.clone(),
+                category: row.category,
+                reason: row.reason,
+                summary: ultron_core::eventlog::excerpt(&row.action_json, 4000),
+            }
+        } else {
+            EngineEvent::ApprovalResolved {
+                approval_id: row.id.clone(),
+                status: row.status,
+                by: row
+                    .resolved_by
+                    .ok_or_else(|| anyhow::anyhow!("onay çözüm kaynağı eksik"))?,
+            }
+        };
+        let payload = serde_json::to_value(event)?;
+        let ev = StoredEvent {
+            id: format!(
+                "approval-state-{}-{}",
+                row.id,
+                payload["type"].as_str().unwrap_or_default()
+            ),
+            chat_id: String::new(),
+            session_id: None,
+            // Durum özeti küresel olay imleci değildir; sıralama onay durum makinesindedir.
+            seq: 0,
+            ts: row.resolved_at.unwrap_or(row.created_at),
+            kind: payload["type"].as_str().unwrap_or_default().into(),
+            payload,
+        };
+        if self.accept_global_approval(&ev) {
+            emit(ev);
+        }
+        Ok(())
+    }
+}
+
+/// Abonesiz başlangıçta veya kopuklukta kaçan sohbet dışı kararları kalıcı durumdan tamamlar.
+async fn reconcile_approvals<F: FnMut(StoredEvent)>(
+    bridge: &Bridge,
+    sync: &mut Sync,
+    emit: &mut F,
+) -> anyhow::Result<()> {
+    let mut cursor = None;
+    loop {
+        let data = bridge
+            .request(Request::ListApprovals {
+                status: None,
+                limit: Some(32),
+                cursor: cursor.clone(),
+            })
+            .await?;
+        let rows: Vec<Approval> = serde_json::from_value(data["approvals"].clone())?;
+        for row in rows {
+            sync.restore_global_approval(row, emit)?;
+        }
+        let next: Option<String> = serde_json::from_value(data["next_cursor"].clone())?;
+        if next.is_none() {
+            return Ok(());
+        }
+        anyhow::ensure!(next > cursor, "onay sayfalama imleci ilerlemedi");
+        cursor = next;
+    }
 }
 
 /// Bir sohbetin `after_seq` sonrasını kalıcı günlükten çekip sırayla iletir.
@@ -101,6 +204,7 @@ async fn reconcile<F: FnMut(StoredEvent)>(
     heads: &HashMap<String, i64>,
     emit: &mut F,
 ) -> anyhow::Result<()> {
+    reconcile_approvals(bridge, sync, emit).await?;
     let data = bridge
         .request(Request::ListChats {
             project_id: None,
@@ -194,6 +298,12 @@ async fn follow_once<F: FnMut(StoredEvent), G: FnMut(DaemonStatus)>(
         };
         match resp {
             Some(Response::Event(ev)) => {
+                if ev.chat_id.is_empty() {
+                    if sync.accept_global_approval(&ev) {
+                        emit(ev);
+                    }
+                    continue;
+                }
                 // Boşluk varsa (bilinen sohbette atlanan sıra ya da ilk olayı seq > 1 olan
                 // sohbet) eksik öneki günlükten tamamla; sonra bu olayı ilet.
                 let last = sync.cursors.last(&ev.chat_id).unwrap_or(0);
@@ -271,5 +381,46 @@ pub async fn run_follow_with_state<F: FnMut(StoredEvent), G: FnMut(DaemonStatus)
             () = tokio::time::sleep(delay) => {}
         }
         delay = (delay * 2).min(backoff.max);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chatless_state_reconcile_restores_expiry_and_ignores_stale_live_pending() {
+        let pending: Approval = serde_json::from_value(serde_json::json!({
+            "id": "synthetic-approval", "chat_id": null, "engine": "claude",
+            "category": "Delete", "reason": "test", "action_json": "{}",
+            "status": "pending", "created_at": "2026-01-01T00:00:00Z",
+            "resolved_at": null, "resolved_by": null
+        }))
+        .unwrap();
+        let mut expired = pending.clone();
+        expired.status = ApprovalStatus::Expired;
+        expired.resolved_by = Some(ultron_core::db::approvals::ResolvedBy::Restart);
+        expired.resolved_at = Some("2026-01-01T00:01:00Z".parse().unwrap());
+        let mut sync = Sync::default();
+        let mut events = Vec::new();
+        sync.restore_global_approval(pending.clone(), &mut |ev| events.push(ev))
+            .unwrap();
+        sync.restore_global_approval(expired.clone(), &mut |ev| events.push(ev))
+            .unwrap();
+        sync.restore_global_approval(expired.clone(), &mut |ev| events.push(ev))
+            .unwrap();
+        sync.restore_global_approval(pending, &mut |ev| events.push(ev))
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].payload["status"], "expired");
+        assert!(!sync.accept_global_approval(&events[0]));
+        assert!(!sync.accept_global_approval(&events[1]));
+        // Yeni masaüstü de abonesiz başlangıçta sonuçlanmış kaydı geri yükler.
+        let mut fresh = Sync::default();
+        fresh
+            .restore_global_approval(expired, &mut |ev| {
+                assert_eq!(ev.payload["status"], "expired")
+            })
+            .unwrap();
     }
 }

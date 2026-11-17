@@ -4,6 +4,81 @@ const MAX_DEPTH: usize = 16;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_COMMANDS: usize = 1024;
 
+/// Shell türüne göre değişen joker ve değişken genişletmeleri güvenle çözülemez.
+pub(super) fn ambiguous_path(text: &str) -> bool {
+    let text = without_device_prefix(text);
+    // 8.3 adları dosya sistemine bakmadan güvenle genişletilemez; onaya düşer.
+    text.contains(['*', '?', '[', ']', '$', '%', '~', '`', '^', '{', '}'])
+}
+
+pub(super) fn without_device_prefix(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    if bytes.len() >= 4
+        && matches!(bytes[0], b'/' | b'\\')
+        && matches!(bytes[1], b'/' | b'\\')
+        && matches!(bytes[2], b'?' | b'.')
+        && matches!(bytes[3], b'/' | b'\\')
+    {
+        &text[4..]
+    } else {
+        text
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum PathKind {
+    FullyQualified,
+    Relative,
+}
+
+/// Yalnız sürücü+kök veya köksüz/sürücüsüz yollar çözümlenebilir.
+/// Diğer Windows ad alanları ve shell genişletmeleri tahmin edilmez.
+pub(super) fn classified_path(text: &str) -> Option<(PathKind, String)> {
+    let plain = without_device_prefix(text);
+    let path = plain.replace('\\', "/").to_lowercase();
+    if path.is_empty()
+        || ambiguous_path(text)
+        || path
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | '|' | '"' | '\''))
+    {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let (kind, tail) = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'/'
+    {
+        (PathKind::FullyQualified, &path[3..])
+    } else if plain.len() == text.len() && !path.starts_with('/') && !path.contains(':') {
+        (PathKind::Relative, path.as_str())
+    } else {
+        return None;
+    };
+    if tail.contains(':')
+        || tail.split('/').any(|part| {
+            (!matches!(part, "." | "..") && part.ends_with(['.', ' ']))
+                || matches!(
+                    part.split('.').next().unwrap_or(""),
+                    "con" | "prn" | "aux" | "nul"
+                )
+                || part
+                    .strip_prefix("com")
+                    .or_else(|| part.strip_prefix("lpt"))
+                    .is_some_and(|suffix| {
+                        matches!(
+                            suffix.split('.').next(),
+                            Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                        )
+                    })
+        })
+    {
+        return None;
+    }
+    Some((kind, path))
+}
+
 #[derive(Default)]
 pub(super) struct Parsed {
     // İç kurallarda Git'in -D/-d ayrımı için özgün harfler korunur.
@@ -30,6 +105,143 @@ pub(super) fn executable(token: &str) -> String {
         }
     }
     lower
+}
+
+/// Shell durumu izlenmez: dizin değiştiren bir bileşenden sonra göreli yol
+/// başlangıç cwd'sine bağlanamaz. Dinamik kod da aynı belirsizliği taşır.
+pub(super) fn changes_working_directory(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            executable(arg).as_str(),
+            "cd" | "chdir"
+                | "set-location"
+                | "sl"
+                | "push-location"
+                | "pushd"
+                | "pop-location"
+                | "popd"
+                | "invoke-expression"
+                | "iex"
+        ) || {
+            let lower = arg.to_lowercase();
+            lower.contains("[environment]::currentdirectory")
+                || lower.contains("[system.environment]::currentdirectory")
+                || lower.contains("[io.directory]::setcurrentdirectory")
+                || lower.contains("[system.io.directory]::setcurrentdirectory")
+                || lower.starts_with("-workingdirectory")
+        }
+    })
+}
+
+/// Seçenek adlarını, alt komutları ve filtreleri yol diye çözümleme. Bilinmeyen
+/// araçların konumsal argümanları muhafazakâr olarak olası yol kabul edilir.
+pub(super) fn path_arguments(args: &[String]) -> Vec<&str> {
+    let Some(first) = args.first() else {
+        return Vec::new();
+    };
+    let program = executable(first);
+    let build_tool = matches!(program.as_str(), "cargo" | "npm");
+    let git = program == "git";
+    let git_objects = git
+        && !args
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case("--no-index"));
+    let mut git_verb = None;
+    let mut literal_paths = false;
+    let mut expect_path = false;
+    let mut skip_value = false;
+    let mut paths = Vec::new();
+    for arg in args.iter().skip(1) {
+        if expect_path {
+            paths.push(arg.as_str());
+            expect_path = false;
+            continue;
+        }
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg == "--" {
+            literal_paths = true;
+            continue;
+        }
+        if !literal_paths && arg.starts_with('-') {
+            let (name, value) = arg
+                .split_once([':', '='])
+                .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+            let lower = name.to_lowercase();
+            let path_option = matches!(
+                lower.as_str(),
+                "-path"
+                    | "-literalpath"
+                    | "-destination"
+                    | "-destinationpath"
+                    | "-target"
+                    | "-workingdirectory"
+                    | "-filepath"
+                    | "--manifest-path"
+                    | "--target-dir"
+                    | "--prefix"
+                    | "--cache"
+                    | "--git-dir"
+                    | "--work-tree"
+                    | "--exec-path"
+                    | "--output"
+                    | "-output"
+                    | "-o"
+            ) || (git && name == "-C");
+            if path_option {
+                if let Some(value) = value {
+                    paths.push(value);
+                } else {
+                    expect_path = true;
+                }
+            } else if git && name.starts_with("-C") {
+                paths.push(&arg[2..]);
+            } else if git && matches!(lower.as_str(), "-c" | "--namespace" | "--config-env") {
+                skip_value = value.is_none();
+            } else if !build_tool
+                && !git
+                && let Some(value) = value
+            {
+                paths.push(value);
+            }
+            continue;
+        }
+        // cmd/Windows dosya araçlarının anahtarları birer yol değildir.
+        if !literal_paths
+            && matches!(
+                arg.to_ascii_lowercase().as_str(),
+                "/s" | "/e" | "/b" | "/a" | "/y" | "/i" | "/q" | "/f"
+            )
+        {
+            continue;
+        }
+        if build_tool {
+            continue;
+        }
+        if git && git_verb.is_none() {
+            git_verb = Some(arg.as_str());
+            continue;
+        }
+        // revision:path Git nesnesidir; yalnız salt okunur komutlarda ve
+        // dosya pathspec sınırından önce bu sözdizimine izin verilir.
+        if git_objects
+            && !literal_paths
+            && git_verb.is_some_and(|verb| {
+                matches!(
+                    verb.to_ascii_lowercase().as_str(),
+                    "show" | "log" | "diff" | "cat-file" | "ls-tree" | "rev-parse"
+                )
+            })
+            && arg.contains(':')
+            && !arg.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+        {
+            continue;
+        }
+        paths.push(arg.as_str());
+    }
+    paths
 }
 
 pub(super) fn parse(command: &str) -> Parsed {

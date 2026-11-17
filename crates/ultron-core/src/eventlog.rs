@@ -67,7 +67,7 @@ impl EventLog {
             .db
             .append_event(&stored)?
             .ok_or_else(|| anyhow!("olay zaten kayıtlı: {}", stored.id))?;
-        self.write_transcript(&stored)?;
+        self.write_transcript(&stored, false)?;
         // Dinleyici yoksa gönderim hatası beklenen bir durumdur.
         let _ = self.tx.send(stored.clone());
         Ok(stored)
@@ -78,7 +78,17 @@ impl EventLog {
         self.tx.subscribe()
     }
 
-    fn write_transcript(&self, stored: &StoredEvent) -> Result<()> {
+    /// Kalıcı onay olayını normal dökümle aynı yazıcı ve kilitten geçirir.
+    pub fn write_persisted_transcript(&self, stored: &StoredEvent) -> Result<()> {
+        validate_chat_id(&stored.chat_id)?;
+        let _guard = self
+            .seq_lock
+            .lock()
+            .map_err(|_| anyhow!("olay sıra kilidi zehirlendi"))?;
+        self.write_transcript(stored, true)
+    }
+
+    fn write_transcript(&self, stored: &StoredEvent, durable: bool) -> Result<()> {
         let path = self
             .paths
             .transcripts
@@ -90,10 +100,7 @@ impl EventLog {
         line.insert("chat_id".into(), Value::String(stored.chat_id.clone()));
         line.insert(
             "session_id".into(),
-            stored
-                .session_id
-                .clone()
-                .map_or(Value::Null, Value::String),
+            stored.session_id.clone().map_or(Value::Null, Value::String),
         );
         if let Value::Object(payload) = &stored.payload {
             for (k, v) in payload {
@@ -105,6 +112,9 @@ impl EventLog {
             .append(true)
             .open(&path)?;
         writeln!(file, "{}", Value::Object(line))?;
+        if durable {
+            file.sync_data()?;
+        }
         Ok(())
     }
 }

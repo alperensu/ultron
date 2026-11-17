@@ -87,6 +87,57 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE import_state ADD COLUMN prefix_hash TEXT;
     "#,
+    // v8: kalıcı onay kuyruğu; eski tablolara ve kayıtlara dokunmaz.
+    r#"
+    CREATE TABLE approvals (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT REFERENCES chats(id),
+        engine TEXT NOT NULL,
+        category TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        action_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'approved', 'denied', 'expired')),
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        resolved_by TEXT CHECK(resolved_by IN ('desktop', 'telegram', 'timeout', 'restart')),
+        CHECK((status = 'pending' AND resolved_at IS NULL AND resolved_by IS NULL)
+           OR (status != 'pending' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL))
+    );
+    CREATE INDEX approvals_status_created ON approvals(status, created_at);
+    "#,
+    // v9: bağlantı sahipliği ve durumla atomik yazılan, yeniden denenebilir olay çıkışı.
+    r#"
+    CREATE TABLE approvals_v9 (
+        id TEXT PRIMARY KEY,
+        chat_id TEXT REFERENCES chats(id),
+        engine TEXT NOT NULL,
+        category TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        action_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'approved', 'denied', 'expired')),
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        resolved_by TEXT CHECK(resolved_by IN ('desktop', 'telegram', 'approver', 'timeout', 'restart')),
+        requester_id TEXT,
+        CHECK((status = 'pending' AND resolved_at IS NULL AND resolved_by IS NULL)
+           OR (status != 'pending' AND resolved_at IS NOT NULL AND resolved_by IS NOT NULL))
+    );
+    INSERT INTO approvals_v9(id, chat_id, engine, category, reason, action_json, status,
+        created_at, resolved_at, resolved_by)
+        SELECT id, chat_id, engine, category, reason, action_json, status,
+            created_at, resolved_at, resolved_by FROM approvals;
+    DROP TABLE approvals;
+    ALTER TABLE approvals_v9 RENAME TO approvals;
+    CREATE INDEX approvals_status_created ON approvals(status, created_at);
+    CREATE INDEX approvals_requester ON approvals(requester_id, id);
+    CREATE TABLE approval_outbox (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        approval_id TEXT NOT NULL,
+        event_json TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// Bekleyen migrasyonları `user_version` üzerinden sırayla uygular.
@@ -120,6 +171,44 @@ pub fn apply(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v9_preserves_existing_v8_approvals_and_accepts_authenticated_resolver() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for (idx, sql) in MIGRATIONS.iter().take(8).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", (idx + 1) as i64).unwrap();
+        }
+        conn.execute("INSERT INTO approvals(id, engine, category, reason, action_json, created_at) VALUES ('pending', 'claude', 'Delete', 'test', '{}', '2026-01-01T00:00:00Z')", []).unwrap();
+        conn.execute("INSERT INTO approvals(id, engine, category, reason, action_json, status, created_at, resolved_at, resolved_by) VALUES ('resolved', 'claude', 'Delete', 'test', '{}', 'approved', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', 'desktop')", []).unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2);
+        let by: String = conn.query_row("SELECT resolved_by FROM approvals WHERE id = 'resolved'", [], |r| r.get(0)).unwrap();
+        assert_eq!(by, "desktop");
+        conn.execute("UPDATE approvals SET status = 'approved', resolved_at = created_at, resolved_by = 'approver' WHERE id = 'pending'", []).unwrap();
+    }
+
+    #[test]
+    fn approvals_migration_preserves_v7_data_and_is_repeatable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for (idx, sql) in MIGRATIONS.iter().take(7).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", (idx + 1) as i64).unwrap();
+        }
+        conn.execute("INSERT INTO chats(id, title, created_at) VALUES ('kept', 'kept title', '2026-01-01T00:00:00Z')", []).unwrap();
+        apply(&conn).unwrap();
+        conn.execute("INSERT INTO approvals(id, engine, category, reason, action_json, created_at) VALUES ('a', 'claude', 'Delete', 'test', '{}', '2026-01-01T00:00:00Z')", []).unwrap();
+        apply(&conn).unwrap();
+        let kept: String = conn.query_row("SELECT title FROM chats WHERE id = 'kept'", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, "kept title");
+        let approval: (Option<String>, String) = conn.query_row("SELECT chat_id, status FROM approvals WHERE id = 'a'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(approval, (None, "pending".into()));
+        assert!(conn.execute("UPDATE approvals SET status = 'approved' WHERE id = 'a'", []).is_err());
+    }
 
     #[test]
     fn path_key_migration_backfills_without_changing_existing_projects() {

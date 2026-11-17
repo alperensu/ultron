@@ -24,6 +24,9 @@ use ultron_core::{Config, Db, EngineId, EventLog, Paths, SessionManager, Session
 
 use crate::keepawake::KeepAwake;
 
+#[path = "approvals.rs"]
+pub mod approvals;
+
 /// Kimlik doğrulaması (Hello) için tanınan süre.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -50,11 +53,13 @@ struct State {
     db: Arc<Db>,
     log: Arc<EventLog>,
     token: String,
+    approver_token: String,
     keep: KeepAwake,
     default_engine: EngineId,
     turns: Mutex<JoinSet<()>>,
     paths: Paths,
     quota: ultron_core::quota::QuotaService,
+    approvals: approvals::Approvals,
 }
 
 /// Çalışan sunucunun tutamacı.
@@ -63,6 +68,7 @@ pub struct ServerHandle {
     task: tokio::task::JoinHandle<()>,
     pipe_name: String,
     token: String,
+    approver_token: String,
     keep: KeepAwake,
 }
 
@@ -73,6 +79,10 @@ impl ServerHandle {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn approver_token(&self) -> &str {
+        &self.approver_token
     }
 
     /// Şu an çalışan tur sayısı (keep-awake tutucuları).
@@ -162,14 +172,18 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
 
     let db = Arc::new(Db::open(&paths.db)?);
     let log = Arc::new(EventLog::new(db.clone(), paths.clone()));
+    let approvals = approvals::Approvals::new(db.clone(), log.clone(), paths.clone());
+    approvals.recover_pending()?;
     let recovered = recover_interrupted(&db, &log)?;
     if recovered > 0 {
         tracing::warn!(recovered, "yarım kalan oturumlar Interrupted yapıldı");
     }
 
-    // Token pipe'tan önce yazılır; istemci pipe'ı görünce token'ı okuyabilir.
+    // İki token da pipe'tan önce yazılır; eksik rol dosyasıyla servis hazır sayılmaz.
     let token = sys::random_token()?;
     sys::write_private_file(&ipc::token_path(&paths), token.as_bytes())?;
+    let approver_token = sys::random_token()?;
+    sys::write_private_file(&ipc::approver_token_path(&paths), approver_token.as_bytes())?;
 
     let sid = sys::current_user_sid()?;
     let sd = sys::SecurityDescriptor::owner_only(&sid, "GA")?;
@@ -184,11 +198,13 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
         db,
         log,
         token: token.clone(),
+        approver_token: approver_token.clone(),
         keep: keep.clone(),
         default_engine: cfg.default_engine,
         turns: Mutex::new(JoinSet::new()),
         paths: paths.clone(),
         quota: ultron_core::quota::QuotaService::from_env(),
+        approvals,
     });
 
     let cancel = CancellationToken::new();
@@ -228,6 +244,7 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
         task,
         pipe_name,
         token,
+        approver_token,
         keep,
     })
 }
@@ -235,6 +252,17 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
 enum Flow {
     Continue,
     Close,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionRole {
+    Requester,
+    Approver,
+}
+
+struct ConnectionAuth {
+    role: ConnectionRole,
+    requester_id: String,
 }
 
 async fn send_error(writer: &mut Writer, message: impl Into<String>) {
@@ -265,17 +293,17 @@ async fn handle_conn(stream: NamedPipeServer, st: Arc<State>, cancel: Cancellati
             return;
         }
     };
-    match serde_json::from_str::<Request>(&line) {
-        Ok(Request::Hello { token }) if ct_eq(token.as_bytes(), st.token.as_bytes()) => {
-            if write_msg(
-                &mut writer,
-                &Response::Ok {
-                    data: json!({"hello": true, "version": ultron_core::VERSION}),
-                },
-            )
-            .await
-            .is_err()
-            {
+    let role = match serde_json::from_str::<Request>(&line) {
+        Ok(Request::Hello { token }) => {
+            // İki sır da sabit zamanlı karşılaştırılır; rolü istemci etiketi belirlemez.
+            let requester = ct_eq(token.as_bytes(), st.token.as_bytes());
+            let approver = ct_eq(token.as_bytes(), st.approver_token.as_bytes());
+            if approver {
+                ConnectionRole::Approver
+            } else if requester {
+                ConnectionRole::Requester
+            } else {
+                send_error(&mut writer, "kimlik doğrulaması başarısız").await;
                 return;
             }
         }
@@ -283,6 +311,24 @@ async fn handle_conn(stream: NamedPipeServer, st: Arc<State>, cancel: Cancellati
             send_error(&mut writer, "kimlik doğrulaması başarısız").await;
             return;
         }
+    };
+    let auth = ConnectionAuth {
+        role,
+        requester_id: uuid::Uuid::new_v4().to_string(),
+    };
+    {
+        if write_msg(
+                &mut writer,
+                &Response::Ok {
+                    data: json!({"hello": true, "version": ultron_core::VERSION,
+                        "role": if role == ConnectionRole::Approver { "approver" } else { "requester" }}),
+                },
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
     }
 
     loop {
@@ -305,7 +351,7 @@ async fn handle_conn(stream: NamedPipeServer, st: Arc<State>, cancel: Cancellati
                 continue;
             }
         };
-        match dispatch(&st, request, &mut reader, &mut writer, &cancel).await {
+        match dispatch(&st, &auth, request, &mut reader, &mut writer, &cancel).await {
             Ok(Flow::Continue) => {}
             Ok(Flow::Close) => return,
             Err(e) => {
@@ -415,12 +461,58 @@ async fn read_catalog_file(path: &Path) -> Result<String> {
 
 async fn dispatch(
     st: &Arc<State>,
+    auth: &ConnectionAuth,
     request: Request,
     reader: &mut Reader,
     writer: &mut Writer,
     cancel: &CancellationToken,
 ) -> Result<Flow> {
     match request {
+        Request::PolicyCheck {
+            action,
+            chat_id,
+            engine,
+            wait_secs,
+        } => {
+            let decision = st
+                .approvals
+                .check_owned(action, chat_id, engine, wait_secs, Some(&auth.requester_id))
+                .await?;
+            ok(writer, json!({"decision": decision})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::ListApprovals {
+            status,
+            limit,
+            cursor,
+        } => {
+            let owner =
+                (auth.role == ConnectionRole::Requester).then_some(auth.requester_id.as_str());
+            ok(
+                writer,
+                serde_json::to_value(st.db.list_approvals_page(
+                    status,
+                    owner,
+                    limit,
+                    cursor.as_deref(),
+                )?)?,
+            )
+            .await?;
+            Ok(Flow::Continue)
+        }
+        Request::ResolveApproval { id, approve, by } => {
+            use ultron_core::db::approvals::ResolvedBy;
+            if auth.role != ConnectionRole::Approver {
+                return Err(anyhow!("yetkisiz: onaylayıcı rolü gerekli"));
+            }
+            if !matches!(by.as_str(), "desktop" | "telegram") {
+                return Err(anyhow!("geçersiz onay etiketi (desktop|telegram)"));
+            }
+            // Eski `by` yalnız uyumlu bir etikettir; kalıcı kimlik onaylayıcı bağlantısıdır.
+            let approval = st.approvals.resolve(&id, approve, ResolvedBy::Approver)?;
+            ok(writer, json!({"approval": approval})).await?;
+            Ok(Flow::Continue)
+        }
         Request::Hello { .. } => {
             send_error(writer, "Hello yalnız bağlantının ilk mesajı olabilir").await;
             Ok(Flow::Close)
@@ -584,8 +676,9 @@ async fn dispatch(
                 // Projesiz sohbet kullanıcının ev dizininde çalışmaz: sohbete özel çalışma alanı.
                 None if cwd.trim().is_empty() || is_user_home(Path::new(&cwd)) => {
                     let dir = st.paths.root.join("workspaces").join(&chat_id);
-                    std::fs::create_dir_all(&dir)
-                        .with_context(|| format!("çalışma alanı oluşturulamadı: {}", dir.display()))?;
+                    std::fs::create_dir_all(&dir).with_context(|| {
+                        format!("çalışma alanı oluşturulamadı: {}", dir.display())
+                    })?;
                     dir.to_string_lossy().into_owned()
                 }
                 None => cwd,
@@ -613,6 +706,7 @@ async fn dispatch(
             let engine = pre_engine;
             let mut last_seq = st.db.next_seq(&chat_id)? - 1;
             let mut wake = st.log.subscribe();
+            let mut approval_wake = st.approvals.subscribe_global();
             let guard = st.keep.acquire();
             let (done_tx, mut done_rx) = oneshot::channel();
             {
@@ -672,6 +766,7 @@ async fn dispatch(
                         }
                         return Ok(Flow::Continue);
                     }
+                    _ = approval_wake.recv() => {}
                     woke = wake.recv() => {
                         if matches!(woke, Err(broadcast::error::RecvError::Closed)) {
                             return Ok(Flow::Close);
@@ -695,6 +790,7 @@ async fn dispatch(
             limit,
         } => match chat_id {
             Some(chat) => {
+                let mut approval_wake = st.approvals.subscribe_global();
                 let mut last_seq = after_seq.unwrap_or(0);
                 if let (false, Some(limit)) = (follow, limit) {
                     let page = st
@@ -719,6 +815,7 @@ async fn dispatch(
                     }
                     tokio::select! {
                         () = cancel.cancelled() => return Ok(Flow::Close),
+                        _ = approval_wake.recv() => {}
                         woke = wake.recv() => {
                             if matches!(woke, Err(broadcast::error::RecvError::Closed)) {
                                 return Ok(Flow::Close);
@@ -734,6 +831,7 @@ async fn dispatch(
                 }
             }
             None if follow => {
+                let mut approval_wake = st.approvals.subscribe_global();
                 let mut wake = subscribe_and_ack(st, writer, None).await?;
                 // Sohbet başına son iletilen sıra. Yayın kanalı taşarsa (Lagged) kaçan olaylar
                 // bu imleçlerden itibaren veritabanından tamamlanır.
@@ -741,6 +839,14 @@ async fn dispatch(
                 loop {
                     tokio::select! {
                         () = cancel.cancelled() => return Ok(Flow::Close),
+                        event = approval_wake.recv() => match event {
+                            Ok(ev) => write_msg(writer, &Response::Event(ev)).await?,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // İstemci ListApprovals ile kalıcı durumdan yeniden eşitlenir.
+                                return Err(anyhow!("onay akışı geride kaldı; onay listesini yeniden okuyun"));
+                            }
+                            Err(broadcast::error::RecvError::Closed) => return Ok(Flow::Close),
+                        },
                         woke = wake.recv() => match woke {
                             Ok(ev) => {
                                 let seen = cursors.get(&ev.chat_id).copied().unwrap_or(0);
@@ -909,8 +1015,13 @@ mod tests {
         FAKE.call_once(|| {
             let name = format!("ultron-fake-cli{}", std::env::consts::EXE_SUFFIX);
             let exe = std::env::current_exe().unwrap();
-            let fake = exe.ancestors().skip(1).take(6).map(|dir| dir.join(&name))
-                .find(|path| path.is_file()).expect("önce ultron-fake-cli derlenmeli");
+            let fake = exe
+                .ancestors()
+                .skip(1)
+                .take(6)
+                .map(|dir| dir.join(&name))
+                .find(|path| path.is_file())
+                .expect("önce ultron-fake-cli derlenmeli");
             // SAFETY: tüm testler yalnız aynı sahte CLI yolunu bir kez yazar.
             unsafe { std::env::set_var("ULTRON_FAKE_CLI", fake) };
         });

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use ultron_core::engine::{Engine, FakeEngine};
-use ultron_core::ipc::{PolicyArg, Request};
+use ultron_core::ipc::{self, PolicyArg, Request};
 use ultron_core::{Config, EngineId, Paths};
 use ultron_desktop::bridge::{Bridge, BridgeError};
 use ultron_desktop::events::{Backoff, run_follow};
@@ -18,8 +18,11 @@ const STARTED: &str = r#"{"type":"session_started","native_session_id":"nat-1"}"
 const REPLY: &str = r#"{"type":"assistant_text","text":"merhaba"}"#;
 const DONE: &str = r#"{"type":"turn_completed"}"#;
 
+// Süreç ortamını kullanan testler varsayılan paralel koşuda da birbirinden yalıtılır.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn set_env(key: &str, value: impl AsRef<std::ffi::OsStr>) {
-    // SAFETY: testler `--test-threads=1` ile çalışır; ortam yalnız test başında yazılır.
+    // SAFETY: ortamı kullanan tüm testler ENV_LOCK tutar; görevler yazımlardan sonra başlar.
     unsafe { std::env::set_var(key, value) };
 }
 
@@ -37,7 +40,7 @@ fn ensure_bin(package: &str, bin: &str) -> PathBuf {
     find().unwrap_or_else(|| {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let status = std::process::Command::new(cargo)
-            .args(["build", "-p", package, "--bin", bin])
+            .args(["build", "-j", "4", "-p", package, "--bin", bin])
             .status()
             .unwrap();
         assert!(status.success(), "{bin} derlenemedi");
@@ -59,11 +62,25 @@ fn fake_engines(dir: &Path) -> HashMap<EngineId, Arc<dyn Engine>> {
     map
 }
 
+fn test_config() -> Config {
+    // Sahte motor turu gerçek agy özetleyicisini veya canlı kota hizmetini başlatmamalı.
+    let mut cfg = Config {
+        claude_live_quota: false,
+        ..Config::default()
+    };
+    for engine in &mut cfg.engines {
+        if engine.id == EngineId::Agy {
+            engine.enabled = false;
+        }
+    }
+    cfg
+}
+
 async fn start_server(paths: &Paths, pipe: &str) -> server::ServerHandle {
     server::start(ServerConfig {
         paths: paths.clone(),
         pipe_name: pipe.to_string(),
-        cfg: Config::default(),
+        cfg: test_config(),
         engines: fake_engines(&paths.root),
     })
     .await
@@ -89,7 +106,7 @@ async fn run_turn(bridge: &Bridge, cwd: &Path, chat: &str) -> i64 {
     loop {
         let r = tokio::time::timeout(Duration::from_secs(20), client.next())
             .await
-            .expect("tur zaman aşımı")
+            .unwrap_or_else(|_| panic!("tur zaman aşımı (son olay seq={head})"))
             .unwrap();
         match r {
             Some(ultron_core::ipc::Response::Ok { data }) if data.get("done").is_some() => {
@@ -105,7 +122,9 @@ async fn run_turn(bridge: &Bridge, cwd: &Path, chat: &str) -> i64 {
 
 #[tokio::test]
 async fn bridge_starts_daemon_or_reports_error() {
+    let _env = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
+    set_env("ULTRON_QUOTA_HOME", tmp.path().join("quota-home"));
     let paths = Paths::from_root(tmp.path().join("ultron"));
     paths.ensure().unwrap();
     set_env("ULTRON_HOME", &paths.root);
@@ -155,13 +174,27 @@ async fn bridge_starts_daemon_or_reports_error() {
         Err(BridgeError::Daemon { message }) => assert!(message.contains("bulunamadı")),
         other => panic!("Daemon hatası beklenirdi: {other:?}"),
     }
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .output();
+    // Daraltılmış PATH ve WMI kısıtları altında da yalnız bu testin servisini kapat.
+    let powershell = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let stopped = std::process::Command::new(powershell)
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!("Stop-Process -Id {pid} -Force -ErrorAction Stop"))
+        .output()
+        .expect("test servisi kapatılamadı");
+    assert!(
+        stopped.status.success(),
+        "test servisi kapatılamadı: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
 }
 
 #[tokio::test]
 async fn event_bridge_resumes_after_reconnect() {
+    let _env = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::from_root(tmp.path().join("ultron"));
     paths.ensure().unwrap();
@@ -213,6 +246,7 @@ async fn event_bridge_resumes_after_reconnect() {
 
 #[tokio::test]
 async fn events_page_respects_limit() {
+    let _env = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::from_root(tmp.path().join("ultron"));
     paths.ensure().unwrap();
@@ -264,6 +298,97 @@ async fn events_page_respects_limit() {
 
 type Seen = Vec<(String, i64)>;
 
+#[tokio::test]
+async fn chatless_restart_results_reconcile_all_pages_and_reconnect() {
+    use ultron_core::db::approvals::ApprovalStatus;
+    use ultron_core::policy::{Action, RiskCategory};
+    use ultron_desktop::events::{DaemonStatus, run_follow_with_state};
+    let _env = ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let db = ultron_core::Db::open(&paths.db).unwrap();
+    let create = || {
+        db.create_approval(
+            None,
+            EngineId::Claude,
+            RiskCategory::Delete,
+            "test",
+            &Action::FileDelete {
+                path: "synthetic.txt".into(),
+            },
+        )
+        .unwrap()
+        .id
+    };
+    let mut expected: std::collections::HashSet<_> = (0..40).map(|_| create()).collect();
+    let config = || ServerConfig {
+        paths: paths.clone(),
+        pipe_name: pipe.clone(),
+        cfg: test_config(),
+        engines: HashMap::new(),
+    };
+    // Kurtarma pipe açılmadan olur; bu sonuçların hiçbir canlı abonesi yoktur.
+    let server = server::start(config()).await.unwrap();
+    let bridge = Bridge::new(paths.clone(), None);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (state_tx, mut states) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
+    let follower_cancel = cancel.clone();
+    let follower = tokio::spawn(async move {
+        run_follow_with_state(
+            &bridge,
+            Backoff {
+                initial: Duration::from_millis(300),
+                max: Duration::from_millis(300),
+            },
+            follower_cancel,
+            move |ev| {
+                let _ = tx.send(ev);
+            },
+            move |status| {
+                let _ = state_tx.send(status);
+            },
+        )
+        .await;
+    });
+    assert_eq!(next_status(&mut states).await, DaemonStatus::Ready);
+    for _ in 0..40 {
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.payload["status"], "expired");
+        assert!(expected.remove(event.payload["approval_id"].as_str().unwrap()));
+    }
+    assert!(expected.is_empty());
+    server.shutdown().await;
+    assert!(matches!(
+        next_status(&mut states).await,
+        DaemonStatus::Unavailable(_)
+    ));
+    let id = create();
+    let server = server::start(config()).await.unwrap();
+    assert_eq!(
+        db.get_approval(&id).unwrap().unwrap().status,
+        ApprovalStatus::Expired
+    );
+    assert_eq!(next_status(&mut states).await, DaemonStatus::Ready);
+    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.payload["approval_id"], id);
+    assert_eq!(event.payload["status"], "expired");
+    assert!(rx.try_recv().is_err());
+    cancel.cancel();
+    follower.await.unwrap();
+    server.shutdown().await;
+}
+
 fn spawn_follower(
     bridge: &Arc<Bridge>,
     backoff: Backoff,
@@ -311,6 +436,7 @@ fn seqs_of(seen: &Seen, chat: &str) -> Vec<i64> {
 
 #[tokio::test]
 async fn reconnect_discovers_chat_created_while_offline() {
+    let _env = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::from_root(tmp.path().join("ultron"));
     paths.ensure().unwrap();
@@ -351,6 +477,7 @@ async fn reconnect_discovers_chat_created_while_offline() {
 
 #[tokio::test]
 async fn first_event_gap_fetches_prefix() {
+    let _env = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::from_root(tmp.path().join("ultron"));
     paths.ensure().unwrap();
@@ -361,16 +488,16 @@ async fn first_event_gap_fetches_prefix() {
     std::fs::create_dir_all(&cwd).unwrap();
     let bridge = Arc::new(Bridge::new(paths.clone(), None));
     let server = start_server(&paths, &pipe).await;
-    // Takipçi başlamadan c1'in ilk turu (seq 1..=3) yazılır.
+    // Takipçi başlamadan kullanıcı mesajı ve fixture olayları günlüğe yazılır.
     run_turn(&bridge, &cwd, "c1").await;
     let (mut rx, cancel, follower) = spawn_follower(&bridge, Backoff::default());
-    // Taban çizgisi alınana dek bekle, sonra ikinci tur: takipçinin gördüğü ilk canlı olay seq 4.
+    // Taban çizgisi alınana dek bekle, sonra ikinci turu başlat.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    run_turn(&bridge, &cwd, "c1").await;
+    let head = run_turn(&bridge, &cwd, "c1").await;
     let mut seen = Seen::new();
-    let ok = collect_until(&mut rx, &mut seen, |s| s.len() >= 6).await;
+    let ok = collect_until(&mut rx, &mut seen, |s| s.len() >= head as usize).await;
     assert!(ok, "olaylar tamamlanmadı: {seen:?}");
-    assert_eq!(seqs_of(&seen, "c1"), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(seqs_of(&seen, "c1"), (1..=head).collect::<Vec<_>>());
 
     cancel.cancel();
     let _ = follower.await;
@@ -388,6 +515,7 @@ async fn next_status(
 
 #[tokio::test]
 async fn daemon_state_follows_connection() {
+    let _env = ENV_LOCK.lock().await;
     use ultron_desktop::events::{DaemonStatus, run_follow_with_state};
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::from_root(tmp.path().join("ultron"));
@@ -439,6 +567,7 @@ async fn daemon_state_follows_connection() {
 
 #[tokio::test]
 async fn bridge_waits_for_subscription_ack_before_ready() {
+    let _env = ENV_LOCK.lock().await;
     use ultron_desktop::events::{DaemonStatus, run_follow_with_state};
     use ultrond::server::{SUBSCRIBE_GATE, SubscribeGate};
     let tmp = tempfile::tempdir().unwrap();
@@ -601,6 +730,7 @@ fn keys(v: &serde_json::Value) -> Vec<String> {
 /// ve çekirdek tiplerle tipli ayrıştırma). TS tarafı aynı alan listelerini `bridge.test.ts` sınar.
 #[tokio::test]
 async fn command_json_shapes_match_ts_types() {
+    let _env = ENV_LOCK.lock().await;
     use ultron_desktop::commands::*;
     fn json(value: impl serde::Serialize) -> serde_json::Value {
         serde_json::to_value(value).unwrap()
@@ -624,7 +754,7 @@ async fn command_json_shapes_match_ts_types() {
     struct RestoreQuotaHome(Option<std::ffi::OsString>);
     impl Drop for RestoreQuotaHome {
         fn drop(&mut self) {
-            // SAFETY: bu süreç testleri --test-threads=1 ile çalıştırır.
+            // SAFETY: ortamı kullanan tüm testler ENV_LOCK ile sıralanır.
             unsafe {
                 match &self.0 {
                     Some(value) => std::env::set_var("ULTRON_QUOTA_HOME", value),
@@ -647,7 +777,7 @@ async fn command_json_shapes_match_ts_types() {
     let server = server::start(ServerConfig {
         paths: paths.clone(),
         pipe_name: pipe.clone(),
-        cfg: Config::default(),
+        cfg: test_config(),
         engines,
     })
     .await
@@ -931,6 +1061,20 @@ async fn command_json_shapes_match_ts_types() {
         ["default_engine", "pid", "running_turns", "version"]
     );
     server.shutdown().await;
+}
+
+#[test]
+fn requester_token_requires_both_role_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    assert!(ipc::read_token(&paths).is_err());
+    std::fs::write(ipc::token_path(&paths), "synthetic-requester").unwrap();
+    assert!(ipc::read_token(&paths).is_err());
+    std::fs::write(ipc::approver_token_path(&paths), "synthetic-approver").unwrap();
+    assert_eq!(ipc::read_token(&paths).unwrap(), "synthetic-requester");
+    std::fs::remove_file(ipc::token_path(&paths)).unwrap();
+    assert!(ipc::read_token(&paths).is_err());
 }
 
 async fn collect(

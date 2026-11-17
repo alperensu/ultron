@@ -25,3 +25,6 @@
 ## Testler
 - Entegrasyon testleri `crates/ultron-core/tests` altında, sentetik fikstürler `tests/fixtures` altındadır.
 - Sahte CLI yardımcı ikili dosyası `tests/bin/fake_cli.rs` konumundadır.
+
+## Kalan risk
+Politika sözcüksel bir ek savunma katmanıdır; politika yolunun dışındaki aynı kullanıcı süreçleri onaylayıcı belirtecini hâlâ okuyabilir. Motorların işletim sistemi düzeyinde izolasyonu (kısıtlı belirteç veya ayrı hesap) Faz 3 Görev 5 için planlanmıştır.

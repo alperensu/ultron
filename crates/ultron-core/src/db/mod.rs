@@ -1,4 +1,5 @@
 mod migrations;
+pub mod approvals;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};

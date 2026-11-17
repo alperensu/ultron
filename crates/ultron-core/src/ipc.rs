@@ -116,6 +116,63 @@ pub enum Request {
         pool: String,
         count: u32,
     },
+    PolicyCheck {
+        action: crate::policy::Action,
+        chat_id: Option<String>,
+        engine: EngineId,
+        #[serde(default = "default_approval_wait_secs")]
+        wait_secs: u32,
+    },
+    ListApprovals {
+        status: Option<crate::db::approvals::ApprovalStatus>,
+        #[serde(default)]
+        limit: Option<u32>,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
+    ResolveApproval {
+        id: String,
+        approve: bool,
+        by: String,
+    },
+}
+
+fn default_approval_wait_secs() -> u32 {
+    300
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    #[test]
+    fn policy_check_defaults_timeout_and_debug_hides_action() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "type": "policy_check", "action": {"Shell": {"command": "rm x; token=synthetic-value", "cwd": "."}},
+            "chat_id": null, "engine": "claude"
+        })).unwrap();
+        assert!(matches!(
+            &request,
+            Request::PolicyCheck { wait_secs: 300, .. }
+        ));
+        assert!(!format!("{request:?}").contains("synthetic-value"));
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), request);
+        for status in ["pending", "approved", "denied", "expired"] {
+            let request: Request = serde_json::from_value(
+                serde_json::json!({"type": "list_approvals", "status": status}),
+            )
+            .unwrap();
+            assert!(matches!(
+                request,
+                Request::ListApprovals {
+                    status: Some(_),
+                    limit: None,
+                    cursor: None
+                }
+            ));
+        }
+    }
 }
 
 fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
@@ -215,6 +272,16 @@ impl std::fmt::Debug for Request {
                 .field("chat_id", chat_id)
                 .finish_non_exhaustive(),
             Request::Status => f.write_str("Status"),
+            Request::PolicyCheck { .. } => f.write_str("PolicyCheck { action: <gizli> }"),
+            Request::ListApprovals { status, .. } => f
+                .debug_struct("ListApprovals")
+                .field("status", status)
+                .finish_non_exhaustive(),
+            Request::ResolveApproval { id, approve, .. } => f
+                .debug_struct("ResolveApproval")
+                .field("id", id)
+                .field("approve", approve)
+                .finish_non_exhaustive(),
             Request::ListProjects => f.write_str("ListProjects"),
             Request::ListChats { project_id, .. } => f
                 .debug_struct("ListChats")
@@ -351,8 +418,25 @@ pub fn token_path(paths: &Paths) -> std::path::PathBuf {
     paths.run.join("token")
 }
 
-/// Servisin yazdığı token'ı okur.
+/// Yalnız insan arayüzlerinin kullandığı onaylayıcı sırrı; motor ortamına aktarılmaz.
+/// Hello.token bu sır ise approver, normal daemon token'ı ise requester rolü alınır.
+pub fn approver_token_path(paths: &Paths) -> std::path::PathBuf {
+    paths.run.join("approver-token")
+}
+
+/// Servisin yazdığı requester token'ını iki rolün dosyaları hazırsa okur.
 pub fn read_token(paths: &Paths) -> Result<String> {
+    // Onaylayıcı sırrını okumadan hazır olduğunu doğrula; eksikse başlatma döngüsü bekler.
+    let approver_path = approver_token_path(paths);
+    let metadata = std::fs::metadata(&approver_path).with_context(|| {
+        format!(
+            "onaylayıcı token dosyası hazır değil: {}",
+            approver_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!("onaylayıcı token yolu dosya değil");
+    }
     let path = token_path(paths);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("token okunamadı: {}", path.display()))?;

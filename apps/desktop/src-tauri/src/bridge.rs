@@ -80,6 +80,25 @@ impl Bridge {
 
     /// Tek istek, tek yanıt (paylaşılan bağlantı; kopmuşsa bir kez yeniden bağlanır).
     pub async fn request(&self, req: Request) -> Result<Value, BridgeError> {
+        if matches!(
+            req,
+            Request::ListApprovals { .. } | Request::ResolveApproval { .. }
+        ) {
+            // Sır yalnız Rust köprüsünde kalır; normal bağlantıya veya motor ortamına taşınmaz.
+            let _ready = self.connect().await?;
+            let secret = std::fs::read_to_string(ipc::approver_token_path(&self.paths))
+                .map_err(|_| protocol("onaylayıcı sırrı okunamadı"))?;
+            let mut client = Client::connect(
+                &ipc::pipe_name().map_err(|_| protocol("pipe çözülemedi"))?,
+                secret.trim(),
+            )
+            .await
+            .map_err(|_| protocol("onaylayıcı bağlantısı kurulamadı"))?;
+            return match round_trip(&mut client, &req).await {
+                Ok(Some(resp)) => into_data(resp),
+                _ => Err(protocol("onaylayıcı yanıtı alınamadı")),
+            };
+        }
         let mut guard = self.shared.lock().await;
         for attempt in 0..2 {
             if guard.is_none() {

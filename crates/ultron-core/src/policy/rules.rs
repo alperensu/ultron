@@ -2,7 +2,10 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::command::{executable, parse};
+use super::command::{
+    PathKind, ambiguous_path, changes_working_directory, classified_path, executable, parse,
+    path_arguments, without_device_prefix,
+};
 use super::{Action, Decision, PolicyConfig, PolicyContext, RiskCategory};
 
 fn ask(category: RiskCategory) -> Decision {
@@ -121,6 +124,27 @@ fn evaluate_shell(command: &str, cwd: &Path, cfg: &PolicyConfig, ctx: &PolicyCon
     if parsed.uncertain {
         return uncertain();
     }
+    // Sabit sır sınırı allow_list ile kaldırılamaz. Genişletmeleri çalıştırmadan çözümleyemeyiz.
+    if sensitive_runtime_access(&parsed.commands, &cwd.to_string_lossy())
+        || ambiguous_path(&cwd.to_string_lossy())
+        || protected_runtime_path(&cwd.to_string_lossy(), "")
+        || parsed
+            .commands
+            .iter()
+            .flat_map(|args| path_arguments(args))
+            .any(|arg| {
+                ambiguous_path(arg)
+                    || arg.to_lowercase().contains("approver-token")
+                    || protected_runtime_path(arg, &cwd.to_string_lossy())
+            })
+    {
+        // Zaten onay gerektiren işlemin özgün risk kategorisini koru.
+        let category = parsed.commands.iter().find_map(|args| {
+            let lower: Vec<_> = args.iter().map(|arg| arg.to_lowercase()).collect();
+            builtin(args, &lower, cwd, ctx)
+        });
+        return ask(category.unwrap_or(RiskCategory::Secrets));
+    }
     let mut decision = Decision::Allow;
     for args in &parsed.commands {
         let category = command_risk(args, cwd, cfg, ctx);
@@ -138,6 +162,87 @@ fn evaluate_shell(command: &str, cwd: &Path, cfg: &PolicyConfig, ctx: &PolicyCon
         return Decision::Allow;
     }
     decision
+}
+
+fn creates_link(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(index, arg)| {
+        let tail = &args[index + 1..];
+        match executable(arg).as_str() {
+            "mklink" | "ln" => true,
+            "fsutil" => tail.iter().any(|arg| arg.eq_ignore_ascii_case("hardlink")),
+            "new-item" | "ni" => tail.iter().any(|arg| {
+                arg.to_lowercase()
+                    .split(['=', ':'])
+                    .any(|part| matches!(part, "junction" | "symboliclink" | "hardlink"))
+            }),
+            _ => false,
+        }
+    })
+}
+
+fn reads_content_or_recurses(args: &[String]) -> bool {
+    args.iter().flat_map(|arg| words(arg)).any(|arg| {
+        let lower = arg.to_lowercase();
+        matches!(
+            executable(&arg).as_str(),
+            "get-content"
+                | "gc"
+                | "cat"
+                | "type"
+                | "more"
+                | "select-string"
+                | "sls"
+                | "findstr"
+                | "rg"
+                | "grep"
+                | "get-childitem"
+                | "gci"
+                | "ls"
+                | "dir"
+                | "find"
+                | "copy-item"
+                | "cpi"
+                | "copy"
+                | "cp"
+                | "robocopy"
+                | "xcopy"
+                | "compress-archive"
+                | "expand-archive"
+                | "zip"
+                | "unzip"
+                | "7z"
+                | "tar"
+        ) || lower.starts_with("-recurse")
+            || matches!(lower.as_str(), "/s" | "/e")
+            || (lower.starts_with('-') && !lower.starts_with("--") && lower[1..].contains('r'))
+            || lower == "--recursive"
+    })
+}
+
+/// Üst dizin taramaları ve bağlantı oluşturma allow-list ile serbest bırakılamaz.
+fn sensitive_runtime_access(commands: &[Vec<String>], cwd: &str) -> bool {
+    let mut changed_directory = false;
+    commands.iter().any(|args| {
+        changed_directory |= changes_working_directory(args);
+        if creates_link(args) {
+            return true;
+        }
+        if !reads_content_or_recurses(args) {
+            return false;
+        }
+        let paths = path_arguments(args);
+        // Örtük cwd erişimleri (ör. gci | gc) de başlangıç cwd'sine bağlanamaz.
+        (changed_directory
+            && (paths.is_empty()
+                || paths.iter().any(|path| {
+                    !matches!(classified_path(path), Some((PathKind::FullyQualified, _)))
+                })))
+            || resolve(cwd, "").is_none()
+            || runtime_path_or_ancestor(cwd, "")
+            || paths
+                .iter()
+                .any(|path| resolve(path, cwd).is_none() || runtime_path_or_ancestor(path, cwd))
+    })
 }
 
 fn base(ctx: &PolicyContext) -> &Path {
@@ -160,17 +265,15 @@ fn command_risk(
     {
         return None;
     }
-    for arg in args.iter().skip(1) {
+    let lower: Vec<_> = args.iter().map(|arg| arg.to_lowercase()).collect();
+    if let Some(risk) = builtin(args, &lower, cwd, ctx) {
+        return Some(risk);
+    }
+    for arg in path_arguments(args) {
         if let Some(risk) = path_risk(Path::new(arg), cwd, cfg, ctx) {
             return Some(risk);
         }
-        for word in words(arg) {
-            if let Some(risk) = path_risk(Path::new(&word), cwd, cfg, ctx) {
-                return Some(risk);
-            }
-        }
     }
-    let lower: Vec<_> = args.iter().map(|arg| arg.to_lowercase()).collect();
     if cfg
         .deploy_patterns
         .iter()
@@ -178,9 +281,6 @@ fn command_risk(
         .any(|pattern| lower.join(" ").contains(&pattern.to_lowercase()))
     {
         return Some(RiskCategory::Deploy);
-    }
-    if let Some(risk) = builtin(args, &lower, cwd, ctx) {
-        return Some(risk);
     }
     // Tanınmayan sarmalayıcılar veya argüman içine gizlenen komutlar güvenli sayılmaz.
     for (index, arg) in args.iter().enumerate().skip(1) {
@@ -337,7 +437,9 @@ fn git_risk(args: &[String]) -> Option<RiskCategory> {
 }
 
 fn project_venv(program: &str, cwd: &Path, ctx: &PolicyContext) -> bool {
-    let resolved = resolve(program, &cwd.to_string_lossy());
+    let Some(resolved) = resolve(program, &cwd.to_string_lossy()) else {
+        return false;
+    };
     let project = normalized(&base(ctx).to_string_lossy());
     [".venv/scripts", ".venv/bin", "venv/scripts", "venv/bin"]
         .iter()
@@ -352,13 +454,50 @@ fn secret_path(path: &str) -> bool {
             .next()
             .unwrap_or("")
             .to_lowercase();
-        name == ".env"
+        name == "approver-token"
+            || name == ".env"
             || name.starts_with(".env.")
             || name.ends_with(".key")
             || name.starts_with("id_rsa")
             || name.starts_with("credentials")
             || name == ".credentials.json"
     })
+}
+
+fn protected_runtime_path(path: &str, cwd: &str) -> bool {
+    let Some(resolved) = resolve(path, cwd) else {
+        return false;
+    };
+    // Varsayılan Ultron dizini, farklı Windows sürücü/önek yazımlarıyla da korunur.
+    if resolved
+        .split('/')
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|parts| parts == ["ultron", "run"])
+    {
+        return true;
+    }
+    crate::Paths::resolve()
+        .is_ok_and(|paths| under(&resolved, &normalized(&paths.run.to_string_lossy())))
+}
+
+fn runtime_path_or_ancestor(path: &str, cwd: &str) -> bool {
+    // PowerShell adlandırılmış parametreleri yolu aynı argümanda taşıyabilir.
+    let path = path_argument(path);
+    let Some(resolved) = resolve(path, cwd) else {
+        return false;
+    };
+    protected_runtime_path(path, cwd)
+        || crate::Paths::resolve()
+            .is_ok_and(|paths| under(&normalized(&paths.run.to_string_lossy()), &resolved))
+}
+
+fn path_argument(arg: &str) -> &str {
+    if arg.starts_with('-') {
+        arg.split_once([':', '=']).map_or(arg, |(_, value)| value)
+    } else {
+        arg
+    }
 }
 
 fn path_risk(
@@ -368,23 +507,25 @@ fn path_risk(
     ctx: &PolicyContext,
 ) -> Option<RiskCategory> {
     let text = path.to_string_lossy();
-    if secret_path(&text) {
+    if secret_path(&text)
+        || ambiguous_path(&text)
+        || protected_runtime_path(&text, &cwd.to_string_lossy())
+        || protected_runtime_path(&cwd.to_string_lossy(), "")
+    {
         return Some(RiskCategory::Secrets);
     }
-    let resolved = resolve(&text, &cwd.to_string_lossy());
+    let Some(resolved) = resolve(&text, &cwd.to_string_lossy()) else {
+        return Some(RiskCategory::Secrets);
+    };
     let root = base(ctx).to_string_lossy();
-    if cfg
-        .finance_paths
-        .iter()
-        .any(|path| under(&resolved, &resolve(&path.to_string_lossy(), &root)))
-    {
+    if cfg.finance_paths.iter().any(|path| {
+        resolve(&path.to_string_lossy(), &root).is_none_or(|parent| under(&resolved, &parent))
+    }) {
         return Some(RiskCategory::Finance);
     }
-    if cfg
-        .protected_paths
-        .iter()
-        .any(|path| under(&resolved, &resolve(&path.to_string_lossy(), &root)))
-    {
+    if cfg.protected_paths.iter().any(|path| {
+        resolve(&path.to_string_lossy(), &root).is_none_or(|parent| under(&resolved, &parent))
+    }) {
         return Some(RiskCategory::SystemConfig);
     }
     None
@@ -397,17 +538,29 @@ fn under(path: &str, parent: &str) -> bool {
             .is_some_and(|tail| tail.starts_with('/') || parent.ends_with('/'))
 }
 
-fn resolve(path: &str, cwd: &str) -> String {
-    let path = path.replace('\\', "/");
-    if path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') {
-        normalized(&path)
-    } else {
-        normalized(&format!("{cwd}/{path}"))
+fn resolve(path: &str, cwd: &str) -> Option<String> {
+    let (kind, path) = classified_path(path)?;
+    match kind {
+        PathKind::FullyQualified => Some(normalized(&path)),
+        PathKind::Relative if cwd.is_empty() => Some(normalized(&path)),
+        PathKind::Relative => {
+            let (_, cwd) = classified_path(cwd)?;
+            Some(normalized(&format!("{cwd}/{path}")))
+        }
     }
 }
 
 fn normalized(path: &str) -> String {
     let path = path.replace('\\', "/").to_lowercase();
+    let path = without_device_prefix(&path);
+    // Win32 aygıt önekli UNC, aynı normal UNC yoluyla karşılaştırılır.
+    let unc;
+    let path = if let Some(tail) = path.strip_prefix("unc/") {
+        unc = format!("//{tail}");
+        unc.as_str()
+    } else {
+        path
+    };
     let absolute = path.starts_with('/');
     let mut components = Vec::new();
     for part in path.split('/') {
@@ -452,6 +605,9 @@ fn evaluate_tool(tool: &str, input: &Value, cfg: &PolicyConfig, ctx: &PolicyCont
         return denied();
     }
     let name = tool.to_lowercase();
+    if name.contains("link") || name.contains("junction") {
+        return ask(RiskCategory::Secrets);
+    }
     if matches!(
         name.as_str(),
         "bash" | "shell" | "powershell" | "run_command"
@@ -472,12 +628,23 @@ fn evaluate_tool(tool: &str, input: &Value, cfg: &PolicyConfig, ctx: &PolicyCont
     fn visit(value: &Value, cfg: &PolicyConfig, ctx: &PolicyContext) -> Option<RiskCategory> {
         match value {
             Value::String(text) => {
+                if runtime_path_or_ancestor(text, &base(ctx).to_string_lossy())
+                    || matches!(
+                        text.to_lowercase().as_str(),
+                        "junction" | "symboliclink" | "hardlink"
+                    )
+                {
+                    return Some(RiskCategory::Secrets);
+                }
                 if let Some(risk) = path_risk(Path::new(text), base(ctx), cfg, ctx) {
                     return Some(risk);
                 }
                 let parsed = parse(text);
                 if parsed.uncertain {
                     return Some(RiskCategory::SystemConfig);
+                }
+                if sensitive_runtime_access(&parsed.commands, &base(ctx).to_string_lossy()) {
+                    return Some(RiskCategory::Secrets);
                 }
                 parsed
                     .commands
@@ -490,4 +657,59 @@ fn evaluate_tool(tool: &str, input: &Value, cfg: &PolicyConfig, ctx: &PolicyCont
         }
     }
     visit(input, cfg, ctx).map_or(Decision::Allow, ask)
+}
+
+#[cfg(test)]
+mod approval_secret_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_path_normalization_removes_device_prefixes_and_preserves_boundaries() {
+        for path in [
+            r"C:\SANDBOX\Ultron\\",
+            "c:/sandbox/ultron///",
+            r"\\?\C:\sandbox\ultron",
+            r"\\.\C:\sandbox\ultron",
+        ] {
+            assert_eq!(normalized(path), "c:/sandbox/ultron");
+            assert!(under("c:/sandbox/ultron/run", &normalized(path)));
+        }
+        assert_eq!(
+            normalized(r"\\?\UNC\server\share\ultron"),
+            normalized(r"\\server\share\ultron")
+        );
+        assert!(under("c:/sandbox/ultron/run", &normalized("C:/")));
+        assert!(!under("c:/sandbox/ultron/run", "c:/sandbox/ultron-old"));
+        assert!(ambiguous_path(r"C:\SYNTH~1\ULTRON~1"));
+    }
+
+    #[test]
+    fn approver_secret_is_a_protected_path_for_shell_and_tools() {
+        let ctx = PolicyContext {
+            project_root: None,
+            workspace_root: "workspace".into(),
+        };
+        let cfg = PolicyConfig::default();
+        for action in [
+            Action::Shell {
+                command: "cat run/approver-token".into(),
+                cwd: "workspace".into(),
+            },
+            Action::FileWrite {
+                path: "run/approver-token".into(),
+            },
+            Action::ToolCall {
+                tool: "Read".into(),
+                input: serde_json::json!({"path": "run/approver-token"}),
+            },
+        ] {
+            assert!(matches!(
+                evaluate(&action, &cfg, &ctx),
+                Decision::Ask {
+                    category: RiskCategory::Secrets,
+                    ..
+                }
+            ));
+        }
+    }
 }

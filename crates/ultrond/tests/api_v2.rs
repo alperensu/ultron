@@ -270,6 +270,9 @@ fn variant_name(r: &Request) -> &'static str {
         Request::ImportClaudeHistory { .. } => "import_claude_history",
         Request::Route { .. } => "route",
         Request::SetResetRights { .. } => "set_reset_rights",
+        Request::PolicyCheck { .. } => "policy_check",
+        Request::ListApprovals { .. } => "list_approvals",
+        Request::ResolveApproval { .. } => "resolve_approval",
     }
 }
 
@@ -307,6 +310,12 @@ async fn every_request_variant_is_implemented() {
         Request::ImportClaudeHistory { root: Some(empty.to_string_lossy().into_owned()) },
         Request::Route { text: "devam".into() },
         Request::SetResetRights { pool: "claude".into(), count: 1 },
+        Request::PolicyCheck {
+            action: ultron_core::policy::Action::Shell { command: "git status".into(), cwd: cwd.clone() },
+            chat_id: None, engine: EngineId::Claude, wait_secs: 0,
+        },
+        Request::ListApprovals { status: None, limit: None, cursor: None },
+        Request::ResolveApproval { id: "olmayan-onay".into(), approve: true, by: "desktop".into() },
     ];
     let mut seen = std::collections::BTreeSet::new();
     for req in requests {
@@ -318,6 +327,6 @@ async fn every_request_variant_is_implemented() {
             assert!(!message.contains("henüz uygulanmadı"), "{req:?}: {message}");
         }
     }
-    assert_eq!(seen.len(), 16, "her varyant denenmeli: {seen:?}");
+    assert_eq!(seen.len(), 19, "her varyant denenmeli: {seen:?}");
     h.shutdown().await;
 }

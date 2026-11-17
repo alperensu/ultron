@@ -338,13 +338,89 @@ fn secret_files_require_approval() {
 }
 
 #[test]
+fn protected_runtime_wildcards_expansions_and_directory_access_never_allow() {
+    let run = Paths::resolve().unwrap().run;
+    let cases = [
+        ("Get-Content -Path approver-*".to_owned(), run.clone()),
+        (r"type ..\run\appr*".to_owned(), run.join("../work")),
+        // Yol sentetiktir; kullanıcı dizini okunmaz ve komut çalıştırılmaz.
+        (
+            r"cat \C:\Users\synthetic\AppData\Local\\ultron\\run\\*".to_owned(),
+            "C:/workspace".into(),
+        ),
+        ("Get-ChildItem".to_owned(), run.join("nested")),
+        (format!("ls '{}'", run.display()), "C:/workspace".into()),
+        (format!("cat '{}/*'", run.display()), "C:/workspace".into()),
+        ("cat approver-?oken".into(), "C:/workspace".into()),
+        ("cat approver-[t]oken".into(), "C:/workspace".into()),
+        (
+            "cat %ULTRON_HOME%/run/approver-token".into(),
+            "C:/workspace".into(),
+        ),
+        ("cat '$env:ULTRON_HOME/run/*'".into(), "C:/workspace".into()),
+        ("cat ~/ultron/run".into(), "C:/workspace".into()),
+    ];
+    for (command, cwd) in cases {
+        let cfg = PolicyConfig {
+            allow_list: vec![command.clone()],
+            ..Default::default()
+        };
+        for action in [
+            Action::Shell {
+                command: command.clone(),
+                cwd: cwd.clone(),
+            },
+            Action::ToolCall {
+                tool: "powershell".into(),
+                input: json!({"command": command, "cwd": cwd}),
+            },
+        ] {
+            assert!(
+                matches!(
+                    evaluate(&action, &cfg, &context()),
+                    Decision::Ask { .. } | Decision::Deny { .. }
+                ),
+                "{action:?}"
+            );
+        }
+    }
+    for path in [run.clone(), run.join("*"), "../run/appr*".into()] {
+        for action in [
+            Action::FileWrite { path: path.clone() },
+            Action::ToolCall {
+                tool: "Read".into(),
+                input: json!({"path": path}),
+            },
+        ] {
+            assert!(matches!(
+                evaluate(&action, &PolicyConfig::default(), &context()),
+                Decision::Ask { .. }
+            ));
+        }
+    }
+}
+
+#[test]
 fn safe_commands_allow() {
     for command in [
         "git status",
+        "git diff",
+        "git show HEAD:README.md",
+        "git show HEAD:src/lib.rs",
         "cargo test",
+        "cargo test parser::tests",
+        "cargo test -p ultron-core parser::tests",
+        "npm test",
         "npm run lint",
         "ls",
         "Get-ChildItem",
+        "cat README.md",
+        "Get-Content ./docs/readme.txt",
+        "Get-Content -LiteralPath:./README.md",
+        "Get-Content -Path=./README.md",
+        "Get-ChildItem ./src",
+        "Copy-Item ./src/readme.txt ./copy.txt",
+        "tar -cf archive.tar ./src",
         "git branch -d merged",
         "git clean -n",
         "git -C repo status",
@@ -377,6 +453,348 @@ fn safe_commands_allow() {
         ),
         Decision::Allow
     );
+}
+
+#[test]
+fn directory_changes_make_subsequent_relative_access_unclassifiable() {
+    for change in [
+        "cd C:/sandbox/safe",
+        "chdir C:/sandbox/safe",
+        "Set-Location C:/sandbox/safe; Set-Location ..",
+        "sl C:/sandbox/safe",
+        "Push-Location C:/sandbox/safe",
+        "pushd C:/sandbox/safe",
+        "pushd C:/sandbox/safe; popd",
+        "popd",
+        "Pop-Location",
+        "[Environment]::CurrentDirectory = 'C:/sandbox/safe'",
+        "[IO.Directory]::SetCurrentDirectory('C:/sandbox/safe')",
+        "Start-Process cmd -WorkingDirectory C:/sandbox/safe",
+        "Start-Process cmd -WorkingDirectory:C:/sandbox/safe",
+        "cmd /c \"cd C:/sandbox/safe\"",
+        "Invoke-Expression 'cd C:/sandbox/safe'",
+        "iex 'cd C:/sandbox/safe'",
+        "& { Set-Location C:/sandbox/safe }",
+        "{ cd C:/sandbox/safe }",
+        "(cd C:/sandbox/safe)",
+    ] {
+        for access in [
+            "Get-ChildItem ultron -Recurse -File | Get-Content",
+            "Get-Content -LiteralPath:./README.md",
+            "cat README.md",
+            "Get-ChildItem",
+            "Copy-Item ./README.md ./copy.txt",
+            "tar -cf archive.tar ./src",
+            "New-Item -ItemType HardLink -Path ./link -Target ./README.md",
+        ] {
+            let command = format!("{change}; {access}");
+            for allow_list in [vec![], vec![command.clone()]] {
+                let cfg = PolicyConfig {
+                    allow_list,
+                    ..Default::default()
+                };
+                for action in [
+                    Action::Shell {
+                        command: command.clone(),
+                        cwd: "C:/workspace/project".into(),
+                    },
+                    Action::ToolCall {
+                        tool: "powershell".into(),
+                        input: json!({"command": command, "cwd": "C:/workspace/project"}),
+                    },
+                ] {
+                    assert!(
+                        matches!(evaluate(&action, &cfg, &context()), Decision::Ask { .. }),
+                        "{action:?}"
+                    );
+                }
+            }
+        }
+    }
+    for command in [
+        "cat ./README.md; cd C:/sandbox/safe",
+        "cd C:/sandbox/safe; cat C:/workspace/project/README.md",
+        "cmd /c \"cd C:/sandbox/safe && type README.md\"",
+        "& { cd C:/sandbox/safe; Get-Content README.md }",
+        "iex 'cd C:/sandbox/safe; cat README.md'",
+    ] {
+        let decision = shell(command, &PolicyConfig::default());
+        if command.starts_with("cat ./") || command.ends_with("C:/workspace/project/README.md") {
+            assert_eq!(decision, Decision::Allow, "{command}");
+        } else {
+            assert!(matches!(decision, Decision::Ask { .. }), "{command}");
+        }
+    }
+}
+
+#[test]
+fn parsed_path_parameter_values_keep_sensitive_path_checks() {
+    let cfg = PolicyConfig {
+        finance_paths: vec!["ledger".into()],
+        ..Default::default()
+    };
+    for command in [
+        "Get-Content -LiteralPath:./ledger/entry.csv",
+        "Get-Content -LiteralPath=./ledger/entry.csv",
+    ] {
+        assert!(
+            matches!(
+                shell(command, &cfg),
+                Decision::Ask {
+                    category: RiskCategory::Finance,
+                    ..
+                }
+            ),
+            "{command}"
+        );
+    }
+    for command in [
+        "Get-Content -LiteralPath:./.env",
+        "cargo test --manifest-path ./.env",
+        "npm test --prefix ./credentials",
+        "git show -- HEAD:README.md",
+        "git diff --no-index HEAD:README.md ./README.md",
+        "git status HEAD:README.md",
+    ] {
+        assert!(
+            matches!(
+                shell(command, &PolicyConfig::default()),
+                Decision::Ask { .. }
+            ),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn unclassifiable_paths_fail_closed_before_allow_list() {
+    for path in [
+        r"\sandbox\ultron",
+        "C:sandbox\\ultron",
+        "/sandbox/ultron",
+        r"c:SANDBOX/ultron",
+        r"/sandbox\ultron",
+        r"\/server\share/ultron",
+        r"\\server\share\ultron",
+        r"\\?\UNC\server\share\ultron",
+        r"\\.\pipe\synthetic",
+        r"\??\C:\sandbox\ultron",
+        r"\/?.c:/invalid",
+        r"\\?\sandbox\ultron",
+        "C:/SYNTH~1/ultron",
+        "%SYNTHETIC_HOME%/ultron",
+        "$env:SYNTHETIC_HOME/ultron",
+        "~/ultron",
+        "C:/sandbox/*",
+        "C:/sandbox/[u]ltron",
+        "C:/sandbox/file:stream",
+        "C:/sandbox/nul",
+    ] {
+        for command in [
+            format!("Get-ChildItem '{path}' -Recurse -File | Get-Content"),
+            format!("Get-ChildItem -LiteralPath:'{path}'"),
+            format!("cat '{path}'"),
+            format!("Copy-Item '{path}' ./copy -Recurse"),
+            format!("tar -cf archive.tar '{path}'"),
+            format!("New-Item -ItemType Junction -Path ./link -Target '{path}'"),
+        ] {
+            let cfg = PolicyConfig {
+                allow_list: vec![command.clone()],
+                ..Default::default()
+            };
+            for action in [
+                Action::Shell {
+                    command: command.clone(),
+                    cwd: "C:/workspace".into(),
+                },
+                Action::ToolCall {
+                    tool: "powershell".into(),
+                    input: json!({"command": command, "cwd": "C:/workspace"}),
+                },
+                Action::ToolCall {
+                    tool: "custom".into(),
+                    input: json!({"command": command}),
+                },
+                Action::ToolCall {
+                    tool: "Read".into(),
+                    input: json!({"path": path}),
+                },
+            ] {
+                assert!(
+                    matches!(
+                        evaluate(&action, &cfg, &context()),
+                        Decision::Ask { .. } | Decision::Deny { .. }
+                    ),
+                    "{action:?}"
+                );
+            }
+        }
+    }
+    // Normalleştirilebilen aygıt önekleri ve karışık slashlar güvenli yolu bozmaz.
+    for path in [
+        "C:/workspace/project/readme.txt",
+        r"\\?\C:\workspace\project\readme.txt",
+        r"\\.\C:\workspace\project\readme.txt",
+        r"/\?\C:/workspace\project/readme.txt",
+        r"\/.\c:/WORKSPACE/project/readme.txt",
+    ] {
+        let command = format!("cat '{path}'");
+        assert_eq!(
+            shell(&command, &PolicyConfig::default()),
+            Decision::Allow,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn protected_runtime_ancestor_reads_never_allow_even_with_allow_list() {
+    let paths = Paths::resolve().unwrap();
+    for ancestor in paths.run.ancestors() {
+        let path = ancestor.to_string_lossy().replace('\\', "/");
+        for command in [
+            format!("Get-ChildItem '{path}' -Recurse -File | Get-Content"),
+            format!("Get-ChildItem -LiteralPath:'{path}' -Recurse | Get-Content"),
+            format!("Get-Content -Path:'{path}'"),
+            format!("cmd /c dir /s \"{path}\""),
+            format!("ls -R '{path}'"),
+            format!("findstr /s value '{path}'"),
+            format!("rg value '{path}'"),
+            format!("grep -r value '{path}'"),
+            format!("Select-String -Recurse -Path '{path}' value"),
+            format!("robocopy '{path}' C:/workspace/copy /s"),
+            format!("xcopy '{path}' C:/workspace/copy /e"),
+            format!("Copy-Item '{path}' C:/workspace/copy -Recurse"),
+            format!("Compress-Archive -Path '{path}' -DestinationPath archive.zip"),
+            format!("tar -cf archive.tar '{path}'"),
+        ] {
+            let cfg = PolicyConfig {
+                allow_list: vec![command.clone()],
+                ..Default::default()
+            };
+            for tool in ["powershell", "custom"] {
+                let action = Action::ToolCall {
+                    tool: tool.into(),
+                    input: json!({"command": command}),
+                };
+                assert!(
+                    matches!(evaluate(&action, &cfg, &context()), Decision::Ask { .. }),
+                    "{action:?}"
+                );
+            }
+            assert!(
+                matches!(shell(&command, &cfg), Decision::Ask { .. }),
+                "{command}"
+            );
+        }
+        for action in [
+            Action::Shell {
+                command: "Get-ChildItem -Recurse -File | Get-Content".into(),
+                cwd: ancestor.into(),
+            },
+            Action::ToolCall {
+                tool: "Read".into(),
+                input: json!({"path": ancestor, "recursive": true}),
+            },
+        ] {
+            assert!(
+                matches!(
+                    evaluate(&action, &PolicyConfig::default(), &context()),
+                    Decision::Ask { .. }
+                ),
+                "{action:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn link_creation_and_junction_read_chain_never_allow() {
+    let root = Paths::resolve()
+        .unwrap()
+        .root
+        .to_string_lossy()
+        .replace('\\', "/");
+    for command in [
+        format!(
+            "New-Item -ItemType Junction -Path C:/workspace/u -Target '{root}'; Get-ChildItem C:/workspace/u/run -File | Get-Content"
+        ),
+        format!("New-Item -ItemType Junction -Path C:/workspace/u -Target '{root}'"),
+        "New-Item -ItemType SymbolicLink -Path C:/workspace/u -Target C:/workspace/safe".into(),
+        "ni -Type HardLink -Path C:/workspace/u -Target C:/workspace/safe".into(),
+        format!("mklink /J C:/workspace/u \"{root}\""),
+        format!("cmd /c mklink /J C:/workspace/u \"{root}\""),
+        "fsutil hardlink create C:/workspace/u C:/workspace/safe".into(),
+        "ln -s safe u".into(),
+    ] {
+        let cfg = PolicyConfig {
+            allow_list: vec![command.clone()],
+            ..Default::default()
+        };
+        assert!(
+            matches!(shell(&command, &cfg), Decision::Ask { .. }),
+            "{command}"
+        );
+        let action = Action::ToolCall {
+            tool: "custom".into(),
+            input: json!({"command": command}),
+        };
+        assert!(
+            matches!(evaluate(&action, &cfg, &context()), Decision::Ask { .. }),
+            "{action:?}"
+        );
+    }
+    for action in [
+        Action::ToolCall {
+            tool: "create_symlink".into(),
+            input: json!({"target": "safe", "path": "u"}),
+        },
+        Action::ToolCall {
+            tool: "New-Item".into(),
+            input: json!({"ItemType": "Junction", "target": "safe", "path": "u"}),
+        },
+    ] {
+        assert!(matches!(
+            evaluate(&action, &PolicyConfig::default(), &context()),
+            Decision::Ask { .. }
+        ));
+    }
+}
+
+#[test]
+fn runtime_ancestor_case_slashes_device_prefixes_and_short_names_require_approval() {
+    let root = Paths::resolve()
+        .unwrap()
+        .root
+        .to_string_lossy()
+        .replace('\\', "/");
+    for path in [
+        root.to_uppercase(),
+        format!("{root}///"),
+        format!(r"\\?\{}", root.replace('/', "\\")),
+        format!(r"\\.\{}", root.replace('/', "\\")),
+        format!("//?/{root}"),
+        format!("//./{root}"),
+        "C:/Users/SYNTHE~1/AppData/Local/ULTRON~1".into(),
+    ] {
+        let command = format!("Get-ChildItem '{path}' -Recurse | Get-Content");
+        let cfg = PolicyConfig {
+            allow_list: vec![command.clone()],
+            ..Default::default()
+        };
+        assert!(
+            matches!(shell(&command, &cfg), Decision::Ask { .. }),
+            "{command}"
+        );
+        let action = Action::ToolCall {
+            tool: "Read".into(),
+            input: json!({"path": path}),
+        };
+        assert!(
+            matches!(evaluate(&action, &cfg, &context()), Decision::Ask { .. }),
+            "{action:?}"
+        );
+    }
 }
 
 #[test]
