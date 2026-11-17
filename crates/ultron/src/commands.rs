@@ -24,6 +24,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
+    /// Yerel Telegram bağlantısını yönetir.
+    Telegram {
+        #[command(subcommand)]
+        action: TelegramCmd,
+    },
     /// Claude PreToolUse isteğini requester olarak denetler.
     Policy {
         #[command(subcommand)]
@@ -81,6 +86,137 @@ pub enum Cmd {
         #[command(subcommand)]
         action: ServiceCmd,
     },
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub enum TelegramCmd {
+    /// Token'ı yalnız standart girdiden, terminalde yankısız okur (en çok 4 KiB).
+    SetToken,
+    /// Sır veya kullanıcı kimliği göstermeden bağlantı durumunu yazdırır.
+    Status,
+    /// İzinli özel sohbetlere sabit test mesajını gönderir.
+    Test,
+}
+
+/// Satır sonu veya EOF ile biter; hata metni girdiyi içermez.
+/// Terminalde çağıran, okuma boyunca konsol yankısını kapatır.
+pub fn telegram_token_request(reader: &mut impl std::io::BufRead) -> Result<Request> {
+    use std::io::BufRead;
+    let mut bytes = Vec::new();
+    std::io::Read::take(reader, 4097).read_until(b'\n', &mut bytes)
+        .map_err(|_| anyhow!("Telegram token girdisi okunamadı"))?;
+    if bytes.len() > 4096 { bail!("Telegram token girdisi en çok 4 KiB olabilir"); }
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+        if bytes.ends_with(b"\r") { bytes.pop(); }
+    }
+    let valid = bytes.len() <= 2560 && bytes.iter().position(|b| *b == b':').is_some_and(|colon| {
+        let (id, rest) = bytes.split_at(colon);
+        let secret = &rest[1..];
+        !id.is_empty() && id.iter().all(u8::is_ascii_digit) && !secret.is_empty()
+            && secret.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+    });
+    if !valid { bail!("Telegram token girdisi geçersiz"); }
+    let token = String::from_utf8(bytes).map_err(|_| anyhow!("Telegram token girdisi geçersiz"))?;
+    Ok(Request::TelegramSetToken { token })
+}
+
+pub fn render_telegram_status(status: &ultron_core::ipc::TelegramStatusSnapshot) -> String {
+    use ultron_core::config::NotifyMode;
+    use ultron_core::ipc::TelegramConnectionState;
+    let state = match status.state {
+        TelegramConnectionState::Connected => "Bağlı",
+        TelegramConnectionState::MissingToken => "Token yok",
+        TelegramConnectionState::MissingAllowedUsers => "Kapalı: izinli kullanıcı yok",
+        TelegramConnectionState::Error => "Hata",
+    };
+    let notify = match status.settings.notify { NotifyMode::Always => "her zaman", NotifyMode::Away => "uzaktayken" };
+    let enabled = if status.settings.auto_continue_enabled { "açık" } else { "kapalı" };
+    let fallback = status.settings.fallback_order.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>().join(", ");
+    format!("Telegram: {state}; izinli kullanıcı: {}; bildirim: {notify}; otomatik devam: {enabled}; bekleme: {} dk; yedek motorlar: {}{}",
+        status.allowed_user_count, status.settings.auto_continue_wait_minutes,
+        if fallback.is_empty() { "yok" } else { &fallback },
+        status.error.map(|e| format!("; hata kodu: {e:?}")).unwrap_or_default())
+}
+
+pub fn render_telegram_test(report: &ultron_core::ipc::TelegramTestReport) -> String {
+    format!("Telegram testi: {} alıcı; {} teslim, {} başarısız, {} belirsiz",
+        report.attempted, report.delivered, report.failed, report.uncertain)
+}
+
+/// Yalnız stdin konsolunun yankı kipini geçici olarak değiştirir; Drop geri yükler.
+#[cfg(windows)]
+struct StdinEchoGuard { handle: *mut std::ffi::c_void, previous: u32 }
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+    fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
+}
+
+#[cfg(windows)]
+impl StdinEchoGuard {
+    fn disable() -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        let handle = std::io::stdin().as_raw_handle();
+        let mut previous = 0;
+        // SAFETY: stdin geçerli konsol tutamacıdır; previous yazılabilir u32'dir.
+        if unsafe { GetConsoleMode(handle, &mut previous) } == 0 {
+            bail!("Standart girdinin güvenli konsol kipi okunamadı");
+        }
+        // ENABLE_ECHO_INPUT = 0x0004. Diğer konsol kipleri korunur.
+        // SAFETY: doğrulanmış stdin tutamacında yalnız yankı bayrağı değiştirilir.
+        if unsafe { SetConsoleMode(handle, previous & !0x0004) } == 0 {
+            bail!("Standart girdinin konsol yankısı kapatılamadı");
+        }
+        Ok(Self { handle, previous })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StdinEchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: aynı stdin tutamacının saklanan özgün konsol kipi geri yüklenir.
+        unsafe { SetConsoleMode(self.handle, self.previous) };
+    }
+}
+
+fn read_telegram_stdin() -> Result<Request> {
+    use std::io::IsTerminal;
+    #[cfg(windows)]
+    let _echo = if std::io::stdin().is_terminal() { Some(StdinEchoGuard::disable()?) } else { None };
+    #[cfg(not(windows))]
+    if std::io::stdin().is_terminal() { bail!("Token'ı standart girdiye yönlendirin; güvenli terminal kipi kullanılamıyor"); }
+    telegram_token_request(&mut std::io::stdin().lock())
+}
+
+async fn telegram_main(action: TelegramCmd) -> Result<()> {
+    let request = match action {
+        TelegramCmd::SetToken => read_telegram_stdin()?,
+        TelegramCmd::Status => Request::TelegramStatus,
+        TelegramCmd::Test => Request::TelegramTest,
+    };
+    let mut client = match action {
+        TelegramCmd::Status => connect_or_start().await?,
+        _ => connect_approver().await?,
+    };
+    // Bu sınır ham daemon hata metnini basmaz: hatalı bir token yankılanamaz.
+    let data = one_reply(&mut client, &request).await
+        .map_err(|_| anyhow!("Telegram yönetim isteği başarısız"))?;
+    match action {
+        TelegramCmd::SetToken => println!("Telegram token'ı kaydedildi"),
+        TelegramCmd::Status => {
+            let status = serde_json::from_value(data).map_err(|_| anyhow!("Telegram durum yanıtı geçersiz"))?;
+            println!("{}", render_telegram_status(&status));
+        }
+        TelegramCmd::Test => {
+            let report = serde_json::from_value(data).map_err(|_| anyhow!("Telegram test yanıtı geçersiz"))?;
+            println!("{}", render_telegram_test(&report));
+            if report.failed > 0 || report.uncertain > 0 { bail!("Telegram test teslimi tamamlanmadı"); }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -599,6 +735,7 @@ async fn stream(client: &mut Client, verbose: bool) -> Result<Option<Value>> {
 /// Komutu çalıştırır.
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Cmd::Telegram { action } => telegram_main(action).await,
         Cmd::Policy {
             action: PolicyCmd::Check,
         } => policy_check_main().await,

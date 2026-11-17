@@ -31,7 +31,7 @@ fn ensure_fake_cli() {
         let fake = find().unwrap_or_else(|| {
             let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
             let status = Command::new(cargo)
-                .args(["build", "-p", "ultron-core", "--bin", "ultron-fake-cli"])
+                .args(["build", "-j", "4", "-p", "ultron-core", "--bin", "ultron-fake-cli"])
                 .status()
                 .unwrap();
             assert!(status.success());
@@ -67,7 +67,7 @@ async fn env() -> Env {
     let handle = server::start(ServerConfig {
         paths: paths.clone(),
         pipe_name: pipe.clone(),
-        cfg: Config::default(),
+        cfg: Config { summarizer: ultron_core::config::SummarizerMode::Off, claude_live_quota: false, ..Config::default() },
         engines,
     })
     .await
@@ -195,6 +195,9 @@ fn clap_parses_all_commands() {
         vec!["ultron", "events", "--chat", "x", "--follow"],
         vec!["ultron", "history", "search", "q", "--limit", "5"],
         vec!["ultron", "status"],
+        vec!["ultron", "telegram", "status"],
+        vec!["ultron", "telegram", "test"],
+        vec!["ultron", "telegram", "set-token"],
         vec!["ultron", "service", "install"],
         vec!["ultron", "service", "uninstall"],
     ] {
