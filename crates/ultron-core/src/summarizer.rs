@@ -179,13 +179,32 @@ async fn collect_turn(engine: &dyn Engine, req: TurnRequest) -> Result<String> {
     match outcome? {
         TurnOutcome::Completed => {}
         TurnOutcome::Cancelled => bail!("özetleyici turu iptal edildi"),
-        TurnOutcome::QuotaExhausted => bail!("özetleyici için kota doldu"),
-        TurnOutcome::Failed { .. } => bail!("özetleyici turu başarısız oldu"),
+        TurnOutcome::QuotaExhausted => {
+            bail!("özetleyici için kota doldu{}", reason_suffix(failure.as_deref()))
+        }
+        TurnOutcome::Failed {
+            exit_code,
+            stderr_excerpt,
+        } => {
+            let first = stderr_excerpt.lines().find(|l| !l.trim().is_empty());
+            let code = exit_code.map_or_else(|| "?".to_string(), |c| c.to_string());
+            let detail = format!("çıkış kodu {code}: {}", first.or(failure.as_deref()).unwrap_or(""));
+            bail!("özetleyici turu başarısız oldu{}", reason_suffix(Some(&detail)))
+        }
     }
     if let Some(message) = failure {
-        bail!("özetleyici hatası: {message}");
+        bail!("özetleyici hatası{}", reason_suffix(Some(&message)));
     }
     Ok(text)
+}
+
+/// Hata nedeni son eki: tek satır, maskelenmiş, en çok 200 karakter; ham kullanıcı içeriği
+/// taşımaz (yalnız motorun hata/stderr metni gelir).
+fn reason_suffix(reason: Option<&str>) -> String {
+    match reason.map(|r| crate::import::notes::one_line(r, 200)) {
+        Some(r) if !r.is_empty() => format!(" ({r})"),
+        _ => String::new(),
+    }
 }
 
 /// Çıktıdaki ilk `{` ile son `}` arasını JSON olarak çözer.
@@ -214,4 +233,20 @@ fn build_prompt(state: &WorkState, recent: &[StoredEvent]) -> String {
          Mevcut durum:\n{state_json}\n\nSon mesajlar:\n{}",
         messages[start..].join("\n")
     )
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::reason_suffix;
+
+    #[test]
+    fn reason_is_one_line_masked_and_clipped() {
+        let long = format!("kod 3\nsatır iki sk-ant-api03-{} {}", "A".repeat(40), "x".repeat(400));
+        let got = reason_suffix(Some(&long));
+        assert!(!got.contains('\n'), "{got}");
+        assert!(!got.contains("sk-ant-api03-AAAA"), "{got}");
+        assert!(got.chars().count() <= 210, "{}", got.chars().count());
+        assert_eq!(reason_suffix(None), "");
+        assert_eq!(reason_suffix(Some("  ")), "");
+    }
 }

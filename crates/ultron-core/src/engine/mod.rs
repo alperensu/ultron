@@ -30,6 +30,10 @@ pub(crate) fn is_quota_message(text: &str) -> bool {
     if pair("usage", "limit") || pair("rate", "limit") || pair("resource", "exhausted") {
         return true;
     }
+    // agy 1.5.9: "Individual quota reached. ... Resets in 119h".
+    if pair("quota", "reached") {
+        return true;
+    }
     if words.windows(3).any(|w| w == ["too", "many", "requests"]) {
         return true;
     }

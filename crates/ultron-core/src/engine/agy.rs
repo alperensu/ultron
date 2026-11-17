@@ -247,7 +247,11 @@ fn result_events(result: &Value) -> Vec<EngineEvent> {
             EngineEvent::TurnCompleted,
         ];
     }
-    let response = str_or_empty(result, "response");
+    // agy 1.5.9: hata metni `response` değil `error` alanındadır (`response` boş gelir).
+    let mut response = str_or_empty(result, "response");
+    if response.is_empty() {
+        response = str_or_empty(result, "error");
+    }
     let message = if response.is_empty() {
         if status.is_empty() {
             "agy başarısız sonuç döndü".to_string()

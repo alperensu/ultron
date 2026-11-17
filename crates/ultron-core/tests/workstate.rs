@@ -230,3 +230,26 @@ fn summary_command_puts_schema_before_prompt() {
     assert_eq!(spec.args[n - 2], SUMMARY_SCHEMA);
     assert_eq!(spec.args[n - 1], "-p=ozetle");
 }
+
+#[tokio::test]
+#[ignore = "canlı agy; kota harcar. Yalnız onaylı: cargo test -- --ignored live_"]
+async fn live_agy_summarizer_synthetic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = EngineConfig {
+        id: EngineId::Agy,
+        enabled: true,
+        binary: "agy".into(),
+        model: Some("gemini-3.8-flash-low".into()),
+        effort: None,
+        extra_args: Vec::new(),
+    };
+    let summarizer = AgySummarizer::agy(cfg, tmp.path().to_path_buf());
+    let state = WorkState::default();
+    let events = vec![
+        stored(1, EngineEvent::UserText { text: "Sentetik: ızgara hesaplayıcı yaz".into() }),
+        stored(2, EngineEvent::AssistantText { text: "Sentetik: tamamlandı".into() }),
+    ];
+    let patch = summarizer.refresh(&state, &events).await;
+    eprintln!("{patch:?}");
+    patch.expect("özetleyici başarısız");
+}

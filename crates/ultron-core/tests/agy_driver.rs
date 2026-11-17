@@ -320,3 +320,25 @@ async fn live_agy_roundtrip() {
         EngineEvent::SessionStarted { native_session_id: Some(_) }
     )));
 }
+
+#[test]
+fn agy_159_error_field_is_quota_with_reason() {
+    // agy 1.5.9 gerçek yakalaması: hata metni `result.error` alanında, `response` boş.
+    let eng = AgyEngine::new(cfg());
+    let events = parse_file(&eng, &fixture("quota_error_field.jsonl"));
+    let msg = events.iter().find_map(|e| match e {
+        EngineEvent::QuotaExhausted { message, .. } => Some(message.clone()),
+        _ => None,
+    });
+    let msg = msg.unwrap_or_else(|| panic!("QuotaExhausted yok: {events:?}"));
+    assert!(msg.contains("Individual quota reached"), "{msg}");
+}
+
+#[test]
+fn agy_command_for_summary_pins_flash_low_and_plan_mode() {
+    let cmd = AgyEngine::new(cfg()).command(&request(ToolPolicy::ReadOnly, None));
+    let i = cmd.args.iter().position(|a| a == "--model").unwrap();
+    assert_eq!(cmd.args[i + 1], "gemini-3.8-flash-low");
+    assert!(cmd.args.windows(2).any(|w| w == ["--mode", "plan"]));
+    assert!(cmd.args.last().unwrap().starts_with("-p="));
+}
