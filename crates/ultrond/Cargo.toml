@@ -21,6 +21,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ultron-core = { path = "../ultron-core" }
 uuid = { workspace = true }
+zeroize = "=1.9.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
