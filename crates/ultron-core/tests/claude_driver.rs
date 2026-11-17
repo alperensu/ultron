@@ -319,7 +319,7 @@ fn claude_parses_init_assistant_tool_result() {
                 input: json!({ "file_path": "C:/proj/notes.txt" }),
             },
             EngineEvent::ToolResult {
-                tool: "toolu-0001".into(),
+                tool: "Read".into(),
                 output_excerpt: "yanit-2".into(),
                 is_error: false,
             },
@@ -371,7 +371,7 @@ fn claude_successful_edit_emits_file_changed_after_result() {
         eng.parse_line(&result_line("toolu-9", false)),
         vec![
             EngineEvent::ToolResult {
-                tool: "toolu-9".into(),
+                tool: "Edit".into(),
                 output_excerpt: "sonuc".into(),
                 is_error: false,
             },
@@ -399,6 +399,19 @@ fn claude_successful_edit_emits_file_changed_after_result() {
 }
 
 #[test]
+fn claude_tool_result_carries_tool_name_matching_call_and_unknown_id_falls_back() {
+    let eng = ClaudeEngine::new(cfg());
+    let bash = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash1","name":"Bash","input":{"command":"ls"}}]}}"#;
+    let calls = eng.parse_line(bash);
+    assert!(matches!(&calls[..], [EngineEvent::ToolCall { tool, .. }] if tool == "Bash"));
+    let results = eng.parse_line(&result_line("toolu_bash1", false));
+    assert!(matches!(&results[..], [EngineEvent::ToolResult { tool, .. }] if tool == "Bash"), "{results:?}");
+    // Kimlik bir kez tüketilir; bilinmeyen kimlik kendisine döner.
+    let again = eng.parse_line(&result_line("toolu_bash1", false));
+    assert!(matches!(&again[..], [EngineEvent::ToolResult { tool, .. }] if tool == "toolu_bash1"));
+}
+
+#[test]
 fn claude_rejected_write_emits_no_file_changed() {
     let eng = ClaudeEngine::new(cfg());
     let write = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu-20","name":"Write","input":{"file_path":"C:/proj/b.txt","content":"z"}}]}}"#;
@@ -407,7 +420,7 @@ fn claude_rejected_write_emits_no_file_changed() {
     assert_eq!(
         events,
         vec![EngineEvent::ToolResult {
-            tool: "toolu-20".into(),
+            tool: "Write".into(),
             output_excerpt: "sonuc".into(),
             is_error: true,
         }]
@@ -479,7 +492,12 @@ fn claude_rejected_rate_limit_event_is_quota() {
     let eng = ClaudeEngine::new(cfg());
     let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1700000000}}"#;
     let events = eng.parse_line(line);
-    assert!(matches!(events[0], EngineEvent::QuotaExhausted { .. }));
+    assert!(matches!(events[0], EngineEvent::QuotaExhausted { resets_at: Some(at), .. }
+        if Some(at) == Utc.timestamp_opt(1_700_000_000, 0).single()));
+    for reset in ["null", "\"unknown\"", "9223372036854775807"] {
+        let line = format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{reset}}}}}"#);
+        assert!(matches!(&eng.parse_line(&line)[..], [EngineEvent::QuotaExhausted { resets_at: None, .. }]));
+    }
     let allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"}}"#;
     assert!(eng.parse_line(allowed).is_empty());
 }

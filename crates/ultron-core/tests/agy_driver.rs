@@ -19,6 +19,35 @@ fn cfg() -> EngineConfig {
     }
 }
 
+#[test]
+fn quota_relative_resets_use_injected_time_only_on_failure() {
+    use chrono::{Duration, TimeZone, Utc};
+    let engine = AgyEngine::new(cfg());
+    let now = Utc.with_ymd_and_hms(2026, 11, 17, 12, 0, 0).unwrap();
+    for (duration, seconds) in [("119h", 119 * 3600), ("44m", 44 * 60),
+        ("30s", 30), ("1h 2m 3s", 3723), ("1h2m3s.", 3723), ("336h", 336 * 3600)] {
+        let line = json!({"event":"result", "result":{"status":"ERROR", "response":"",
+            "error":format!("Individual quota reached. Resets in {duration}")}}).to_string();
+        assert!(matches!(&engine.parse_line_at(&line, now)[..],
+            [EngineEvent::QuotaExhausted { resets_at: Some(at), .. }] if *at == now + Duration::seconds(seconds)), "{duration}");
+    }
+    for duration in ["", "0s", "-2h", "1.5h", "44 minutes", "1m 1h", "1h 2h",
+        "999999999999999999999h", "9000h", "337h", "14d", "1h-ish", "1h tomorrow", "1h Resets in 2h"] {
+        let line = json!({"event":"result", "result":{"status":"ERROR",
+            "error":format!("quota reached. Resets in {duration}")}}).to_string();
+        assert!(matches!(&engine.parse_line_at(&line, now)[..],
+            [EngineEvent::QuotaExhausted { resets_at: None, .. }]), "{duration}");
+    }
+    let success = json!({"event":"result", "result":{"status":"SUCCESS",
+        "response":"quota reached. Resets in 119h", "error":"quota reached"}}).to_string();
+    assert!(!engine.parse_line_at(&success, now).iter().any(|event| matches!(event, EngineEvent::QuotaExhausted { .. })));
+    let assistant = json!({"event":"step_update", "step_update":{"step_type":"agent_response",
+        "text_delta":"quota reached. Resets in 119h"}}).to_string();
+    assert!(matches!(&engine.parse_line_at(&assistant, now)[..], [EngineEvent::AssistantText { .. }]));
+    let ordinary = json!({"event":"result", "result":{"status":"ERROR", "error":"failed. Resets in 44m"}}).to_string();
+    assert!(matches!(&engine.parse_line_at(&ordinary, now)[..], [EngineEvent::Error { .. }]));
+}
+
 fn request(policy: ToolPolicy, resume: Option<&str>) -> TurnRequest {
     TurnRequest {
         chat_id: "c1".into(),

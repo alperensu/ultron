@@ -149,6 +149,8 @@ fn codex_quota_error_maps_to_quota_exhausted() {
         "QuotaExhausted yok: {events:?}"
     );
     assert!(!events.iter().any(|e| matches!(e, EngineEvent::Error { .. })));
+    assert!(events.iter().any(|e| matches!(e, EngineEvent::QuotaExhausted { resets_at: None, .. })),
+        "kanıtsız reset tahmin edilmez; scheduler kota penceresini kullanır");
 }
 
 #[test]

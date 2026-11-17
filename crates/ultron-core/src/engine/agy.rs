@@ -8,6 +8,7 @@
 //! Gerçek yakalamada `-p` değeri olarak istem alınır (`-p` yalnız bayrak değildir);
 //! bu yüzden istem argüman olarak `-p=<istem>` biçiminde verilir ve stdin kullanılmaz.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{
@@ -69,6 +70,16 @@ fn tail_with_budget(prompt: &str, budget: usize) -> String {
 impl AgyEngine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self { cfg }
+    }
+
+    /// Göreli hata reset'ini deterministik bir saate bağlar; başarı metni taranmaz.
+    pub fn parse_line_at(&self, line: &str, now: DateTime<Utc>) -> Vec<EngineEvent> {
+        match serde_json::from_str::<Value>(line) {
+            Ok(raw) => parse_value(&raw, now),
+            Err(_) => vec![EngineEvent::Unknown {
+                raw: Value::String(line.to_string()),
+            }],
+        }
     }
 }
 
@@ -135,12 +146,7 @@ impl Engine for AgyEngine {
     }
 
     fn parse_line(&self, line: &str) -> Vec<EngineEvent> {
-        match serde_json::from_str::<Value>(line) {
-            Ok(raw) => parse_value(&raw),
-            Err(_) => vec![EngineEvent::Unknown {
-                raw: Value::String(line.to_string()),
-            }],
-        }
+        self.parse_line_at(line, Utc::now())
     }
 }
 
@@ -177,7 +183,7 @@ fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
-fn parse_value(raw: &Value) -> Vec<EngineEvent> {
+fn parse_value(raw: &Value, now: DateTime<Utc>) -> Vec<EngineEvent> {
     match raw.get("event").and_then(Value::as_str).unwrap_or_default() {
         "init" => vec![EngineEvent::SessionStarted {
             native_session_id: str_field(raw, "conversation_id"),
@@ -187,7 +193,7 @@ fn parse_value(raw: &Value) -> Vec<EngineEvent> {
             None => unknown(raw),
         },
         "result" => match raw.get("result") {
-            Some(result) => result_events(result),
+            Some(result) => result_events(result, now),
             None => unknown(raw),
         },
         _ => unknown(raw),
@@ -261,7 +267,7 @@ fn tool_step_events(step: &Value, step_type: &str) -> Vec<EngineEvent> {
     }
 }
 
-fn result_events(result: &Value) -> Vec<EngineEvent> {
+fn result_events(result: &Value, now: DateTime<Utc>) -> Vec<EngineEvent> {
     let status = str_or_empty(result, "status");
     if status == "SUCCESS" {
         let usage = result.get("usage");
@@ -290,12 +296,46 @@ fn result_events(result: &Value) -> Vec<EngineEvent> {
     };
     if is_quota_message(&message) {
         vec![EngineEvent::QuotaExhausted {
+            resets_at: relative_reset(&message, now),
             message,
-            resets_at: None,
         }]
     } else {
         vec![EngineEvent::Error { message }]
     }
+}
+
+/// Yalnız açık `Resets in 119h`, `44m`, `30s`, `1h 2m 3s` biçimleri.
+/// 14 günün üzerindeki, sırasız/tekrarlı veya belirsiz süreler tahmin edilmez.
+fn relative_reset(message: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let lower = message.to_ascii_lowercase();
+    let (prefix, duration) = lower.split_once("resets in ")?;
+    if prefix.chars().last().is_some_and(char::is_alphanumeric)
+        || duration.contains("resets in ")
+    {
+        return None;
+    }
+    let mut rest = duration.trim().strip_suffix('.').unwrap_or(duration.trim()).trim();
+    let mut seconds = 0_i64;
+    let mut previous = 3601;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 { return None; }
+        let amount: i64 = rest[..digits].parse().ok()?;
+        rest = rest[digits..].trim_start();
+        let unit = match rest.as_bytes().first()? {
+            b'h' => 3600,
+            b'm' => 60,
+            b's' => 1,
+            _ => return None,
+        };
+        if unit >= previous { return None; }
+        previous = unit;
+        seconds = seconds.checked_add(amount.checked_mul(unit)?)?;
+        if seconds > 14 * 24 * 3600 { return None; }
+        rest = rest[1..].trim_start();
+    }
+    if seconds == 0 { return None; }
+    now.checked_add_signed(chrono::Duration::seconds(seconds))
 }
 
 /// Tur sonunda çağrılır: çıkış kodu 0 ama hiç `AssistantText` yoksa, lane.py'deki

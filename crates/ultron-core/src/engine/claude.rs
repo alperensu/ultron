@@ -145,6 +145,9 @@ pub struct ClaudeEngine {
     /// Dosya düzenleyen `tool_use` kimliği → (yol, değişiklik türü). Değişiklik olayı yalnız
     /// eşleşen `tool_result` başarılı geldiğinde üretilir.
     pending_edits: Mutex<HashMap<String, (String, &'static str)>>,
+    /// `tool_use` kimliği → araç adı. `tool_result` bloğu adı taşımaz; sonuç olayı çağrıyla
+    /// aynı araç adıyla eşleşsin diye kimlik burada çözülür.
+    pending_tools: Mutex<HashMap<String, String>>,
 }
 
 impl ClaudeEngine {
@@ -152,6 +155,7 @@ impl ClaudeEngine {
         Self {
             cfg,
             pending_edits: Mutex::new(HashMap::new()),
+            pending_tools: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -290,6 +294,17 @@ impl ClaudeEngine {
             .remove(id)
     }
 
+    fn remember_tool(&self, id: &str, tool: &str) {
+        let mut map = self.pending_tools.lock().unwrap_or_else(|e| e.into_inner());
+        // Eşleşmeyen çağrılar sınırsız birikmesin.
+        if map.len() >= 4096 { map.clear(); }
+        map.insert(id.to_string(), tool.to_string());
+    }
+
+    fn take_tool(&self, id: &str) -> Option<String> {
+        self.pending_tools.lock().unwrap_or_else(|e| e.into_inner()).remove(id)
+    }
+
     fn user_events(&self, raw: &Value) -> Vec<EngineEvent> {
         let Some(blocks) = raw.pointer("/message/content").and_then(Value::as_array) else {
             return Vec::new();
@@ -299,14 +314,16 @@ impl ClaudeEngine {
             .iter()
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
         {
-            // Sonuç bloğu araç adını taşımaz; kimlik olarak `tool_use_id` kullanılır.
+            // Sonuç bloğu araç adını taşımaz; çağrıdan hatırlanan ad kullanılır,
+            // bilinmiyorsa `tool_use_id` kimliğine dönülür.
             let id = str_or_empty(block, "tool_use_id");
+            let tool = self.take_tool(&id).unwrap_or_else(|| id.clone());
             let is_error = block
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             out.push(EngineEvent::ToolResult {
-                tool: id.clone(),
+                tool,
                 output_excerpt: excerpt(
                     &content_text(block.get("content")),
                     DEFAULT_EXCERPT_CHARS,
@@ -395,6 +412,9 @@ fn assistant_events(engine: &ClaudeEngine, raw: &Value) -> Vec<EngineEvent> {
                     if let (Some(path), Some(id)) = (path, str_field(block, "id")) {
                         engine.remember_edit(&id, path, change);
                     }
+                }
+                if let Some(id) = str_field(block, "id") {
+                    engine.remember_tool(&id, &tool);
                 }
                 out.push(EngineEvent::ToolCall { tool, input });
             }
