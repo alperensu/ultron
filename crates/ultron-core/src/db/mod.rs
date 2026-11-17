@@ -1,5 +1,7 @@
 mod migrations;
 pub mod approvals;
+pub mod quota_wait;
+pub mod telegram;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};

@@ -156,6 +156,61 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE project_notes ADD COLUMN summarizer TEXT NOT NULL DEFAULT '';
     CREATE UNIQUE INDEX projects_path_key_unique ON projects(path_key) WHERE path_key != '';
     "#,
+    // v12: Telegram kabul günlüğü ve nesil kontrollü kota beklemeleri (yalnız ekleyici).
+    r#"
+    ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(kind IN ('unknown', 'policy_tool', 'turn_elevation'));
+    CREATE TABLE telegram_bindings (
+        user_id INTEGER PRIMARY KEY CHECK(user_id > 0),
+        chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE telegram_poll_state (
+        bot_id INTEGER PRIMARY KEY CHECK(bot_id > 0),
+        next_update_id INTEGER NOT NULL CHECK(next_update_id >= 0)
+    );
+    CREATE TABLE telegram_turn_origins (
+        logical_turn_id TEXT PRIMARY KEY CHECK(length(logical_turn_id) BETWEEN 1 AND 128),
+        chat_id TEXT NOT NULL REFERENCES chats(id),
+        user_id INTEGER NOT NULL CHECK(user_id > 0),
+        private_chat_id INTEGER NOT NULL CHECK(private_chat_id = user_id),
+        user_event_seq INTEGER NOT NULL CHECK(user_event_seq > 0),
+        start_seq INTEGER NOT NULL CHECK(start_seq >= user_event_seq),
+        end_seq INTEGER CHECK(end_seq >= start_seq),
+        delivery_state TEXT NOT NULL DEFAULT 'pending'
+            CHECK(delivery_state IN ('pending', 'ready', 'delivered', 'needs_attention')),
+        UNIQUE(chat_id, user_event_seq)
+    );
+    CREATE TABLE telegram_inbox (
+        bot_id INTEGER NOT NULL CHECK(bot_id > 0),
+        update_id INTEGER NOT NULL CHECK(update_id >= 0),
+        user_id INTEGER NOT NULL CHECK(user_id > 0),
+        state TEXT NOT NULL CHECK(state IN ('accepted', 'running', 'completed', 'needs_attention')),
+        logical_turn_id TEXT UNIQUE REFERENCES telegram_turn_origins(logical_turn_id),
+        PRIMARY KEY(bot_id, update_id)
+    );
+    CREATE TABLE quota_waits (
+        id TEXT PRIMARY KEY CHECK(length(id) BETWEEN 1 AND 128),
+        logical_turn_id TEXT NOT NULL UNIQUE CHECK(length(logical_turn_id) BETWEEN 1 AND 128),
+        chat_id TEXT NOT NULL REFERENCES chats(id),
+        source_session_id TEXT NOT NULL REFERENCES engine_sessions(id),
+        engine TEXT NOT NULL CHECK(engine IN ('claude', 'codex', 'agy')),
+        user_event_seq INTEGER NOT NULL CHECK(user_event_seq > 0),
+        checkpoint_seq INTEGER NOT NULL CHECK(checkpoint_seq >= user_event_seq),
+        cwd TEXT NOT NULL CHECK(length(cwd) BETWEEN 1 AND 32768),
+        policy TEXT NOT NULL CHECK(policy IN ('read_only', 'workspace', 'requires_local_approval')),
+        reset_at TEXT,
+        state TEXT NOT NULL CHECK(state IN ('waiting', 'claimed', 'running', 'completed', 'cancelled', 'needs_attention')),
+        generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+        next_engine_index INTEGER NOT NULL DEFAULT 0 CHECK(next_engine_index >= 0),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        next_attempt_at TEXT,
+        updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX quota_waits_one_active_chat ON quota_waits(chat_id)
+        WHERE state IN ('waiting', 'claimed', 'running', 'needs_attention');
+    CREATE INDEX quota_waits_pending ON quota_waits(state, next_attempt_at);
+    "#,
 ];
 
 type DupRow = (String, String, Option<String>, Option<String>, Option<String>, i64);
@@ -279,6 +334,67 @@ pub fn apply(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_kind_migration_defaults_to_desktop_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for (idx, sql) in MIGRATIONS.iter().take(11).enumerate() {
+            if idx == 10 {
+                let tx = conn.unchecked_transaction().unwrap();
+                dedupe_projects(&tx).unwrap();
+                tx.commit().unwrap();
+            }
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", (idx + 1) as i64)
+                .unwrap();
+        }
+        conn.execute("INSERT INTO chats(id, title, created_at) VALUES ('kept', 'Türkçe', '2026-01-01T00:00:00Z')", []).unwrap();
+        conn.execute(
+            "INSERT INTO events(id, chat_id, seq, ts, kind, payload_json)
+            VALUES ('event', 'kept', 1, '2026-01-01T00:00:00Z', 'user_text',
+            '{\"type\":\"user_text\",\"text\":\"[MASKED]\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO approvals(id, chat_id, engine, category, reason, action_json, created_at)
+            VALUES ('legacy', 'kept', 'claude', '\"SystemConfig\"', 'sentetik',
+            '{\"ToolCall\":{\"tool\":\"ultron.turn.elevate\",\"input\":{}}}', '2026-01-01T00:00:00Z')", []).unwrap();
+        let before: String = conn
+            .query_row("SELECT payload_json FROM events", [], |r| r.get(0))
+            .unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>("SELECT payload_json FROM events", [], |r| r.get(0))
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>("SELECT title FROM chats", [], |r| r.get(0))
+                .unwrap(),
+            "Türkçe"
+        );
+        drop(conn);
+        let db = super::super::Db::open(&path).unwrap();
+        let approval = db.get_approval("legacy").unwrap().unwrap();
+        assert_eq!(
+            approval.kind,
+            super::super::approvals::ApprovalKind::Unknown
+        );
+        assert!(!approval.is_policy_tool());
+        assert_eq!(
+            approval.status,
+            super::super::approvals::ApprovalStatus::Pending
+        );
+    }
 
     #[test]
     fn v9_preserves_existing_v8_approvals_and_accepts_authenticated_resolver() {

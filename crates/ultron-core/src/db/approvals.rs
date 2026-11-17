@@ -51,6 +51,16 @@ pub enum ResolvedBy {
     Restart,
 }
 
+/// Kaynak yalnız açık daemon constructor'ından gelir; category kaynak kanıtı değildir.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    PolicyTool,
+    TurnElevation,
+    #[default]
+    Unknown,
+}
+
 impl ApprovalStatus {
     /// Saf durum geçişi: son durumlar değişmez, servis kaynakları onay veremez.
     pub fn resolve(self, approve: bool, by: ResolvedBy) -> Result<Self> {
@@ -79,6 +89,21 @@ pub struct Approval {
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub resolved_by: Option<ResolvedBy>,
+    #[serde(default)]
+    pub kind: ApprovalKind,
+}
+
+impl Approval {
+    /// Ek idari araç filtresi uygulama katmanında yapılır; elevation burada da kapalıdır.
+    pub fn is_policy_tool(&self) -> bool {
+        self.kind == ApprovalKind::PolicyTool
+            && serde_json::from_str::<Action>(&self.action_json)
+                .is_ok_and(|action| !is_elevation(&action))
+    }
+}
+
+fn is_elevation(action: &Action) -> bool {
+    matches!(action, Action::ToolCall { tool, .. } if tool == "ultron.turn.elevate")
 }
 
 fn masked_value(value: Value) -> Value {
@@ -125,6 +150,72 @@ impl Db {
         action: &Action,
         requester_id: Option<&str>,
     ) -> Result<Approval> {
+        self.create_approval_with_kind(
+            chat_id,
+            engine,
+            category,
+            reason,
+            action,
+            requester_id,
+            ApprovalKind::Unknown,
+        )
+    }
+
+    pub fn create_policy_tool_approval(
+        &self,
+        chat_id: Option<&str>,
+        engine: EngineId,
+        category: RiskCategory,
+        reason: &str,
+        action: &Action,
+        requester_id: Option<&str>,
+    ) -> Result<Approval> {
+        if is_elevation(action) {
+            bail!("tur yükseltmesi araç onayı olamaz");
+        }
+        self.create_approval_with_kind(
+            chat_id,
+            engine,
+            category,
+            reason,
+            action,
+            requester_id,
+            ApprovalKind::PolicyTool,
+        )
+    }
+
+    pub fn create_turn_elevation_approval(
+        &self,
+        chat_id: &str,
+        engine: EngineId,
+        reason: &str,
+        action: &Action,
+    ) -> Result<Approval> {
+        if !is_elevation(action) {
+            bail!("geçersiz tur yükseltme eylemi");
+        }
+        self.create_approval_with_kind(
+            Some(chat_id),
+            engine,
+            RiskCategory::SystemConfig,
+            reason,
+            action,
+            None,
+            ApprovalKind::TurnElevation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_approval_with_kind(
+        &self,
+        chat_id: Option<&str>,
+        engine: EngineId,
+        category: RiskCategory,
+        reason: &str,
+        action: &Action,
+        requester_id: Option<&str>,
+        kind: ApprovalKind,
+    ) -> Result<Approval> {
         validate_action_size(action)?;
         if reason.len() > 4096
             || chat_id.is_some_and(|id| id.len() > 128)
@@ -143,6 +234,7 @@ impl Db {
             created_at: Utc::now(),
             resolved_at: None,
             resolved_by: None,
+            kind,
         };
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -157,10 +249,10 @@ impl Db {
             bail!("onay kuyruğu dolu; yeni işlem reddedildi");
         }
         tx.execute(
-            "INSERT INTO approvals(id, chat_id, engine, category, reason, action_json, status, created_at, requester_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            "INSERT INTO approvals(id, chat_id, engine, category, reason, action_json, status, created_at, requester_id, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9)",
             params![row.id, row.chat_id, super::engine_str(engine), serde_json::to_string(&category)?,
-                row.reason, row.action_json, row.created_at.to_rfc3339(), requester_id],
+                row.reason, row.action_json, row.created_at.to_rfc3339(), requester_id, wire_name(kind)?],
         )?;
         approval_event_tx(
             &tx,
@@ -181,7 +273,7 @@ impl Db {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, engine, category, reason, action_json, status, created_at,
-                    resolved_at, resolved_by FROM approvals
+                    resolved_at, resolved_by, kind FROM approvals
              WHERE (?1 IS NULL OR status = ?1) ORDER BY created_at, id LIMIT 384",
         )?;
         let status = status.map(wire_name).transpose()?;
@@ -205,7 +297,7 @@ impl Db {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, engine, category, reason, action_json, status, created_at,
-                    resolved_at, resolved_by FROM approvals
+                    resolved_at, resolved_by, kind FROM approvals
              WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR requester_id = ?2)
                AND id > ?3 ORDER BY id LIMIT ?4",
         )?;
@@ -276,7 +368,7 @@ impl Db {
         self.conn()?
             .query_row(
                 "SELECT id, chat_id, engine, category, reason, action_json, status, created_at,
-                    resolved_at, resolved_by FROM approvals WHERE id = ?1",
+                    resolved_at, resolved_by, kind FROM approvals WHERE id = ?1",
                 [id],
                 read_row,
             )
@@ -313,7 +405,7 @@ impl Db {
         }
         let row = tx.query_row(
             "SELECT id, chat_id, engine, category, reason, action_json, status, created_at,
-                    resolved_at, resolved_by FROM approvals WHERE id = ?1",
+                    resolved_at, resolved_by, kind FROM approvals WHERE id = ?1",
             [id],
             read_row,
         )?;
@@ -414,6 +506,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
             .get::<_, Option<String>>(9)?
             .map(|_| parse(r, 9, true))
             .transpose()?,
+        kind: parse(r, 10, true)?,
     })
 }
 
@@ -667,7 +760,11 @@ mod tests {
 
     #[test]
     fn pending_transitions_and_terminal_states_are_final() {
-        for by in [ResolvedBy::Desktop, ResolvedBy::Telegram, ResolvedBy::Approver] {
+        for by in [
+            ResolvedBy::Desktop,
+            ResolvedBy::Telegram,
+            ResolvedBy::Approver,
+        ] {
             assert_eq!(
                 ApprovalStatus::Pending.resolve(true, by).unwrap(),
                 ApprovalStatus::Approved
