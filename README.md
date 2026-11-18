@@ -192,12 +192,6 @@ AGENTS.md              Proje ve kod kuralları; crate düzeyinde AGENTS.md dosya
 
 Tasarım belgesi: [docs/superpowers/specs/2026-11-15-harness-design.md](docs/superpowers/specs/2026-11-15-harness-design.md)
 
-## Teşekkürler / Esinlenmeler
-
-- Kodlama kuralları, [multica-ai/andrej-karpathy-skills](https://github.com/multica-ai/andrej-karpathy-skills) (MIT) deposundaki Andrej Karpathy esinli yönergelerden ilham almıştır.
-- Hafıza tasarımındaki fikirler (Markdown kaynak, kaynak odaklı arama) `avenoxai/avenoxbeyin` projesinden esinlenmiştir.
-- Rust tabanlı mimari yönü, Discord'un Rust ile yaptığı çalışmalardan esinlenmiştir.
-
 "Ultron" projenin çalışma adıdır; Marvel veya başka bir markayla bağlantısı yoktur.
 
 ## Lisans
