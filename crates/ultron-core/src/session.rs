@@ -25,6 +25,9 @@ use crate::external;
 use crate::handoff::build_handoff_before;
 use crate::prompts::{self, Role};
 use crate::summarizer::{NullSummarizer, Summarizer};
+use crate::memory::background::{
+    BackgroundConfig, DigestProcessor, EnqueueOutcome, MemoryBackground, MemoryWorkerHandle,
+};
 use crate::workstate::WorkStateService;
 
 /// Devir paketinde aynen verilen son mesaj sayısı.
@@ -136,7 +139,8 @@ pub struct SessionManager {
     log: Arc<EventLog>,
     cfg: Config,
     engines: HashMap<EngineId, Arc<dyn Engine>>,
-    workstate: WorkStateService,
+    workstate: Arc<WorkStateService>,
+    background: MemoryBackground,
     active: ActiveTurns,
     audit_reports: broadcast::Sender<audit::AuditReport>,
 }
@@ -151,7 +155,8 @@ impl SessionManager {
         engines: HashMap<EngineId, Arc<dyn Engine>>,
     ) -> SessionManager {
         SessionManager {
-            workstate: WorkStateService::new(db.clone(), Box::new(NullSummarizer)),
+            workstate: Arc::new(WorkStateService::new(db.clone(), Box::new(NullSummarizer))),
+            background: MemoryBackground::new(db.clone(), BackgroundConfig::default()),
             db,
             log,
             cfg,
@@ -164,8 +169,64 @@ impl SessionManager {
     /// Çalışma durumu özetleyicisini değiştirir.
     #[must_use]
     pub fn with_summarizer(mut self, summarizer: Box<dyn Summarizer>) -> SessionManager {
-        self.workstate = WorkStateService::new(self.db.clone(), summarizer);
+        self.workstate = Arc::new(WorkStateService::new(self.db.clone(), summarizer));
         self
+    }
+
+    /// Arka plan işçisi ayarlarını değiştirir (kuyruk sınırı, işçi sayısı, bekleme).
+    #[must_use]
+    pub fn with_memory_background_config(mut self, cfg: BackgroundConfig) -> SessionManager {
+        self.background = MemoryBackground::new(self.db.clone(), cfg);
+        self
+    }
+
+    /// Kalıcı özet/aday iş kuyruğu.
+    pub fn memory_background(&self) -> &MemoryBackground {
+        &self.background
+    }
+
+    /// Özet+aday işçilerini başlatır (daemon açılışı). Tur tamamlanması işçiye bağlı değildir;
+    /// işçi yokken işler kuyrukta kalır. Kapanışta `shutdown().await` çağrılmalıdır.
+    pub fn start_memory_worker(&self) -> MemoryWorkerHandle {
+        self.background.start(Arc::new(DigestProcessor::new(
+            self.db.clone(),
+            self.workstate.clone(),
+        )))
+    }
+
+    /// Tamamlanan tur için model BEKLEMEDEN: kural alanları senkron güncellenir, özet işi
+    /// kalıcı kuyruğa alınır. Kuyruk/DB hatasında tur sonucu korunur, güvenli durum kaydedilir.
+    fn finish_turn_summary(&self, chat_id: &str, logical_turn_id: &str, completed: bool) {
+        use crate::workstate::summary_status as st;
+        let wants_model = completed && self.workstate.summarizer().kind() != "null";
+        let status = if !completed {
+            st::TURN_INCOMPLETE
+        } else if wants_model {
+            st::PENDING
+        } else {
+            st::NO_ENGINE
+        };
+        let state = match self.workstate.complete_rules(chat_id, !completed || wants_model, Some(status)) {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!(chat_id, error = %err, "çalışma durumu güncellenemedi");
+                return;
+            }
+        };
+        // `end_seq`, kural güncellemesinin gördüğü son olaydır; aradaki olaylar (denetim vb.)
+        // yamayı kalıcı olarak eski saydırmaz.
+        let end_seq = state.rules_seq;
+        if !wants_model || end_seq < 1 {
+            return;
+        }
+        let failure = match self.background.enqueue(chat_id, logical_turn_id, end_seq) {
+            EnqueueOutcome::Queued | EnqueueOutcome::Duplicate => None,
+            EnqueueOutcome::QueueFull => Some(st::QUEUE_FULL),
+            EnqueueOutcome::StoreFailed => Some(st::ENQUEUE_FAILED),
+        };
+        if let Some(code) = failure {
+            let _ = self.workstate.set_summary_status(chat_id, code, end_seq);
+        }
     }
 
     /// Codex/agy denetim sonuçları. Ortak PolicyViolation/bildirim adaptörü bu akışı tüketebilir.
@@ -677,17 +738,14 @@ impl SessionManager {
         if let Some(head) = blocking(move || external::git_head(&dir)).await? {
             self.db.set_chat_last_head(chat_id, &head)?;
         }
-        // Özetleyici yalnız tamamlanan turda çalışır; diğer sonuçlarda kural tabanlı durum
-        // yine güncellenir ve özet eski işaretlenir.
-        let refreshed = if outcome == TurnOutcome::Completed {
-            self.workstate.on_turn_completed(chat_id).await
-        } else {
-            self.workstate.refresh_rules(chat_id)
-        };
-        if let Err(err) = refreshed {
-            tracing::warn!(chat_id, error = %err, "çalışma durumu güncellenemedi");
-        }
+        // Model beklenmez: kural alanları senkron güncellenir, özet işi kalıcı kuyruğa alınır.
         let end_seq = self.db.next_seq(chat_id)? - 1;
+        let turn_key = match &source {
+            UserSource::Accepted { logical_turn_id, .. } => (*logical_turn_id).to_string(),
+            UserSource::Quota(context) => format!("quota-{}", context.wait.id),
+            UserSource::New => format!("local-{user_seq}"),
+        };
+        self.finish_turn_summary(chat_id, &turn_key, outcome == TurnOutcome::Completed);
         let mut quota_event = None;
         if outcome == TurnOutcome::QuotaExhausted {
             let mut after = start_seq;

@@ -1,5 +1,7 @@
 mod migrations;
+pub mod approval_shadow;
 pub mod approvals;
+pub mod memory;
 pub mod quota_wait;
 pub mod telegram;
 

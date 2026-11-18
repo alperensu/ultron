@@ -3,6 +3,7 @@
 
 pub mod keepawake;
 pub mod memory_contracts;
+pub mod approval_shadow;
 pub mod auto_continue;
 pub mod server;
 pub mod telegram;
