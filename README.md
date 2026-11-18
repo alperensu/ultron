@@ -82,7 +82,7 @@ Temel fikirler:
 | 2. Masaüstü v1 | Tauri arayüzü, projeler ve sohbetler, canlı ajan izleme, kota paneli | **Tamamlandı** ([kabul raporu](docs/reports/2026-11-17-asama2-kabul.md)); MSI paketleme henüz kapalı |
 | 3. Güvenlik ve onay | Sabit kurallar arayüzü, çöp ve anlık görüntü, yerel onay modeli | **Tamamlandı (arka uç)** ([kabul raporu](docs/reports/2026-11-17-asama3-kabul.md)); yerel onay modeli gölge modda geliştiriliyor (yalnız puan kaydeder, onaylamaz); onay kartının elle kontrolü bekliyor |
 | 4. Telegram kapısı | Emir, onay, bildirim, otomatik devam | **Tamamlandı** ([kabul raporu](docs/reports/2026-11-18-asama4-kabul.md)); onay düğmesinin canlı testi bekliyor |
-| 5. İkinci beyin | Markdown kasası, kaynak makbuzları, hafıza önerileri, embedding araması | **Sürüyor.** 5a: sözleşmeler ve v14 şeması tamam; Markdown kasa, makbuzlar, FTS5 arama ve tur sonu arka plan özetleyici geliştiriliyor ([plan](docs/superpowers/plans/2026-11-18-asama5a-ikinci-beyin.md)). 5b (yerel embedding, günlük defter, ChatGPT içe alma) sonra |
+| 5. İkinci beyin | Markdown kasası, kaynak makbuzları, hafıza önerileri, embedding araması | **Sürüyor.** 5a: sözleşmeler ve v14 şeması, Markdown kasa ve makbuzlar, FTS5 arama, turu bekletmeyen arka plan özetleyici ve hafıza önerileri, yerel onay modeli gölge ölçümü tamam; daemon, masaüstü "Hafıza" ekranı ve Telegram `/not`/`/hafiza` bağlantısı sürüyor ([plan](docs/superpowers/plans/2026-11-18-asama5a-ikinci-beyin.md)). 5b (yerel embedding, günlük defter, ChatGPT içe alma) sonra |
 | 6. Orkestrasyon v2 | Görsel yönlendirme, Tam/Dengeli/Eko modları, yerel ve API motorları, konsey | Planlandı |
 | 7. Temsilci | Üçüncü kişilerle Telegram üzerinden görev yürütme | Planlandı |
 
