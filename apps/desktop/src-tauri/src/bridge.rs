@@ -7,7 +7,8 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 use ultron_core::Paths;
 use ultron_core::client::connect_or_start;
 use ultron_core::ipc::{self, Client, Request, Response};
@@ -16,6 +17,10 @@ use ultron_core::ipc::{self, Client, Request, Response};
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Uzun süren yönetim işleri (proje içe aktarma, sohbet silme) için yanıt süresi.
 const ADMIN_REPLY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Servis test koşusunu toplam 60 sn ile sınırlar (TEST_DEADLINE); bunun biraz üstünde bekleriz.
+const TELEGRAM_TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Webview'e giden tipli hata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -96,10 +101,17 @@ impl Bridge {
                 Request::ListApprovals { .. } | Request::ResolveApproval { .. }
                     | Request::TrashList | Request::TrashRestore { .. }
                     | Request::TrashPurge { .. } | Request::GetPolicyConfig | Request::SetPolicyConfig { .. }
+                    | Request::SetTelegramSettings { .. } | Request::TelegramTest
+                    | Request::DesktopHeartbeat { .. }
             )
         {
             // Sır yalnız Rust köprüsünde kalır; normal bağlantıya veya motor ortamına taşınmaz.
-            let _ready = self.connect().await?;
+            // Heartbeat servis takipçisi hazır olduğunda çalışır; kendisi servis başlatmaz.
+            let _ready = if matches!(req, Request::DesktopHeartbeat { .. }) {
+                None
+            } else {
+                Some(self.connect().await?)
+            };
             let secret = std::fs::read_to_string(ipc::approver_token_path(&self.paths))
                 .map_err(|_| protocol("onaylayıcı sırrı okunamadı"))?;
             let mut client = Client::connect(
@@ -153,12 +165,44 @@ impl Bridge {
     }
 }
 
+/// Servis hazırken hemen ve ardından her 30 saniyede bir varlık sinyali gönderir.
+pub async fn run_desktop_heartbeat(
+    bridge: &Bridge,
+    mut ready: watch::Receiver<bool>,
+    cancel: CancellationToken,
+) {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {},
+        () = async {
+            while ready.wait_for(|ready| *ready).await.is_ok() {
+                let next = tokio::time::Instant::now() + HEARTBEAT_INTERVAL;
+                let result = tokio::time::timeout(
+                    HEARTBEAT_TIMEOUT,
+                    bridge.request(Request::DesktopHeartbeat { instance_id: instance_id.clone() }),
+                ).await;
+                if !matches!(result, Ok(Ok(_))) {
+                    tokio::time::sleep_until(next).await;
+                    continue;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep_until(next) => {},
+                    disconnected = ready.wait_for(|ready| !*ready) => {
+                        if disconnected.is_err() { return; }
+                    }
+                }
+            }
+        } => {},
+    }
+}
+
 /// Çöp kutusu mutasyonları (geri yükle / kalıcı sil) asla yeniden denenmez ve uzun bekler.
 fn is_trash_mutation(req: &Request) -> bool {
     matches!(req, Request::TrashRestore { .. } | Request::TrashPurge { .. })
 }
 
-/// Yönetim ve çöp mutasyonları uzun süre bekler; diğerleri kısa `REPLY_TIMEOUT` kullanır.
+/// Yönetim işleri ve Telegram teslim raporu için daha uzun yanıt süreleri kullanılır.
 fn reply_timeout(req: &Request) -> Duration {
     let admin = matches!(
         req,
@@ -166,7 +210,13 @@ fn reply_timeout(req: &Request) -> Duration {
             | Request::RemoveImportedChats { .. }
             | Request::ImportClaudeHistory { .. }
     );
-    if admin || is_trash_mutation(req) { ADMIN_REPLY_TIMEOUT } else { REPLY_TIMEOUT }
+    if matches!(req, Request::TelegramTest) {
+        TELEGRAM_TEST_REPLY_TIMEOUT
+    } else if admin || is_trash_mutation(req) {
+        ADMIN_REPLY_TIMEOUT
+    } else {
+        REPLY_TIMEOUT
+    }
 }
 
 async fn connect_only(paths: &Paths) -> Result<Client> {
@@ -217,5 +267,13 @@ mod timeout_tests {
         assert_eq!(reply_timeout(&Request::TrashList), REPLY_TIMEOUT);
         assert!(is_trash_mutation(&Request::TrashPurge { id: "x".into() }));
         assert!(!is_trash_mutation(&Request::TrashList));
+    }
+
+    #[test]
+    fn telegram_test_waits_for_the_delivery_report() {
+        assert_eq!(reply_timeout(&Request::TelegramTest), TELEGRAM_TEST_REPLY_TIMEOUT);
+        assert_eq!(reply_timeout(&Request::TelegramStatus), REPLY_TIMEOUT);
+        assert!(TELEGRAM_TEST_REPLY_TIMEOUT > Duration::from_secs(60));
+        assert!(TELEGRAM_TEST_REPLY_TIMEOUT <= Duration::from_secs(120));
     }
 }

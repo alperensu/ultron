@@ -10,13 +10,98 @@ use tokio_util::sync::CancellationToken;
 use ultron_core::engine::{Engine, FakeEngine};
 use ultron_core::ipc::{self, PolicyArg, Request};
 use ultron_core::{Config, EngineId, Paths};
-use ultron_desktop::bridge::{Bridge, BridgeError};
+use ultron_desktop::bridge::{Bridge, BridgeError, run_desktop_heartbeat};
 use ultron_desktop::events::{Backoff, run_follow};
 use ultrond::server::{self, ServerConfig};
 
 const STARTED: &str = r#"{"type":"session_started","native_session_id":"nat-1"}"#;
 const REPLY: &str = r#"{"type":"assistant_text","text":"merhaba"}"#;
 const DONE: &str = r#"{"type":"turn_completed"}"#;
+
+#[tokio::test]
+async fn telegram_roles_roundtrip_and_only_shell_heartbeat_marks_presence() {
+    use ultron_core::config::NotifyMode;
+    use ultron_core::ipc::{Response, TelegramConnectionState, TelegramSettings, TelegramStatusSnapshot};
+
+    let _env = ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("ultron"));
+    paths.ensure().unwrap();
+    let pipe = format!(r"\\.\pipe\ultron-test-{}", uuid::Uuid::new_v4());
+    set_env("ULTRON_HOME", &paths.root);
+    set_env("ULTRON_QUOTA_HOME", tmp.path().join("quota-home"));
+    set_env("ULTRON_PIPE_NAME", &pipe);
+    let server = server::start(ServerConfig {
+        paths: paths.clone(),
+        pipe_name: pipe,
+        cfg: Config { summarizer: ultron_core::config::SummarizerMode::Off, ..test_config() },
+        engines: HashMap::new(),
+    })
+    .await
+    .unwrap();
+    let bridge = Arc::new(Bridge::new(paths, None));
+    let mut requester = bridge.connect().await.unwrap();
+    let snapshot: TelegramStatusSnapshot = serde_json::from_value(
+        bridge.request(Request::TelegramStatus).await.unwrap(),
+    ).unwrap();
+    assert_eq!(snapshot.state, TelegramConnectionState::MissingAllowedUsers);
+    assert_eq!(snapshot.allowed_user_count, 0);
+    assert_eq!(snapshot.settings.auto_continue_wait_minutes, 45);
+    assert_eq!(bridge.request(Request::Status).await.unwrap()["away"], true);
+
+    let change = Request::SetTelegramSettings {
+        notify: NotifyMode::Away,
+        auto_continue_enabled: false,
+        auto_continue_wait_minutes: 75,
+        fallback_order: vec![EngineId::Codex, EngineId::Agy],
+    };
+    for request in [
+        change.clone(), Request::TelegramTest,
+        Request::DesktopHeartbeat { instance_id: "synthetic".into() },
+    ] {
+        requester.send(&request).await.unwrap();
+        assert!(matches!(requester.next().await.unwrap(), Some(Response::Error { message })
+            if message.contains("onaylayıcı rolü gerekli")));
+    }
+    assert_eq!(
+        bridge.request(Request::GetTelegramSettings).await.unwrap(),
+        serde_json::to_value(snapshot.settings).unwrap(),
+    );
+    let updated: TelegramSettings = serde_json::from_value(bridge.request(change).await.unwrap()).unwrap();
+    assert_eq!(updated.notify, NotifyMode::Away);
+    assert!(!updated.auto_continue_enabled);
+    assert_eq!(updated.auto_continue_wait_minutes, 75);
+    assert_eq!(updated.fallback_order, [EngineId::Codex, EngineId::Agy]);
+    assert_eq!(
+        bridge.request(Request::GetTelegramSettings).await.unwrap(),
+        serde_json::to_value(updated).unwrap(),
+    );
+    // Boş izinli liste ile onaylayıcı Test yoluna ulaşır, ağ veya Telegram kimlik bilgisi kullanılmaz.
+    assert!(matches!(bridge.request(Request::TelegramTest).await,
+        Err(BridgeError::Daemon { message }) if message.contains("NotVerified")));
+    assert_eq!(bridge.request(Request::Status).await.unwrap()["away"], true);
+
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+    let cancel = CancellationToken::new();
+    let heartbeat = {
+        let bridge = bridge.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { run_desktop_heartbeat(&bridge, ready_rx, cancel).await })
+    };
+    assert_eq!(bridge.request(Request::Status).await.unwrap()["away"], true);
+    ready_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while bridge.request(Request::Status).await.unwrap()["away"] == true {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("servis hazır olunca heartbeat gelmeli");
+    assert_eq!(bridge.request(Request::Status).await.unwrap()["away"], false);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), heartbeat).await
+        .expect("heartbeat iptalde hemen durmalı").unwrap();
+    drop(requester);
+    server.shutdown().await;
+}
 
 // Süreç ortamını kullanan testler varsayılan paralel koşuda da birbirinden yalıtılır.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

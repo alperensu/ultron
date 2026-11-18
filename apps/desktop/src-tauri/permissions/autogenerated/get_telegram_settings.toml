@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-telegram-settings"
+description = "Enables the get_telegram_settings command without any pre-configured scope."
+commands.allow = ["get_telegram_settings"]
+
+[[permission]]
+identifier = "deny-get-telegram-settings"
+description = "Denies the get_telegram_settings command without any pre-configured scope."
+commands.deny = ["get_telegram_settings"]

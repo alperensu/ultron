@@ -155,6 +155,22 @@ describe("sohbet akışı", () => {
     expect(snapshot.engine).toBe("codex");
   });
 
+  it("renders quota life cycle without inventing a reset time or a running turn", () => {
+    const snapshot = createChatTimeline().append([
+      event(1, "quota_wait_started", { resets_at: null, engine: "claude", reason: "reset_unknown" }),
+      event(2, "quota_resumed", { engine: "claude", reason: "reset_reached" }),
+      event(3, "quota_handoff", { from: "claude", to: "codex", reason: "fallback_selected" }),
+      event(4, "quota_wait_stopped", { engine: "codex", reason: "disabled" }),
+    ]);
+    expect(snapshot.rows).toMatchObject([
+      { tone: "quota", text: "Kota bekleniyor. Sıfırlanma zamanı bilinmiyor." },
+      { tone: "quota", text: "Aynı motorla otomatik devam deneniyor." },
+      { tone: "quota", text: "Kota nedeniyle Codex ile devam deneniyor." },
+      { tone: "quota", text: "Otomatik kota beklemesi durdu." },
+    ]);
+    expect(snapshot.running).toBe(false);
+  });
+
   it("fake_bridge_streams_50_events_per_second_and_stops_on_unsubscribe", async () => {
     vi.useFakeTimers();
     const events = Array.from({ length: 50 }, (_, index) => event(index + 1, "assistant_text", { text: "a" }));

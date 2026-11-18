@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-telegram-test"
+description = "Enables the telegram_test command without any pre-configured scope."
+commands.allow = ["telegram_test"]
+
+[[permission]]
+identifier = "deny-telegram-test"
+description = "Denies the telegram_test command without any pre-configured scope."
+commands.deny = ["telegram_test"]

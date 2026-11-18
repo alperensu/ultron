@@ -7,6 +7,7 @@ import { Page } from "./Page";
 import "../features/quota/quota.css";
 import { PolicySettings } from "../features/approvals/PolicySettings";
 import { TrashSettings } from "../features/approvals/TrashSettings";
+import { TelegramSettings } from "../features/telegram/TelegramSettings";
 
 /** Servis mutasyonlarıyla desteklenmeyen ayarlar salt okunur gösterilir. */
 export function Settings() {
@@ -44,6 +45,7 @@ export function Settings() {
           <LargeTitle title="Ayarlar" summary="Servis, motorlar ve içe aktarma" progress={progress} />
           <PolicySettings />
           <TrashSettings />
+          <TelegramSettings />
           <GroupedList header="Servis">
             <Row
               title="ultrond"

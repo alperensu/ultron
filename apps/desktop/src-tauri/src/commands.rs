@@ -9,7 +9,7 @@ use ultron_core::EngineId;
 use ultron_core::db::{SearchHit, StoredEvent};
 use ultron_core::ipc::{
     CatalogImportReport, ChatDetail, ChatInfo, PolicyArg, ProjectInfo, Request,
-    Response, RouteResult,
+    Response, RouteResult, TelegramSettings, TelegramStatusSnapshot, TelegramTestReport,
 };
 use ultron_core::quota::QuotaReport;
 
@@ -289,6 +289,46 @@ pub async fn get_policy_config(b: Shared<'_>) -> Out<ultron_core::ipc::PolicySet
 #[tauri::command]
 pub async fn set_policy_config(b: Shared<'_>, args: PolicySettingsArgs) -> Out<ultron_core::ipc::PolicySettings> {
     request(&b, Request::SetPolicyConfig { settings: args.settings }).await
+}
+
+// Sağlayıcı hata ayrıntıları yerine sabit metin; durum kodları tipli snapshot'ta gelir.
+async fn telegram_request<T: DeserializeOwned>(bridge: &Bridge, req: Request) -> Out<T> {
+    request(bridge, req).await.map_err(|err| match err {
+        BridgeError::DaemonUnavailable { .. } => BridgeError::DaemonUnavailable {
+            reason: "Servise bağlanılamadı.".into(),
+        },
+        BridgeError::Daemon { .. } => BridgeError::Daemon {
+            message: "Servis Telegram isteğini tamamlayamadı.".into(),
+        },
+        BridgeError::Protocol { .. } => BridgeError::Protocol {
+            message: "Servisten geçerli bir Telegram yanıtı alınamadı.".into(),
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn telegram_status(b: Shared<'_>) -> Out<TelegramStatusSnapshot> {
+    telegram_request(&b, Request::TelegramStatus).await
+}
+
+#[tauri::command]
+pub async fn get_telegram_settings(b: Shared<'_>) -> Out<TelegramSettings> {
+    telegram_request(&b, Request::GetTelegramSettings).await
+}
+
+#[tauri::command]
+pub async fn set_telegram_settings(b: Shared<'_>, args: TelegramSettings) -> Out<TelegramSettings> {
+    telegram_request(&b, Request::SetTelegramSettings {
+        notify: args.notify,
+        auto_continue_enabled: args.auto_continue_enabled,
+        auto_continue_wait_minutes: args.auto_continue_wait_minutes,
+        fallback_order: args.fallback_order,
+    }).await
+}
+
+#[tauri::command]
+pub async fn telegram_test(b: Shared<'_>) -> Out<TelegramTestReport> {
+    telegram_request(&b, Request::TelegramTest).await
 }
 
 /// Projesiz yeni sohbetin çalışma dizini: kullanıcı ev dizini, yoksa geçerli dizin.

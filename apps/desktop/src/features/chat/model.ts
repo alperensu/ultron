@@ -34,6 +34,30 @@ export function engineId(value: unknown): EngineId | null {
 }
 
 const WORK_KINDS = new Set(["tool_call", "tool_result", "command", "file_changed", "external_changes"]);
+const resetFormat = new Intl.DateTimeFormat("tr-TR", {
+  dateStyle: "short", timeStyle: "short", timeZone: "Europe/Istanbul",
+});
+
+function quotaLifecycleText(event: StoredEvent): string | null {
+  switch (event.kind) {
+    case "quota_wait_started": {
+      const reset = Date.parse(field(event, "resets_at"));
+      return Number.isFinite(reset)
+        ? `Kota bekleniyor. Sıfırlanma zamanı ${resetFormat.format(reset)} (TSİ).`
+        : "Kota bekleniyor. Sıfırlanma zamanı bilinmiyor.";
+    }
+    case "quota_resumed":
+      return "Aynı motorla otomatik devam deneniyor.";
+    case "quota_handoff": {
+      const to = engineId(eventPayload(event).to);
+      return to ? `Kota nedeniyle ${ENGINE_LABEL[to]} ile devam deneniyor.` : "Yedek motorla devam deneniyor.";
+    }
+    case "quota_wait_stopped":
+      return "Otomatik kota beklemesi durdu.";
+    default:
+      return null;
+  }
+}
 
 export function workEventSummary(event: StoredEvent): string {
   const payload = eventPayload(event);
@@ -123,6 +147,9 @@ export function createChatTimeline(initialEngine: EngineId | null = null) {
         running = false;
       } else if (event.kind === "session_started") {
         running = true;
+      } else {
+        const text = quotaLifecycleText(event);
+        if (text) rows.push({ id: event.id, type: "system", tone: "quota", text });
       }
       previousKind = event.kind;
     }

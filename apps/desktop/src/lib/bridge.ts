@@ -170,6 +170,29 @@ export interface PolicyConfig {
   allow_list: string[];
 }
 export interface PolicySettings { config: PolicyConfig; trash_retention_days: number }
+export interface TelegramSettings {
+  notify: "always" | "away";
+  auto_continue_enabled: boolean;
+  auto_continue_wait_minutes: number;
+  fallback_order: EngineId[];
+}
+export type TelegramErrorCode =
+  | "not_verified" | "invalid_token" | "credential_unavailable" | "network" | "timeout"
+  | "unauthorized" | "poll_conflict" | "rate_limited" | "provider_unavailable"
+  | "invalid_response" | "delivery_uncertain";
+export interface TelegramStatusSnapshot {
+  state: "connected" | "missing_token" | "missing_allowed_users" | "error";
+  allowed_user_count: number;
+  settings: TelegramSettings;
+  error: TelegramErrorCode | null;
+}
+export interface TelegramTestReport {
+  attempted: number;
+  delivered: number;
+  failed: number;
+  uncertain: number;
+}
+
 export interface TrashEntry {
   id: string;
   original_path: string;
@@ -184,6 +207,10 @@ export interface Bridge {
   resolveApproval(id: string, approve: boolean): Promise<{ approval: Approval }>;
   getPolicyConfig(): Promise<PolicySettings>;
   setPolicyConfig(settings: PolicySettings): Promise<PolicySettings>;
+  telegramStatus(): Promise<TelegramStatusSnapshot>;
+  getTelegramSettings(): Promise<TelegramSettings>;
+  setTelegramSettings(settings: TelegramSettings): Promise<TelegramSettings>;
+  telegramTest(): Promise<TelegramTestReport>;
   listTrash(): Promise<{ entries: TrashEntry[] }>;
   restoreTrash(id: string): Promise<{ path: string }>;
   purgeTrash(id: string): Promise<{ id: string }>;
@@ -277,6 +304,11 @@ export function createTauriBridge(): Bridge {
     resolveApproval: (id, approve) => call("resolve_approval", { id, approve }),
     getPolicyConfig: () => call("get_policy_config"),
     setPolicyConfig: (settings) => call("set_policy_config", { settings }),
+    telegramStatus: () => call("telegram_status"),
+    getTelegramSettings: () => call("get_telegram_settings"),
+    setTelegramSettings: ({ notify, auto_continue_enabled, auto_continue_wait_minutes, fallback_order }) =>
+      call("set_telegram_settings", { notify, auto_continue_enabled, auto_continue_wait_minutes, fallback_order }),
+    telegramTest: () => call("telegram_test"),
     listTrash: () => call("list_trash"),
     restoreTrash: (id) => call("restore_trash", { id }),
     purgeTrash: (id) => call("purge_trash", { id }),
@@ -305,6 +337,8 @@ export function createTauriBridge(): Bridge {
 export interface FakeBridgeOptions {
   approvals?: Approval[];
   policySettings?: PolicySettings;
+  telegramStatus?: TelegramStatusSnapshot;
+  telegramTestReport?: TelegramTestReport;
   trash?: TrashEntry[];
   projects?: ProjectInfo[];
   chats?: ChatInfo[];
@@ -344,6 +378,7 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
   let policySettings = structuredClone(opts.policySettings ?? {
     config: { finance_paths: [], protected_paths: [], deploy_patterns: [], allow_list: [] }, trash_retention_days: 30,
   });
+  const telegramStatus = opts.telegramStatus ? structuredClone(opts.telegramStatus) : undefined;
   const trash = new Map((opts.trash ?? []).map((item) => [item.id, structuredClone(item)]));
   const quota = opts.quota ? structuredClone(opts.quota) : undefined;
   let saved: { version: 1; chats: ChatInfo[]; events: StoredEvent[] } | undefined;
@@ -466,6 +501,14 @@ export function createFakeBridge(opts: FakeBridgeOptions = {}): FakeBridge {
       policySettings = structuredClone(settings);
       return structuredClone(policySettings);
     }),
+    telegramStatus: () => run("telegram_status", [], () => telegramStatus ? structuredClone(telegramStatus) : reject("Telegram durumu")),
+    getTelegramSettings: () => run("get_telegram_settings", [], () => telegramStatus ? structuredClone(telegramStatus.settings) : reject("Telegram ayarları")),
+    setTelegramSettings: (settings) => run("set_telegram_settings", [settings], () => {
+      if (!telegramStatus) return reject("Telegram ayarları");
+      telegramStatus.settings = structuredClone(settings);
+      return structuredClone(telegramStatus.settings);
+    }),
+    telegramTest: () => run("telegram_test", [], () => opts.telegramTestReport ? structuredClone(opts.telegramTestReport) : reject("Telegram testi")),
     listTrash: () => run("list_trash", [], () => ({ entries: structuredClone([...trash.values()]) })),
     restoreTrash: (id) => run("restore_trash", [id], () => {
       const item = trash.get(id);
