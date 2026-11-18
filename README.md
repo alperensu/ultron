@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 [![Windows](https://img.shields.io/badge/Windows-11-0078D6?logo=windows)](https://www.microsoft.com/windows)
 [![Durum](https://img.shields.io/badge/durum-A%C5%9Fama%201%2F7-yellow)](#durum)
-[![Lisans](https://img.shields.io/badge/lisans-belirlenmedi-lightgrey)](#)
+[![Lisans](https://img.shields.io/badge/lisans-MIT-blue)](LICENSE)
 
 ![Masaüstü uygulaması maketi](docs/assets/ultron-mockup.png)
 
@@ -169,3 +169,7 @@ Tasarım belgesi: [docs/superpowers/specs/2026-11-15-harness-design.md](docs/sup
 - Rust tabanlı mimari yönü, Discord'un Rust ile yaptığı çalışmalardan esinlenmiştir.
 
 "Ultron" projenin çalışma adıdır; Marvel veya başka bir markayla bağlantısı yoktur.
+
+## Lisans
+
+Bu proje [MIT Lisansı](LICENSE) altında lisanslanmıştır. Ayrıntılar için [LICENSE](LICENSE) dosyasına bakın.
