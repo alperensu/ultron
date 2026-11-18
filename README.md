@@ -2,11 +2,11 @@
 
 > Claude Code, Codex ve Antigravity (agy) CLI'larını kendi üyelikleriyle süren, ortak hafızası ve kayıpsız devir paketi olan kişisel bir AI harness'i.
 
-**Ultron** is a personal AI harness for Windows that drives the Claude Code, Codex and Antigravity (agy) CLIs using the user's own subscriptions (no API keys by default). Every event is written to a durable log, conversations keep their state when the engine changes, and a handoff packet carries the decisions and next step to the new engine. Status: **Phase 1 of 7 (core) is implemented; the live acceptance is partial.** Turkish is the primary language of this document.
+**Ultron** is a personal AI harness for Windows that drives the Claude Code, Codex and Antigravity (agy) CLIs using the user's own subscriptions (no API keys by default). Every event is written to a durable log, conversations keep their state when the engine changes, and a handoff packet carries the decisions and next step to the new engine. Status: **Phases 1–4 are implemented (core, desktop app, safety & approvals, Telegram gateway); Phase 5 (second brain) is in progress.** Turkish is the primary language of this document.
 
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 [![Windows](https://img.shields.io/badge/Windows-11-0078D6?logo=windows)](https://www.microsoft.com/windows)
-[![Durum](https://img.shields.io/badge/durum-A%C5%9Fama%201%2F7-yellow)](#durum)
+[![Durum](https://img.shields.io/badge/durum-A%C5%9Fama%205%2F7-yellow)](#durum)
 [![Lisans](https://img.shields.io/badge/lisans-MIT-blue)](LICENSE)
 
 ![Masaüstü uygulaması maketi](docs/assets/ultron-mockup.png)
@@ -79,21 +79,27 @@ Temel fikirler:
 | Aşama | Kapsam | Durum |
 |---|---|---|
 | 1. Çekirdek | Servis iskeleti, SQLite şeması, olay günlüğü, motor sürücüleri, devir paketi, yerel IPC, CLI | **Tamamlandı (canlı kabul kısmi)** |
-| 2. Masaüstü v1 | Tauri arayüzü, projeler ve sohbetler, canlı ajan izleme, kota paneli | Planlandı |
-| 3. Güvenlik ve onay | Sabit kurallar arayüzü, çöp ve anlık görüntü, yerel onay modeli | Planlandı |
-| 4. Telegram kapısı | Emir, onay, bildirim, otomatik devam | Planlandı |
-| 5. İkinci beyin | Markdown kasası, kaynak makbuzları, hafıza önerileri, embedding araması | Planlandı |
+| 2. Masaüstü v1 | Tauri arayüzü, projeler ve sohbetler, canlı ajan izleme, kota paneli | **Tamamlandı** ([kabul raporu](docs/reports/2026-11-17-asama2-kabul.md)); MSI paketleme henüz kapalı |
+| 3. Güvenlik ve onay | Sabit kurallar arayüzü, çöp ve anlık görüntü, yerel onay modeli | **Tamamlandı (arka uç)** ([kabul raporu](docs/reports/2026-11-17-asama3-kabul.md)); yerel onay modeli gölge modda geliştiriliyor (yalnız puan kaydeder, onaylamaz); onay kartının elle kontrolü bekliyor |
+| 4. Telegram kapısı | Emir, onay, bildirim, otomatik devam | **Tamamlandı** ([kabul raporu](docs/reports/2026-11-18-asama4-kabul.md)); onay düğmesinin canlı testi bekliyor |
+| 5. İkinci beyin | Markdown kasası, kaynak makbuzları, hafıza önerileri, embedding araması | **Sürüyor.** 5a: sözleşmeler ve v14 şeması tamam; Markdown kasa, makbuzlar, FTS5 arama ve tur sonu arka plan özetleyici geliştiriliyor ([plan](docs/superpowers/plans/2026-11-18-asama5a-ikinci-beyin.md)). 5b (yerel embedding, günlük defter, ChatGPT içe alma) sonra |
 | 6. Orkestrasyon v2 | Görsel yönlendirme, Tam/Dengeli/Eko modları, yerel ve API motorları, konsey | Planlandı |
 | 7. Temsilci | Üçüncü kişilerle Telegram üzerinden görev yürütme | Planlandı |
 
-**Aşama 1 ne sunuyor:** `ultrond` servis iskeleti; olaylar için idempotent SQLite günlüğü (WAL); Claude Code, Codex ve agy sürücüleri; tam döküm kaydı; çalışma durumu; devir paketi ve `history_search`; kullanıcıya özel adlandırılmış boru üzerinden yerel IPC; geçici bir terminal istemcisi (`ultron chat`, `ultron switch`).
+**Şu an neler var:**
 
-**Canlı kabul sonuçları** ([ölçüm raporu](docs/reports/2026-11-15-asama1-olcum.md)):
+- `ultrond` servisi ve SQLite olay günlüğü (WAL); Claude Code, Codex ve agy sürücüleri; kayıpsız devir paketi.
+- Masaüstü uygulaması (Tauri + React): projeler ve sohbetler, canlı ajan izleme, kota paneli, Ayarlar > Telegram.
+- Güvenlik: sabit politika kuralları, riskli işlemler için onay kartı, Ultron çöp kutusu ve geri yükleme, proje ve geçmiş notu içe aktarma.
+- Telegram kapısı: `/yeni`, `/sohbetler`, `/durum`, `/limit`, `/onay` komutları; serbest metin yeni tur başlatır; yalnız silme ve git geçmişi işlemleri için tek kullanımlık onay düğmeleri (çözümlenemeyen veya proje dışını hedefleyen komutlar yalnız masaüstünden onaylanır); bildirim modu her zaman / uzaktayken; kota dolunca bekleyip otomatik devam (varsayılan 45 dk), yalnız zamanlayıcı varken bilgisayarı uyanık tutma.
+
+**Aşama 1 canlı kabul sonuçları** ([ölçüm raporu](docs/reports/2026-11-15-asama1-olcum.md)):
 
 - Claude → agy devri: **geçti.** Claude'da verilen karar agy tarafından doğru özetlendi; motor değişimi olayı günlüğe yazıldı.
 - Claude → Codex devri: **henüz çalıştırılmadı** (Codex kullanım kotası nedeniyle). Test kodu derleniyor ve `#[ignore]` ile tutuluyor; bu yönde doğrulama yapılmış sayılmaz.
 - Araç kısıtlama ölçümü: salt okunur modda, iki motorda da sentetik bir dosya silinmedi. Bu tek denemeye dayanan bir ölçümdür, kabul kapısı değildir.
 - Bilinen sınırlar: agy'nin araç çağrıları olay günlüğünde henüz ayrıntılı görünmüyor; akış ölçümü kısa cevaplarla alındığı için kesin değil.
+- Aşama 4 canlı kabul: bağlantı, test mesajı, `/durum`, `/limit` ve serbest metin turu geçti (ayrıntı: [kabul raporu](docs/reports/2026-11-18-asama4-kabul.md)).
 
 ## Hızlı başlangıç (geliştirici)
 
@@ -132,6 +138,23 @@ cargo test -p ultrond --test live_acceptance live_claude_to_agy_handoff -- --ign
 
 Testler geçici `ULTRON_HOME` ve `ULTRON_PIPE_NAME` değerleriyle çalışır; gerçek kullanıcı verisine ve zamanlanmış görevlere dokunmaz.
 
+**Masaüstü uygulaması** (`apps/desktop` içinde):
+
+```powershell
+npm install
+npm run dev        # Vite geliştirme sunucusu
+npm run build      # tsc --noEmit + vite build
+npm test           # Vitest
+npm run e2e        # Playwright
+npx tauri build    # Tauri derlemesi (paketleme henüz kapalı)
+```
+
+**Telegram kurulumu:**
+
+- Bot belirteci `ultron telegram set-token` ile Windows Credential Manager'a kaydedilir; belirteç standart girdiden okunur.
+- İzinli kullanıcı kimlikleri `%LOCALAPPDATA%\ultron\config.toml` dosyasındaki `[telegram] allowed_user_ids` listesine yazılır.
+- Durum: `ultron telegram status`; deneme mesajı: `ultron telegram test`.
+
 ## Güvenlik
 
 - Yerel IPC, kullanıcı SID'ine bağlı adlandırılmış boru üzerinden çalışır; boru yalnızca o kullanıcıya izinlidir ve uzak istemciler reddedilir.
@@ -140,6 +163,10 @@ Testler geçici `ULTRON_HOME` ve `ULTRON_PIPE_NAME` değerleriyle çalışır; g
 - Motor alt süreçleri izin atlama bayraklarıyla (`--dangerously-skip-permissions`, `bypassPermissions`, `danger-full-access`) başlatılmaz.
 - Git çağrılarında fsmonitor, hooks, ext-diff ve filtreler devre dışıdır; `GIT_*` ortam değişkenleri temizlenir.
 - Depoda sır, belirteç, kişisel veri veya mutlak kullanıcı yolu bulunmaz. Test fikstürleri sentetiktir; gerçek yakalamalar depo dışında tutulur.
+- Telegram'da her güncelleme üçlü kimlik süzgecinden geçer: izinli kullanıcı, özel sohbet ve sohbet = kullanıcı.
+- Bot belirteci yalnız Windows Credential Manager'da tutulur.
+- Giden Telegram mesajlarında biçimlendirme ve bağlantı önizlemesi kapalıdır.
+- Telegram onayları tek kullanımlıktır; ilk karar geçerlidir ve onay özeti maskelenir.
 
 **Güvenlik açığı bildirimi:** Lütfen açığı herkese açık bir issue olarak paylaşmayın. Repo'nun **Security** sekmesinden **Report a vulnerability** ile özel bir security advisory açın.
 
@@ -150,7 +177,10 @@ crates/
   ultron-core/   Çekirdek kütüphane: yapılandırma, DB şeması, olaylar, motor sürücüleri,
                  çalışma durumu, devir paketi, IPC tipleri
   ultrond/       Arka plan servisi: adlandırılmış boru, belirteç, oturum yaşam döngüsü, canlı testler
-  ultron/        Terminal istemcisi: chat, switch komutları
+  ultron/        Terminal istemcisi: chat, switch, events, history, import, trash, telegram,
+                 status, service komutları
+apps/
+  desktop/       Masaüstü uygulaması (Tauri + React)
 docs/
   superpowers/specs/   Tasarım belgesi (Türkçe, onaylı kararlar)
   superpowers/plans/   Aşama uygulama planları
