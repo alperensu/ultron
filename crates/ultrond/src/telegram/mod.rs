@@ -8,3 +8,6 @@ pub mod contracts;
 pub mod control;
 pub mod credentials;
 pub mod notifications;
+
+#[cfg(test)]
+mod integration_tests;

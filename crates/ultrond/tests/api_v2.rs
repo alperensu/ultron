@@ -357,12 +357,14 @@ async fn every_request_variant_is_implemented_or_explicitly_not_yet_wired() {
             assert_ne!(message, "Telegram ağ geçidi henüz bağlanmadı", "{req:?}");
         }
     }
-    // Task 10 bu istekleri gerçek beklentilerle uygulanmış gruba taşır.
-    let not_yet_wired = [
-        Request::TelegramStatus,
+    // Salt okunur DTO'lar Response::Ok.data içinde doğrudan döner.
+    seen.insert(variant_name(&Request::TelegramStatus));
+    assert_eq!(ok_data(&h, Request::TelegramStatus).await["state"], "missing_allowed_users");
+    seen.insert(variant_name(&Request::GetTelegramSettings));
+    assert_eq!(ok_data(&h, Request::GetTelegramSettings).await["auto_continue_wait_minutes"], 45);
+    let admin = [
         Request::TelegramSetToken { token: "synthetic-token".into() },
         Request::TelegramTest,
-        Request::GetTelegramSettings,
         Request::SetTelegramSettings {
             notify: ultron_core::config::NotifyMode::Away,
             auto_continue_enabled: false,
@@ -371,9 +373,9 @@ async fn every_request_variant_is_implemented_or_explicitly_not_yet_wired() {
         },
         Request::DesktopHeartbeat { instance_id: "synthetic-instance".into() },
     ];
-    for req in not_yet_wired {
+    for req in admin {
         seen.insert(variant_name(&req));
-        assert_eq!(error_of(&h, req).await, "Telegram ağ geçidi henüz bağlanmadı");
+        assert_eq!(error_of(&h, req).await, "yetkisiz: onaylayıcı rolü gerekli");
     }
     assert_eq!(seen.len(), 33,"her varyant denenmeli: {seen:?}");
     h.shutdown().await;

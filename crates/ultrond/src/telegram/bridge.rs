@@ -106,6 +106,9 @@ async fn poll_loop(deps: &GatewayDependencies, bot: i64, cancel: &CancellationTo
     let mut offset = deps.db.telegram_next_update_id(bot).map_err(|_| GatewayError::Unavailable)?;
     let mut failures = 0u32;
     loop {
+        if deps.config.read().map_err(|_| GatewayError::Unavailable)?.allowed_user_ids.is_empty() {
+            return Ok(());
+        }
         let result = tokio::select! { biased; () = cancel.cancelled() => return Ok(()), result = deps.poller.poll(offset) => result };
         match result {
             Ok(mut updates) => {
@@ -149,6 +152,10 @@ async fn send_loop(deps: &GatewayDependencies, cancel: &CancellationToken, mut r
     loop {
         let outbound = tokio::select! { biased; () = cancel.cancelled() => break, message = receiver.recv() => match message { Some(message) => message, None => break } };
         let logical = outbound.logical_turn_id;
+        if !deps.config.read().map_err(|_| GatewayError::Unavailable)?.allowed_user_ids.contains(&outbound.message.chat_id) {
+            if let Some(id) = &logical { release(id); }
+            continue;
+        }
         let result = tokio::select! { biased;
             // İptal: final Ready kalır ve sonraki çalıştırmada yeniden denenir.
             () = cancel.cancelled() => { if let Some(id) = &logical { release(id); } break; },

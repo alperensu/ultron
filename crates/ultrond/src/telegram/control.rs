@@ -17,6 +17,10 @@ use super::credentials::SecretToken;
 pub static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 pub const TEST_MESSAGE: &str = "Ultron Telegram bağlantı testi.";
 pub const DESKTOP_LEASE: Duration = Duration::from_secs(90);
+/// İki bağlantı testi koşusu arasındaki en kısa süre.
+pub const TEST_COOLDOWN: Duration = Duration::from_secs(30);
+/// Tek test koşusunun toplam süresi. Masaüstü köprüsünün bekleme süresi bunun üstünde olmalıdır.
+pub const TEST_DEADLINE: Duration = Duration::from_secs(60);
 
 pub struct SystemClock;
 impl Clock for SystemClock {
@@ -92,6 +96,10 @@ pub struct TelegramControl {
     health_error: Mutex<Option<TelegramErrorCode>>,
     /// Token/test/settings işlemleri sıralıdır; döndürülen transport rotasyonla yarışmaz.
     mutation: tokio::sync::Mutex<()>,
+    /// Son test koşusunun başlangıcı (cooldown için).
+    last_test: Mutex<Option<tokio::time::Instant>>,
+    test_cooldown: Duration,
+    test_deadline: Duration,
 }
 
 impl TelegramControl {
@@ -102,7 +110,8 @@ impl TelegramControl {
             TelegramSettings::from(&*config)
         };
         let (settings_updates, _) = tokio::sync::watch::channel(settings);
-        Ok(Self { paths, config, store, gateway, settings_updates, health_error: Mutex::new(None), mutation: tokio::sync::Mutex::new(()) })
+        Ok(Self { paths, config, store, gateway, settings_updates, health_error: Mutex::new(None), mutation: tokio::sync::Mutex::new(()),
+            last_test: Mutex::new(None), test_cooldown: TEST_COOLDOWN, test_deadline: TEST_DEADLINE })
     }
 
     /// Task 8 timer/config değişikliğini uyanmadan önce de izleyebilir.
@@ -164,36 +173,61 @@ impl TelegramControl {
         let paths = self.paths.clone();
         let config = self.config.clone();
         let settings_updates = self.settings_updates.clone();
-        tokio::task::spawn_blocking(move || {
+        let (was_empty, empty) = tokio::task::spawn_blocking(move || {
             // Kilit sırası tüm yazıcılarda CONFIG_LOCK -> config olmalıdır.
             let _file_guard = CONFIG_LOCK.lock().map_err(|_| GatewayError::Unavailable)?;
             let mut snapshot = config.write().map_err(|_| GatewayError::Unavailable)?;
             let next = writer(&paths.root.join("config.toml"), &settings)?;
+            let was_empty = snapshot.allowed_user_ids.is_empty();
+            let empty = next.allowed_user_ids.is_empty();
             *snapshot = next;
             settings_updates.send_replace(settings);
-            Ok(())
-        }).await.map_err(|_| GatewayError::Unavailable)?
+            Ok::<_, GatewayError>((was_empty, empty))
+        }).await.map_err(|_| GatewayError::Unavailable)??;
+        if empty || was_empty {
+            let result = self.restart_from_store().await;
+            *self.health_error.lock().map_err(|_| GatewayError::Unavailable)? = result.err();
+        }
+        Ok(())
     }
 
     pub async fn test(&self, role: ControlRole) -> Result<TelegramTestReport, TelegramErrorCode> {
         require_approver(role).map_err(|_| TelegramErrorCode::Unauthorized)?;
-        let _guard = self.mutation.lock().await;
-        let ids = {
-            let config = self.config.read().map_err(|_| TelegramErrorCode::CredentialUnavailable)?;
-            config.validate().map_err(|_| TelegramErrorCode::InvalidResponse)?;
-            config.allowed_user_ids.clone()
+        // Kilit yalnız transport ve ID anlık görüntüsü içindir; ağ gönderimi kilit dışındadır.
+        let (ids, transport) = {
+            let _guard = self.mutation.lock().await;
+            let ids = {
+                let config = self.config.read().map_err(|_| TelegramErrorCode::CredentialUnavailable)?;
+                config.validate().map_err(|_| TelegramErrorCode::InvalidResponse)?;
+                config.allowed_user_ids.clone()
+            };
+            if ids.is_empty() { return Err(TelegramErrorCode::NotVerified); }
+            let health = self.gateway.health();
+            if !health.token_present { return Err(TelegramErrorCode::InvalidToken); }
+            let transport = self.gateway.transport().ok_or(TelegramErrorCode::NotVerified)?;
+            let now = tokio::time::Instant::now();
+            let mut last = self.last_test.lock().map_err(|_| TelegramErrorCode::CredentialUnavailable)?;
+            if last.is_some_and(|at| now.duration_since(at) < self.test_cooldown) {
+                return Err(TelegramErrorCode::RateLimited);
+            }
+            *last = Some(now);
+            (ids, transport)
         };
-        if ids.is_empty() { return Err(TelegramErrorCode::NotVerified); }
-        let health = self.gateway.health();
-        if !health.token_present { return Err(TelegramErrorCode::InvalidToken); }
-        let transport = self.gateway.transport().ok_or(TelegramErrorCode::NotVerified)?;
+        let deadline = tokio::time::Instant::now() + self.test_deadline;
         let mut report = TelegramTestReport { attempted: 0, delivered: 0, failed: 0, uncertain: 0 };
-        for id in ids {
+        let mut ids = ids.into_iter();
+        while let Some(id) = ids.next() {
             report.attempted += 1;
-            match transport.send_message(SendMessage { chat_id: id, text: TEST_MESSAGE.into(), disable_notification: false, reply_markup: None }).await {
-                Ok(_) => report.delivered += 1,
-                Err(error) if matches!(error.code, TelegramErrorCode::DeliveryUncertain | TelegramErrorCode::Timeout | TelegramErrorCode::Network) => report.uncertain += 1,
-                Err(_) => report.failed += 1,
+            let send = transport.send_message(SendMessage { chat_id: id, text: TEST_MESSAGE.into(), disable_notification: false, reply_markup: None });
+            match tokio::time::timeout_at(deadline, send).await {
+                Ok(Ok(_)) => report.delivered += 1,
+                Ok(Err(error)) if matches!(error.code, TelegramErrorCode::DeliveryUncertain | TelegramErrorCode::Timeout | TelegramErrorCode::Network) => report.uncertain += 1,
+                Ok(Err(_)) => report.failed += 1,
+                Err(_) => {
+                    // Süre doldu: uçuştaki gönderim belirsiz; kalanlar hiç gönderilmedi.
+                    report.uncertain += 1;
+                    for _ in ids.by_ref() { report.attempted += 1; report.failed += 1; }
+                }
             }
         }
         Ok(report)
@@ -419,6 +453,67 @@ mod tests {
         assert_eq!(env.control.settings().unwrap(), old);
         assert!(!watch.has_changed().unwrap());
         assert_eq!(std::fs::read_dir(&env.control.paths.root).unwrap().count(), 1);
+    }
+
+    struct GateTransport { gate: tokio::sync::Notify, entered: tokio::sync::Notify, hang: bool }
+    impl TelegramTransport for GateTransport {
+        fn get_me(&self) -> BoxFuture<'_, Result<TelegramUser, TransportError>> { panic!("test ağ doğrulaması yapmaz") }
+        fn get_updates(&self, _: Option<i64>) -> BoxFuture<'_, Result<Vec<TelegramUpdate>, TransportError>> { panic!("test poller başlatmaz") }
+        fn send_message(&self, _: SendMessage) -> BoxFuture<'_, Result<SentMessage, TransportError>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                if self.hang { std::future::pending::<()>().await; } else { self.gate.notified().await; }
+                Ok(SentMessage { message_id: 1 })
+            })
+        }
+        fn edit_message_text(&self, _: EditMessageText) -> BoxFuture<'_, Result<(), TransportError>> { panic!("test mesaj düzenlemez") }
+        fn answer_callback_query(&self, _: AnswerCallbackQuery) -> BoxFuture<'_, Result<(), TransportError>> { panic!("test callback çözmez") }
+    }
+    struct GateGateway(Arc<GateTransport>);
+    impl GatewayLifecycle for GateGateway {
+        fn health(&self) -> GatewayHealth { GatewayHealth { token_present: true, verified: true, error: None } }
+        fn restart(&self, _: Option<SecretToken>) -> BoxFuture<'_, Result<(), TelegramErrorCode>> { Box::pin(async { Ok(()) }) }
+        fn transport(&self) -> Option<Arc<dyn TelegramTransport>> { Some(self.0.clone()) }
+    }
+    fn gate_control(ids: Vec<i64>, hang: bool, cooldown: Duration, deadline: Duration) -> (Arc<TelegramControl>, Arc<GateTransport>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(RwLock::new(TelegramConfig { allowed_user_ids: ids, ..Default::default() }));
+        let transport = Arc::new(GateTransport { gate: Default::default(), entered: Default::default(), hang });
+        let mut control = TelegramControl::new(Paths::from_root(tmp.path().into()), config, Arc::new(MemoryStore::default()), Arc::new(GateGateway(transport.clone()))).unwrap();
+        control.test_cooldown = cooldown;
+        control.test_deadline = deadline;
+        (Arc::new(control), transport, tmp)
+    }
+
+    #[tokio::test]
+    async fn in_flight_test_does_not_block_settings_save() {
+        let (control, transport, _tmp) = gate_control(vec![101], false, Duration::ZERO, Duration::from_secs(60));
+        let running = tokio::spawn({ let control = control.clone(); async move { control.test(ControlRole::Approver).await } });
+        tokio::time::timeout(Duration::from_secs(5), transport.entered.notified()).await.unwrap();
+        let mut settings = control.settings().unwrap();
+        settings.auto_continue_wait_minutes = 77;
+        tokio::time::timeout(Duration::from_secs(5), control.set_settings(ControlRole::Approver, settings)).await
+            .expect("ayar kaydı test gönderimini beklememeli").unwrap();
+        transport.gate.notify_one();
+        assert_eq!(running.await.unwrap().unwrap().delivered, 1);
+    }
+
+    #[tokio::test]
+    async fn test_runs_respect_cooldown() {
+        let (control, transport, _tmp) = gate_control(vec![101], false, Duration::from_millis(300), Duration::from_secs(60));
+        transport.gate.notify_one();
+        control.test(ControlRole::Approver).await.unwrap();
+        assert_eq!(control.test(ControlRole::Approver).await, Err(TelegramErrorCode::RateLimited));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        transport.gate.notify_one();
+        control.test(ControlRole::Approver).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_deadline_reports_unsent_recipients_honestly() {
+        let (control, _transport, _tmp) = gate_control(vec![101, 102, 103], true, Duration::ZERO, Duration::from_millis(100));
+        let report = control.test(ControlRole::Approver).await.unwrap();
+        assert_eq!(report, TelegramTestReport { attempted: 3, delivered: 0, failed: 2, uncertain: 1 });
     }
 
     struct ManualClock { at: Mutex<Instant> }

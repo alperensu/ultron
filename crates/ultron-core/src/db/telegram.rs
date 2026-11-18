@@ -111,6 +111,30 @@ fn checkpoint_tx(tx: &Transaction<'_>, bot_id: i64, next_update_id: i64) -> Resu
     Ok(())
 }
 
+/// Kapanışın seq sınırı ve inbox durumu aynı transaction'da değişir.
+pub(super) fn interrupt_telegram_chat_tx(tx: &Transaction<'_>, chat_id: &str, quota_only: bool) -> Result<()> {
+    tx.execute(
+        "UPDATE telegram_inbox SET state = 'needs_attention'
+         WHERE state IN ('accepted', 'running') AND logical_turn_id IN (
+             SELECT o.logical_turn_id FROM telegram_turn_origins o
+             WHERE o.chat_id = ?1 AND o.end_seq IS NULL
+             AND (NOT ?2 OR EXISTS(SELECT 1 FROM quota_waits q
+                 WHERE q.logical_turn_id = o.logical_turn_id
+                 AND q.state IN ('waiting', 'claimed', 'running', 'needs_attention'))))",
+        params![chat_id, quota_only],
+    )?;
+    tx.execute(
+        "UPDATE telegram_turn_origins AS o SET delivery_state = 'needs_attention', end_seq =
+             MAX(o.start_seq, COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.chat_id = o.chat_id), o.start_seq))
+         WHERE o.chat_id = ?1 AND o.end_seq IS NULL
+         AND (NOT ?2 OR EXISTS(SELECT 1 FROM quota_waits q
+             WHERE q.logical_turn_id = o.logical_turn_id
+             AND q.state IN ('waiting', 'claimed', 'running', 'needs_attention')))",
+        params![chat_id, quota_only],
+    )?;
+    Ok(())
+}
+
 pub(super) fn validated_user_event(event: &StoredEvent) -> Result<StoredEvent> {
     ensure!(
         event.kind == "user_text",
@@ -271,6 +295,7 @@ impl Db {
             checkpoint.is_none_or(|offset| request.update_id >= offset),
             "Telegram güncellemesi ofsetten eski"
         );
+        interrupt_telegram_chat_tx(&tx, &event.chat_id, false)?;
         let stored = Self::append_event_tx(&tx, &event)?
             .ok_or_else(|| anyhow!("kullanıcı olayı zaten var"))?;
         super::quota_wait::invalidate_chat_tx(&tx, &stored.chat_id, Utc::now())?;
@@ -314,6 +339,7 @@ impl Db {
         let event = validated_user_event(event)?;
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        interrupt_telegram_chat_tx(&tx, &event.chat_id, false)?;
         let stored = Self::append_event_tx(&tx, &event)?
             .ok_or_else(|| anyhow!("kullanıcı olayı zaten var"))?;
         super::quota_wait::invalidate_chat_tx(&tx, &stored.chat_id, Utc::now())?;
@@ -373,6 +399,26 @@ impl Db {
         Ok(changed == 1)
     }
 
+    /// Henüz kota kaydı açılmadan iptal edilen denemenin sonucunu kapatır.
+    pub fn interrupt_telegram_turn(&self, logical_turn_id: &str, end_seq: i64) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE telegram_turn_origins SET end_seq = ?2, delivery_state = 'needs_attention'
+             WHERE logical_turn_id = ?1 AND end_seq IS NULL AND start_seq <= ?2",
+            params![logical_turn_id, end_seq],
+        )?;
+        if changed == 1 {
+            tx.execute(
+                "UPDATE telegram_inbox SET state = 'needs_attention'
+                 WHERE logical_turn_id = ?1 AND state IN ('accepted', 'running')",
+                [logical_turn_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Belirsiz ağ teslimi delivered diye işaretlenmez; otomatik yeniden gönderim yoktur.
     pub fn finish_telegram_delivery(&self, logical_turn_id: &str, delivered: bool) -> Result<bool> {
         let state = if delivered {
@@ -394,11 +440,13 @@ impl Db {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         super::quota_wait::recover_waits_tx(&tx, Utc::now())?;
         tx.execute(
-            "UPDATE telegram_turn_origins SET delivery_state = 'needs_attention'
-             WHERE delivery_state = 'pending' AND logical_turn_id IN
-             (SELECT logical_turn_id FROM telegram_inbox WHERE state IN ('accepted', 'running'))
-             AND NOT EXISTS(SELECT 1 FROM quota_waits q
-                 WHERE q.logical_turn_id = telegram_turn_origins.logical_turn_id AND q.state = 'waiting')",
+            "UPDATE telegram_turn_origins AS o SET delivery_state = 'needs_attention', end_seq = MAX(o.start_seq, COALESCE(
+                 (SELECT MIN(e.seq) - 1 FROM events e WHERE e.chat_id = o.chat_id AND e.seq > o.start_seq AND e.kind = 'user_text'),
+                 (SELECT MAX(e.seq) FROM events e WHERE e.chat_id = o.chat_id), o.start_seq))
+             WHERE o.end_seq IS NULL AND NOT EXISTS(
+                 SELECT 1 FROM quota_waits q JOIN telegram_inbox i ON i.logical_turn_id = q.logical_turn_id
+                 WHERE q.logical_turn_id = o.logical_turn_id AND q.state = 'waiting'
+                 AND i.state IN ('accepted', 'running'))",
             [],
         )?;
         let count = tx.execute("UPDATE telegram_inbox SET state = 'needs_attention' WHERE state IN ('accepted', 'running')

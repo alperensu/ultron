@@ -117,6 +117,11 @@ impl TurnService {
     /// IPC requester normal tur başlatabilir; Full yine yeni yerel onay bekler.
     pub fn submit_local_message(&self, mut request: SubmitUserMessage) -> Result<AcceptedTurn, GatewayError> {
         request.origin = TurnOrigin::Local;
+        self.submit(request).map(|(accepted, _)| accepted)
+    }
+
+    pub(crate) fn submit_local_with_cursor(&self, mut request: SubmitUserMessage) -> Result<(AcceptedTurn, i64), GatewayError> {
+        request.origin = TurnOrigin::Local;
         self.submit(request)
     }
 
@@ -146,7 +151,7 @@ impl TurnService {
         Ok(())
     }
 
-    fn submit(&self, mut request: SubmitUserMessage) -> Result<AcceptedTurn, GatewayError> {
+    fn submit(&self, mut request: SubmitUserMessage) -> Result<(AcceptedTurn, i64), GatewayError> {
         self.origin(&request.origin)?;
         let remote = matches!(request.origin, TurnOrigin::Telegram { .. });
         if request.text.trim().is_empty() || request.text.len() > 1024 * 1024 { return Err(GatewayError::InvalidInput); }
@@ -169,7 +174,7 @@ impl TurnService {
             if request.chat_id.is_none() { request.chat_id = binding; }
         }
         let chat_id = request.chat_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-        if chat_id.is_empty() || !chat_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Err(GatewayError::InvalidInput); }
+        if !valid_chat_id(&chat_id) { return Err(GatewayError::InvalidInput); }
         if self.inner.active.lock().map_err(|_| GatewayError::Unavailable)?.contains_key(&chat_id) { return Err(GatewayError::Busy); }
         let existing = deps.db.get_chat(&chat_id).map_err(unavailable)?;
         // Telegram'da mevcut sohbetin proje/motor/çalışma dizini kullanıcı metniyle değişmez.
@@ -199,6 +204,7 @@ impl TurnService {
         let mut reservation = deps.manager.reserve_turn(&chat_id, engine).map_err(|_| GatewayError::Busy)?;
         deps.db.insert_chat(&chat_id, None, "", Utc::now()).map_err(unavailable)?;
         if let Some(project) = project { deps.db.bind_chat_project(&chat_id, &project.id).map_err(unavailable)?; }
+        let stream_cursor = deps.db.next_seq(&chat_id).map_err(unavailable)? - 1;
         let policy = if request.elevated { ToolPolicy::Full } else { request.policy.into() };
         let elevation = if policy == ToolPolicy::Full {
             let approval = deps.manager.request_elevation(&mut reservation, &cwd, &request.text).map_err(unavailable)?;
@@ -238,7 +244,7 @@ impl TurnService {
                 rx
             }
         };
-        Ok(AcceptedTurn { logical_turn_id, chat_id, user_event_seq, completion })
+        Ok((AcceptedTurn { logical_turn_id, chat_id, user_event_seq, completion }, stream_cursor))
     }
 
     fn spawn(&self, tasks: &mut JoinSet<()>, execution: ReservedExecution, elevation: Option<String>, remote: bool, preparation: Result<(), GatewayError>)
@@ -257,7 +263,9 @@ impl TurnService {
             let result = async {
                 preparation?;
                 if let Some(id) = elevation { wait_elevation(&inner.deps, &id, &execution.reservation.cancellation_token()).await.map_err(unavailable)?; }
-                let _grant = ultron_core::turn_grant::issue(&chat_id, &execution.cwd);
+                // Devam girişinin taze grant'ini SessionManager üretir.
+                let _grant = matches!(&execution.source, ExecutionSource::AcceptedUser(_))
+                    .then(|| ultron_core::turn_grant::issue(&chat_id, &execution.cwd));
                 let outcome = run_audited(&inner.deps.manager, &inner.deps.log, &chat_id, inner.deps.executor.execute(execution)).await.map_err(unavailable)?;
                 let end_seq = inner.deps.db.next_seq(&chat_id).map_err(unavailable)? - 1;
                 let mut after = start_seq;
@@ -339,15 +347,25 @@ fn failed_completion(deps: &TurnServiceDependencies, logical_turn_id: &str, chat
 }
 
 fn unavailable(_: impl std::fmt::Display) -> GatewayError { GatewayError::Unavailable }
+pub(crate) fn valid_chat_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 255
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
-    !right.as_os_str().is_empty() && left.to_string_lossy().replace('/', "\\").trim_end_matches('\\').eq_ignore_ascii_case(right.to_string_lossy().replace('/', "\\").trim_end_matches('\\'))
+    if right.as_os_str().is_empty() { return false; }
+    let normalize = |path: &std::path::Path| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    };
+    normalize(left) == normalize(right)
 }
 
 impl GatewayApplication for TurnService {
     fn submit_user_message(&self, request: SubmitUserMessage) -> BoxFuture<'_, Result<AcceptedTurn, GatewayError>> {
         Box::pin(async move {
             if !matches!(request.origin, TurnOrigin::Telegram { .. }) { return Err(GatewayError::Unauthorized); }
-            self.submit(request)
+            self.submit(request).map(|(accepted, _)| accepted)
         })
     }
     fn resume_quota_step(&self, request: ResumeQuotaStep) -> BoxFuture<'_, Result<AcceptedTurn, GatewayError>> { Box::pin(async move { self.resume(request, None) }) }

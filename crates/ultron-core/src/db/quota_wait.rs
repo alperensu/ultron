@@ -541,6 +541,7 @@ impl Db {
     pub fn cancel_quota_waits(&self, chat_id: &str, now: DateTime<Utc>) -> Result<usize> {
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::telegram::interrupt_telegram_chat_tx(&tx, chat_id, true)?;
         let count = invalidate_chat_tx(&tx, chat_id, now)?;
         tx.commit()?;
         Ok(count)

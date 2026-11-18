@@ -19,6 +19,17 @@ static FAKE: Once = Once::new();
 /// Sahte CLI ikilisinin hazır olduğundan emin olur ve yolunu `ULTRON_FAKE_CLI`'a yazar.
 pub fn ensure_fake_cli() {
     FAKE.call_once(|| {
+        // SessionManager'ın iç Paths::resolve çağrıları da kullanıcı durumundan yalıtılır.
+        static TEST_HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let home = TEST_HOME.get_or_init(|| tempfile::tempdir().unwrap());
+        let isolated = Paths::from_root(home.path().join("runtime"));
+        isolated.ensure().unwrap();
+        // SAFETY: yalnız sentetik test ikilisinin ilk motor kurulumu bu sabit yolu yazar.
+        unsafe { std::env::set_var("ULTRON_HOME", &isolated.root) };
+        if std::env::var_os("ULTRON_QUOTA_HOME").is_none() {
+            // SAFETY: açık test override'ı korunur, aksi halde yalnız sabit sentetik yol yazılır.
+            unsafe { std::env::set_var("ULTRON_QUOTA_HOME", home.path().join("quota")) };
+        }
         let name = format!("ultron-fake-cli{}", std::env::consts::EXE_SUFFIX);
         let find = || {
             let exe = std::env::current_exe().unwrap();
@@ -62,7 +73,8 @@ pub fn fake_engines(dir: &Path, lines: &[&str]) -> HashMap<EngineId, Arc<dyn Eng
 /// Sahte motorlu testlerde gerçek agy özetleyicisi çalışmasın: her tur sonunda gerçek
 /// bir Gemini çağrısı yapar (2-10 sn, ağa bağlı) ve kota harcar.
 pub fn config_without_agy() -> Config {
-    let mut cfg = Config::default();
+    let mut cfg = Config { summarizer: ultron_core::config::SummarizerMode::Off,
+        claude_live_quota: false, ..Config::default() };
     for engine in cfg.engines.iter_mut().filter(|e| e.id == EngineId::Agy) {
         engine.enabled = false;
     }

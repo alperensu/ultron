@@ -4354,6 +4354,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

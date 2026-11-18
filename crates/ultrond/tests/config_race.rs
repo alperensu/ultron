@@ -77,3 +77,33 @@ async fn external_edit_not_clobbered() {
     assert_eq!(cfg.reset_rights.codex, Some(2));
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn telegram_settings_and_reset_rights_share_atomic_merge_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = paths_in(tmp.path());
+    let h = start_with(&paths, &unique_pipe(), &[]).await;
+    // Allowlist daemon açıldıktan sonra sentetik dosyaya yazılır: test credential/ağ açmaz.
+    std::fs::write(paths.root.join("config.toml"),
+        "claude_live_quota = false\n[telegram]\nallowed_user_ids = [101, 202]\nfuture_telegram = 'keep'\n[future]\nvalue = 7\n").unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..12 {
+        let mut client = ultron_core::ipc::Client::connect(h.pipe_name(), h.approver_token()).await.unwrap();
+        tasks.push(tokio::spawn(async move {
+            let request = if i % 2 == 0 { Request::SetResetRights { pool: "claude".into(), count: i + 1 } }
+                else { Request::SetTelegramSettings { notify: ultron_core::config::NotifyMode::Away, auto_continue_enabled: false, auto_continue_wait_minutes: 13, fallback_order: vec![ultron_core::EngineId::Codex] } };
+            client.send(&request).await.unwrap(); next(&mut client).await.unwrap()
+        }));
+    }
+    for task in tasks { assert!(matches!(task.await.unwrap(), Response::Ok { .. })); }
+    let cfg = Config::load(&paths).unwrap();
+    assert_eq!(cfg.telegram.allowed_user_ids, vec![101, 202]);
+    assert_eq!(cfg.telegram.auto_continue_wait_minutes, 13);
+    assert!(!cfg.telegram.auto_continue_enabled);
+    assert!(cfg.reset_rights.claude.is_some());
+    let table: toml::Table = std::fs::read_to_string(paths.root.join("config.toml")).unwrap().parse().unwrap();
+    assert_eq!(table["telegram"]["future_telegram"].as_str(), Some("keep"));
+    assert_eq!(table["future"]["value"].as_integer(), Some(7));
+    assert!(!std::fs::read_dir(&paths.root).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".tmp")));
+    h.shutdown().await;
+}

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use common::*;
 use ultron_core::engine::{Engine, FakeEngine};
 use ultron_core::ipc::{Request, Response};
-use ultron_core::{Config, EngineId};
+use ultron_core::EngineId;
 use ultrond::server::{self, ServerConfig};
 
 /// Yalnız Claude kayıtlı, `sleep` kipinde (tur bitmez) bir sunucu başlatır.
@@ -23,7 +23,7 @@ async fn start_sleeping(paths: &ultron_core::Paths, pidfile: &std::path::Path) -
     server::start(ServerConfig {
         paths: paths.clone(),
         pipe_name: unique_pipe(),
-        cfg: Config::default(),
+        cfg: config_without_agy(),
         engines,
     })
     .await
@@ -55,7 +55,7 @@ async fn send_rejects_when_turn_running_before_ack() {
         .unwrap();
     match next(&mut second).await.expect("yanıt yok") {
         Response::Error { message } => assert!(message.contains("çalışan bir tur"), "{message}"),
-        other => panic!("kabul edilmemeliydi: {other:?}"),
+        other => panic!("kabul edilmemeliydi: {other:?}; olaylar: {:?}", ultron_core::Db::open(&paths.db).unwrap().events_for_chat("mesgul", None).unwrap()),
     }
 
     let mut c = connect(&h).await;

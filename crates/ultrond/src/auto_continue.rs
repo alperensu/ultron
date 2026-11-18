@@ -484,6 +484,21 @@ impl AutoContinue {
     /// için bekleyen kayıt varsa onu döndürür (devam denemesinin yeniden tükenmesi
     /// bu yoldan değil, zamanlayıcının kendi uzlaştırmasıyla işlenir).
     pub async fn register_exhausted(&self, attempt: QuotaExhaustedAttempt) -> Result<QuotaWait> {
+        let reset_at = self.resolve_reset(&attempt).await;
+        self.register_resolved(attempt, reset_at).await
+    }
+
+    /// Reset saatini (varsa attempt'ten, yoksa probe ile) çözer. Canlı HTTP yapabilir;
+    /// çağıran global kilit tutmadan çağırmalıdır.
+    pub async fn resolve_reset(&self, attempt: &QuotaExhaustedAttempt) -> Option<DateTime<Utc>> {
+        match attempt.reset_at {
+            Some(reset) => Some(reset),
+            None => self.inner.probe.blocking_reset(attempt.engine, self.inner.clock.now_utc()).await,
+        }
+    }
+
+    /// `register_exhausted`un probe yapmayan hali: `reset_at` önceden `resolve_reset` ile çözülmüştür.
+    pub async fn register_resolved(&self, attempt: QuotaExhaustedAttempt, reset_at: Option<DateTime<Utc>>) -> Result<QuotaWait> {
         if let Some(existing) = self
             .inner
             .db
@@ -494,10 +509,6 @@ impl AutoContinue {
             return Ok(existing);
         }
         let now = self.inner.clock.now_utc();
-        let reset_at = match attempt.reset_at {
-            Some(reset) => Some(reset),
-            None => self.inner.probe.blocking_reset(attempt.engine, now).await,
-        };
         let wait = self.inner.db.create_quota_wait(
             &NewQuotaWait {
                 id: uuid::Uuid::new_v4().simple().to_string(),

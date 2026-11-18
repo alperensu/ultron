@@ -4,14 +4,14 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::windows::named_pipe::NamedPipeServer;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use ultron_core::engine::{Engine, ToolPolicy, TurnOutcome};
@@ -23,7 +23,14 @@ use ultron_core::summarizer::{AgySummarizer, AutoSummarizer, ClaudeSummarizer, N
 use ultron_core::config::SummarizerMode;
 use ultron_core::{Config, Db, EngineId, EventLog, Paths, SessionManager, SessionStatus};
 
-use crate::keepawake::KeepAwake;
+use crate::keepawake::{KeepAwake, KeepAwakeReason};
+use crate::auto_continue::{AutoContinue, AutoContinueDeps, QuotaExhaustedAttempt, QuotaServiceProbe, ResetProbe, reset_from_quota_event};
+use crate::telegram::contracts::*;
+use crate::telegram::control::{CONFIG_LOCK, ControlRole, DesktopPresence, GatewayHealth, GatewayLifecycle, SystemClock, TelegramControl};
+use crate::telegram::credentials::{SecretToken, WindowsCredentialStore};
+use crate::telegram::bridge::{self, GatewayCallbacks, GatewayDependencies, PollSource};
+use crate::telegram::approval_callbacks::ApprovalCallbacks;
+use crate::turn_service::{ExecutionSource, ReservedExecution, TurnExecutor, TurnService, TurnServiceDependencies, valid_chat_id};
 
 #[path = "approvals.rs"]
 pub mod approvals;
@@ -49,18 +56,381 @@ pub struct ServerConfig {
     pub engines: HashMap<EngineId, Arc<dyn Engine>>,
 }
 
+type TransportPair = (Arc<dyn TelegramTransport>, Arc<dyn PollSource>);
+type TransportFactory = Arc<dyn Fn(SecretToken, CancellationToken) -> Result<TransportPair, ipc::TelegramErrorCode> + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) fn isolate_test_runtime() {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let temp = tempfile::tempdir().expect("sentetik runtime dizini");
+        let paths = Paths::from_root(temp.path().join("runtime"));
+        paths.ensure().expect("sentetik runtime yolları");
+        // SAFETY: tüm lib test motorları aynı, tek seferlik sentetik override'ı kullanır.
+        unsafe {
+            std::env::set_var("ULTRON_HOME", &paths.root);
+            std::env::set_var("ULTRON_QUOTA_HOME", temp.path().join("quota"));
+        }
+        temp
+    });
+}
+
+struct ServerDependencies {
+    credentials: Arc<dyn CredentialStore>,
+    clock: Arc<dyn Clock>,
+    transport: TransportFactory,
+    quota: Arc<ultron_core::quota::QuotaService>,
+    reset_probe: Option<Arc<dyn ResetProbe>>,
+    user_home: std::path::PathBuf,
+}
+
+impl ServerDependencies {
+    fn production() -> Self {
+        Self {
+            credentials: Arc::new(WindowsCredentialStore),
+            clock: Arc::new(SystemClock),
+            transport: Arc::new(|token, cancel| {
+                let client = Arc::new(crate::telegram::client::BotApiClient::new(token, cancel).map_err(|e| e.code)?);
+                Ok((client.clone(), client))
+            }),
+            quota: Arc::new(ultron_core::quota::QuotaService::from_env()),
+            reset_probe: None,
+            user_home: std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from).unwrap_or_default(),
+        }
+    }
+}
+
+/// Üretim/env/IPC yüzeyinde alternatif taşıma veya credential seçeneği yoktur.
+#[cfg(test)]
+pub(crate) async fn start_with_test_dependencies(
+    config: ServerConfig,
+    credentials: Arc<dyn CredentialStore>,
+    clock: Arc<dyn Clock>,
+    transport: TransportFactory,
+    quota: Arc<ultron_core::quota::QuotaService>,
+    reset_probe: Option<Arc<dyn ResetProbe>>,
+) -> Result<ServerHandle> {
+    isolate_test_runtime();
+    let user_home = config.paths.root.join("synthetic-user-home");
+    start_inner(config, ServerDependencies { credentials, clock, transport, quota, reset_probe, user_home }).await
+}
+
+type PendingAttempts = Arc<Mutex<HashMap<String, QuotaExhaustedAttempt>>>;
+type Registrations = Arc<tokio::sync::Mutex<HashMap<String, String>>>;
+
+struct SessionExecutor {
+    manager: Arc<SessionManager>,
+    pending: PendingAttempts,
+}
+
+impl TurnExecutor for SessionExecutor {
+    fn execute(&self, turn: ReservedExecution) -> BoxFuture<'_, Result<TurnOutcome>> {
+        Box::pin(async move {
+            let result = match turn.source {
+                ExecutionSource::AcceptedUser(event) => {
+                    let result = self.manager.send_reserved_with_accepted_user(
+                        turn.reservation, &turn.cwd, turn.engine, turn.policy, &turn.logical_turn_id, &event,
+                    ).await?;
+                    if matches!(result.outcome, TurnOutcome::QuotaExhausted) {
+                        let attempt = QuotaExhaustedAttempt {
+                            logical_turn_id: turn.logical_turn_id.clone(), chat_id: turn.chat_id,
+                            source_session_id: result.session_id.clone().context("kota oturumu yok")?,
+                            engine: turn.engine, user_event_seq: event.seq, checkpoint_seq: result.end_seq,
+                            cwd: turn.cwd,
+                            policy: match turn.policy {
+                                ToolPolicy::ReadOnly => ultron_core::db::quota_wait::ResumePolicy::ReadOnly,
+                                ToolPolicy::Workspace => ultron_core::db::quota_wait::ResumePolicy::Workspace,
+                                ToolPolicy::Full => ultron_core::db::quota_wait::ResumePolicy::RequiresLocalApproval,
+                            },
+                            reset_at: result.quota_event.as_ref().and_then(reset_from_quota_event),
+                        };
+                        self.pending.lock().map_err(|_| anyhow!("kota kabul kilidi zehirlendi"))?
+                            .insert(turn.logical_turn_id, attempt);
+                    }
+                    result
+                }
+                ExecutionSource::QuotaResume(context) => {
+                    // Claim/running geçişi çekirdeğe aittir; burada ikinci CAS veya kayıt yoktur.
+                    self.manager.resume_quota_step(turn.reservation, &context.wait.id, context.wait.generation, turn.engine).await?
+                }
+            };
+            Ok(result.outcome)
+        })
+    }
+}
+
+/// Completion adaptörü: scheduler, aktif tur lease'i bırakıldıktan sonra kaydeder.
+struct DaemonApplication {
+    service: Arc<TurnService>,
+    manager: Arc<SessionManager>,
+    db: Arc<Db>,
+    auto: AutoContinue,
+    pending: PendingAttempts,
+    // Mantıksal tur kimliği, yalnız tamamlanmayı bekleyen sohbetin neslidir.
+    registrations: Registrations,
+    tasks: Mutex<Option<JoinSet<()>>>,
+}
+
+impl DaemonApplication {
+    fn accepted(&self, mut accepted: AcceptedTurn, generations: &mut HashMap<String, String>) -> Result<AcceptedTurn, GatewayError> {
+        let mut tasks = self.tasks.lock().map_err(|_| GatewayError::Unavailable)?;
+        let tasks = tasks.as_mut().ok_or(GatewayError::Unavailable)?;
+        while tasks.try_join_next().is_some() {}
+        let pending = self.pending.clone();
+        let auto = self.auto.clone();
+        let db = self.db.clone();
+        let registrations = self.registrations.clone();
+        let logical = accepted.logical_turn_id.clone();
+        let chat = accepted.chat_id.clone();
+        generations.insert(chat.clone(), logical.clone());
+        self.auto.on_chat_superseded(&chat);
+        let (tx, rx) = oneshot::channel();
+        let completion = std::mem::replace(&mut accepted.completion, rx);
+        tasks.spawn(async move {
+            let mut result = completion.await.unwrap_or(Err(GatewayError::Unavailable));
+            // Canlı probe global kilit dışında çözülür; kilit yalnız nesil kontrolü ve kayıt içindir.
+            let resolved = match (&result, pending.lock().ok().and_then(|mut pending| pending.remove(&logical))) {
+                (Ok(done), Some(attempt)) if done.outcome == CompletionOutcome::QuotaExhausted => {
+                    let reset_at = auto.resolve_reset(&attempt).await;
+                    Some((attempt, reset_at))
+                }
+                _ => None,
+            };
+            // Kayıt, kabul/iptal ile aynı kapıdan geçer. Nesil kapıyı daha önce alan yeni
+            // mesajın veya iptalin eski kaydı açmasını engeller.
+            let mut generations = registrations.lock().await;
+            let current = generations.get(&chat) == Some(&logical);
+            if let (Some((attempt, reset_at)), Ok(done)) = (resolved, &result) {
+                if current {
+                    if auto.register_resolved(attempt, reset_at).await.is_err() {
+                        let _ = db.interrupt_telegram_turn(&logical, done.end_seq);
+                        result = Err(GatewayError::NeedsAttention);
+                    }
+                } else if db.interrupt_telegram_turn(&logical, done.end_seq).is_err() {
+                    result = Err(GatewayError::NeedsAttention);
+                }
+            }
+            if current { generations.remove(&chat); }
+            let _ = tx.send(result);
+        });
+        Ok(accepted)
+    }
+
+    async fn submit_local(&self, request: SubmitUserMessage) -> Result<(AcceptedTurn, i64), GatewayError> {
+        let mut generations = self.registrations.lock().await;
+        let (accepted, cursor) = self.service.submit_local_with_cursor(request)?;
+        Ok((self.accepted(accepted, &mut generations)?, cursor))
+    }
+
+    fn check_existing_chat(&self, chat: &str) -> Result<()> {
+        anyhow::ensure!(valid_chat_id(chat), "geçersiz sohbet kimliği");
+        anyhow::ensure!(self.db.get_chat(chat)?.is_some(), "sohbet bulunamadı");
+        Ok(())
+    }
+
+    async fn cancel_chat(&self, chat: &str) -> Result<()> {
+        self.check_existing_chat(chat)?;
+        let mut generations = self.registrations.lock().await;
+        let cancelled = self.auto.cancel_chat(chat)?;
+        let pending = generations.remove(chat).is_some();
+        match self.manager.cancel(chat).await {
+            Err(error) if cancelled == 0 && !pending => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    async fn switch_chat(&self, chat: &str, to: EngineId) -> Result<()> {
+        self.check_existing_chat(chat)?;
+        let mut generations = self.registrations.lock().await;
+        self.manager.switch(chat, to, SwitchReason::User).await?;
+        self.auto.cancel_chat(chat)?;
+        generations.remove(chat);
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        let _ = self.service.shutdown().await;
+        let tasks = self.tasks.lock().ok().and_then(|mut tasks| tasks.take());
+        if let Some(mut tasks) = tasks { tasks.shutdown().await; }
+        if let Ok(mut pending) = self.pending.lock() { pending.clear(); }
+        self.registrations.lock().await.clear();
+    }
+}
+
+impl GatewayApplication for DaemonApplication {
+    fn submit_user_message(&self, request: SubmitUserMessage) -> BoxFuture<'_, Result<AcceptedTurn, GatewayError>> {
+        Box::pin(async move {
+            let mut generations = self.registrations.lock().await;
+            self.accepted(self.service.submit_user_message(request).await?, &mut generations)
+        })
+    }
+    fn resume_quota_step(&self, request: ResumeQuotaStep) -> BoxFuture<'_, Result<AcceptedTurn, GatewayError>> { self.service.resume_quota_step(request) }
+    fn resolve_tool_approval<'a>(&'a self, origin: TurnOrigin, id: &'a str, approve: bool) -> BoxFuture<'a, Result<ultron_core::db::approvals::ApprovalStatus, GatewayError>> { self.service.resolve_tool_approval(origin, id, approve) }
+    fn status_snapshot(&self) -> BoxFuture<'_, Result<GatewayStatusSnapshot, GatewayError>> { self.service.status_snapshot() }
+    fn list_chats(&self) -> BoxFuture<'_, Result<Vec<ipc::ChatInfo>, GatewayError>> { self.service.list_chats() }
+    fn route<'a>(&'a self, text: &'a str, last: Option<&'a str>) -> BoxFuture<'a, Result<ipc::RouteResult, GatewayError>> { self.service.route(text, last) }
+    fn quota_report(&self) -> BoxFuture<'_, Result<ultron_core::quota::QuotaReport, GatewayError>> { self.service.quota_report() }
+    fn get_binding(&self, user: i64) -> BoxFuture<'_, Result<Option<String>, GatewayError>> { self.service.get_binding(user) }
+    fn set_binding<'a>(&'a self, user: i64, chat: Option<&'a str>) -> BoxFuture<'a, Result<(), GatewayError>> { self.service.set_binding(user, chat) }
+}
+
+struct DbOrigins { db: Arc<Db>, paths: Paths }
+impl crate::telegram::notifications::OriginReader for DbOrigins {
+    fn origins_for_chat<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<Vec<ultron_core::db::telegram::TelegramTurnOrigin>, GatewayError>> {
+        Box::pin(async move {
+            // Core tekil canonical okuyucusunu kullanır; salt okunur bağlantı yalnız kimlikleri listeler.
+            let connection = rusqlite::Connection::open_with_flags(&self.paths.db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| GatewayError::Unavailable)?;
+            let mut query = connection.prepare("SELECT logical_turn_id FROM telegram_turn_origins WHERE chat_id = ?1 ORDER BY start_seq")
+                .map_err(|_| GatewayError::Unavailable)?;
+            let ids = query.query_map([chat], |row| row.get::<_, String>(0)).map_err(|_| GatewayError::Unavailable)?;
+            let mut origins = Vec::new();
+            for id in ids {
+                if let Some(origin) = self.db.telegram_turn_origin(&id.map_err(|_| GatewayError::Unavailable)?)
+                    .map_err(|_| GatewayError::Unavailable)? { origins.push(origin); }
+            }
+            Ok(origins)
+        })
+    }
+}
+
+struct CallbackAdapter {
+    callbacks: ApprovalCallbacks,
+    approvals: Arc<approvals::Approvals>,
+    notified: Mutex<std::collections::HashSet<String>>,
+}
+impl GatewayCallbacks for CallbackAdapter {
+    fn handle<'a>(&'a self, query: &'a TelegramCallbackQuery, origin: TurnOrigin) -> BoxFuture<'a, Result<(), GatewayError>> {
+        Box::pin(async move {
+            let TurnOrigin::Telegram { user_id, private_chat_id, update_id } = origin else { return Err(GatewayError::Unauthorized); };
+            if query.from.id != user_id || private_chat_id != user_id { return Err(GatewayError::Unauthorized); }
+            self.callbacks.handle_callback(update_id, query).await.map(|_| ())
+        })
+    }
+    fn notify<'a>(&'a self, id: &'a str, recipient: i64) -> BoxFuture<'a, Result<(), GatewayError>> {
+        Box::pin(async move {
+            self.callbacks.notify(id, recipient, recipient).await.map_err(|_| GatewayError::Unavailable)?;
+            self.notified.lock().map_err(|_| GatewayError::Unavailable)?.insert(id.into());
+            Ok(())
+        })
+    }
+}
+impl CallbackAdapter {
+    async fn maintain(&self, cancel: CancellationToken) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! { biased; () = cancel.cancelled() => break, _ = tick.tick() => {} }
+            let _ = self.callbacks.prune_expired();
+            let ids = self.notified.lock().map(|ids| ids.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+            for id in ids {
+                if self.approvals.get(&id).ok().flatten().is_some_and(|a| a.status != ultron_core::db::approvals::ApprovalStatus::Pending) {
+                    let refreshed = tokio::select! { biased; () = cancel.cancelled() => return, result = self.callbacks.refresh_resolved(&id) => result };
+                    if matches!(refreshed, Ok(None)) && let Ok(mut ids) = self.notified.lock() { ids.remove(&id); }
+                }
+            }
+        }
+    }
+}
+
+struct GatewayRun { cancel: CancellationToken, task: tokio::task::JoinHandle<()> }
+struct DaemonGateway {
+    db: Arc<Db>, log: Arc<EventLog>, paths: Paths,
+    approvals: Arc<approvals::Approvals>, app: Arc<DaemonApplication>,
+    settings: Arc<RwLock<ultron_core::config::TelegramConfig>>,
+    clock: Arc<dyn Clock>, presence: Arc<DesktopPresence>, factory: TransportFactory,
+    health: watch::Sender<GatewayHealth>,
+    transport: RwLock<Option<Arc<dyn TelegramTransport>>>,
+    run: tokio::sync::Mutex<Option<GatewayRun>>,
+}
+impl DaemonGateway {
+    async fn stop_locked(&self, run: &mut Option<GatewayRun>) {
+        // Bekleyen restart future'ı iptal edilse bile JoinHandle slotta kalır;
+        // sonraki restart eski görevi join etmeden poller oluşturamaz.
+        if let Some(old) = run.as_mut() { old.cancel.cancel(); let _ = (&mut old.task).await; }
+        *run = None;
+        if let Ok(mut transport) = self.transport.write() { *transport = None; }
+        let _ = self.app.service.set_bot_identity(None);
+    }
+    async fn shutdown(&self) {
+        self.stop_locked(&mut *self.run.lock().await).await;
+    }
+}
+impl GatewayLifecycle for DaemonGateway {
+    fn health(&self) -> GatewayHealth { *self.health.borrow() }
+    fn transport(&self) -> Option<Arc<dyn TelegramTransport>> {
+        if !self.health.borrow().verified { return None; }
+        self.transport.read().ok().and_then(|transport| transport.clone())
+    }
+    fn restart(&self, token: Option<SecretToken>) -> BoxFuture<'_, Result<(), ipc::TelegramErrorCode>> {
+        Box::pin(async move {
+            let mut run = self.run.lock().await;
+            self.stop_locked(&mut run).await;
+            self.health.send_replace(GatewayHealth::default());
+            if self.settings.read().map_err(|_| ipc::TelegramErrorCode::NotVerified)?.allowed_user_ids.is_empty() { return Ok(()); }
+            let Some(token) = token else { return Ok(()); };
+            let cancel = CancellationToken::new();
+            let (transport, poller) = (self.factory)(token, cancel.clone())?;
+            *self.transport.write().map_err(|_| ipc::TelegramErrorCode::NotVerified)? = Some(transport.clone());
+            self.health.send_replace(GatewayHealth { token_present: true, verified: false, error: None });
+            let callbacks = Arc::new(CallbackAdapter {
+                callbacks: ApprovalCallbacks::new(self.approvals.clone(), self.app.clone(), transport.clone(), self.settings.clone(), self.clock.clone()),
+                approvals: self.approvals.clone(), notified: Mutex::new(Default::default()),
+            });
+            let db = self.db.clone(); let log = self.log.clone(); let app = self.app.clone();
+            let approvals = self.approvals.clone(); let clock = self.clock.clone();
+            let presence = self.presence.clone(); let settings = self.settings.clone(); let health = self.health.clone();
+            let origins = Arc::new(DbOrigins { db: db.clone(), paths: self.paths.clone() });
+            let child = cancel.clone();
+            let task = tokio::spawn(async move {
+                let maintenance = callbacks.maintain(child.clone());
+                let polling = async {
+                    let mut failures = 0u32;
+                    loop {
+                        let service = app.service.clone();
+                        let deps = GatewayDependencies {
+                            db: db.clone(), log: log.clone(), approvals: approvals.clone(), app: app.clone(),
+                            transport: transport.clone(), poller: poller.clone(), callbacks: callbacks.clone(), origins: origins.clone(),
+                            clock: clock.clone(), presence: presence.clone(), config: settings.clone(), health: health.clone(),
+                            on_verified: Arc::new(move |id| service.set_bot_identity(Some(id))),
+                        };
+                        let error = match bridge::run_gateway(deps, child.clone()).await {
+                            Ok(_) => break,
+                            Err(bridge::GatewayRunError::Transport(code)) => code,
+                            Err(_) => ipc::TelegramErrorCode::InvalidResponse,
+                        };
+                        health.send_modify(|h| { h.verified = false; h.error = Some(error); });
+                        if matches!(error, ipc::TelegramErrorCode::InvalidToken | ipc::TelegramErrorCode::Unauthorized) { break; }
+                        failures = failures.saturating_add(1);
+                        tokio::select! { biased; () = child.cancelled() => break,
+                            () = clock.sleep_until(clock.now_monotonic() + Duration::from_secs(1u64 << failures.min(6))) => {} }
+                    }
+                };
+                tokio::pin!(polling, maintenance);
+                tokio::select! {
+                    () = &mut polling => { child.cancel(); maintenance.await; },
+                    () = &mut maintenance => { child.cancel(); polling.await; },
+                }
+                let _ = callbacks.callbacks.clear();
+            });
+            *run = Some(GatewayRun { cancel, task });
+            Ok(())
+        })
+    }
+}
+
 struct State {
-    manager: SessionManager,
     db: Arc<Db>,
     log: Arc<EventLog>,
     token: String,
     approver_token: String,
     keep: KeepAwake,
     default_engine: EngineId,
-    turns: Mutex<JoinSet<()>>,
+    app: Arc<DaemonApplication>,
+    telegram: Arc<TelegramControl>,
+    presence: Arc<DesktopPresence>,
     paths: Paths,
-    quota: ultron_core::quota::QuotaService,
-    approvals: approvals::Approvals,
+    quota: Arc<ultron_core::quota::QuotaService>,
+    approvals: Arc<approvals::Approvals>,
     /// İçe aktarma/silme işlemleri tek seferde bir tane çalışır.
     import_lock: tokio::sync::Mutex<()>,
 }
@@ -73,6 +443,22 @@ fn require_approver(auth: &ConnectionAuth) -> Result<()> {
         return Err(anyhow!("yetkisiz: onaylayıcı rolü gerekli"));
     }
     Ok(())
+}
+
+fn gateway_error(error: GatewayError) -> anyhow::Error {
+    anyhow!(match error {
+        GatewayError::Busy => "bu sohbette çalışan bir tur var",
+        GatewayError::Unauthorized => "yetkisiz: onaylayıcı rolü gerekli",
+        GatewayError::InvalidInput => "geçersiz tur veya Telegram ayarı",
+        GatewayError::NotFound => "kayıt bulunamadı",
+        GatewayError::StaleGeneration => "istek artık güncel değil",
+        GatewayError::NeedsAttention => "işlem için masaüstünde kontrol gerekli",
+        GatewayError::Unavailable => "tur veya Telegram servisi kullanılamıyor",
+    })
+}
+
+fn telegram_error(error: ipc::TelegramErrorCode) -> anyhow::Error {
+    anyhow!("Telegram: {error:?}")
 }
 
 // Aynı masaüstünün iki penceresi birbirinin dosya işlemiyle yarışmaz.
@@ -292,9 +678,16 @@ pub struct ServerHandle {
     token: String,
     approver_token: String,
     keep: KeepAwake,
+    #[cfg(test)]
+    registrations: Registrations,
 }
 
 impl ServerHandle {
+    #[cfg(test)]
+    pub(crate) async fn tracked_turns(&self) -> usize {
+        self.registrations.lock().await.len()
+    }
+
     pub fn pipe_name(&self) -> &str {
         &self.pipe_name
     }
@@ -307,9 +700,9 @@ impl ServerHandle {
         &self.approver_token
     }
 
-    /// Şu an çalışan tur sayısı (keep-awake tutucuları).
+    /// Kota zamanlayıcıları çalışan tur sayısına dahil değildir.
     pub fn running_turns(&self) -> usize {
-        self.keep.holders()
+        self.keep.holders_for(KeepAwakeReason::Turn)
     }
 
     /// Dinlemeyi durdurur, bağlantıları ve çalışan turları sonlandırır, tek örnek kilidini bırakır.
@@ -411,6 +804,10 @@ pub fn summarizer_kind(cfg: &Config) -> &'static str {
 
 /// Sunucuyu başlatır: kilit, token, kurtarma, pipe. Çağıranın tokio çalışma zamanında olması gerekir.
 pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
+    start_inner(config, ServerDependencies::production()).await
+}
+
+async fn start_inner(config: ServerConfig, deps: ServerDependencies) -> Result<ServerHandle> {
     let ServerConfig {
         paths,
         pipe_name,
@@ -424,12 +821,13 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
 
     let db = Arc::new(Db::open(&paths.db)?);
     let log = Arc::new(EventLog::new(db.clone(), paths.clone()));
-    let approvals = approvals::Approvals::new(db.clone(), log.clone(), paths.clone());
+    let approvals = Arc::new(approvals::Approvals::new(db.clone(), log.clone(), paths.clone()));
     approvals.recover_pending()?;
     let recovered = recover_interrupted(&db, &log)?;
     if recovered > 0 {
         tracing::warn!(recovered, "yarım kalan oturumlar Interrupted yapıldı");
     }
+    db.recover_telegram_inbox()?;
 
     // İki token da pipe'tan önce yazılır; eksik rol dosyasıyla servis hazır sayılmaz.
     let token = sys::random_token()?;
@@ -444,24 +842,58 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
 
     let keep = KeepAwake::new();
     let summarizer = select_summarizer(&paths, &cfg)?;
+    let manager = Arc::new(SessionManager::new(db.clone(), log.clone(), cfg.clone(), engines)
+        .with_summarizer(summarizer));
+    let settings = Arc::new(RwLock::new(cfg.telegram.clone()));
+    let presence = Arc::new(DesktopPresence::new(deps.clock.clone()));
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let registrations = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let service = Arc::new(TurnService::new(TurnServiceDependencies {
+        manager: manager.clone(), db: db.clone(), log: log.clone(), paths: paths.clone(), config: cfg.clone(),
+        telegram: settings.clone(), bot_id: None,
+        user_home: deps.user_home,
+        executor: Arc::new(SessionExecutor { manager: manager.clone(), pending: pending.clone() }),
+        resolver: Arc::new(approvals::SharedToolApprovalResolver::new(approvals.clone(), settings.clone())),
+        approvals: approvals.clone(), quota: deps.quota.clone(), presence: presence.clone(), keep: keep.clone(),
+    }).map_err(|_| anyhow!("tur servisi başlatılamadı"))?);
+    // Settings watch, Control kurulduktan sonra bağlanır; aynı Arc tüm katmanlarda paylaşılır.
+    let (updates_tx, updates_rx) = watch::channel(ipc::TelegramSettings::from(&cfg.telegram));
+    let auto = AutoContinue::new(AutoContinueDeps {
+        db: db.clone(), log: log.clone(), resumer: service.clone(), settings: settings.clone(),
+        settings_updates: Some(updates_rx),
+        eligible_engines: cfg.engines.iter().filter(|e| e.enabled).map(|e| e.id).collect(),
+        clock: deps.clock.clone(), keep: keep.clone(),
+        probe: deps.reset_probe.unwrap_or_else(|| Arc::new(QuotaServiceProbe::new(deps.quota.clone(), paths.clone()))),
+    });
+    let app = Arc::new(DaemonApplication { service, manager, db: db.clone(), auto, pending, registrations: registrations.clone(), tasks: Mutex::new(Some(JoinSet::new())) });
+    let (health, _) = watch::channel(GatewayHealth::default());
+    let gateway = Arc::new(DaemonGateway {
+        db: db.clone(), log: log.clone(), paths: paths.clone(), approvals: approvals.clone(), app: app.clone(),
+        settings: settings.clone(), clock: deps.clock, presence: presence.clone(), factory: deps.transport,
+        health, transport: RwLock::new(None), run: tokio::sync::Mutex::new(None),
+    });
+    let telegram = Arc::new(TelegramControl::new(paths.clone(), settings, deps.credentials, gateway.clone())
+        .map_err(|_| anyhow!("Telegram yönetimi başlatılamadı"))?);
+    let mut settings_updates = telegram.subscribe_settings();
+    app.auto.start()?;
+    // Eksik credential/ağ bağlantısı IPC daemon'ının başlamasını engellemez; status gerçek hatayı gösterir.
+    let _ = telegram.initialize().await;
     let state = Arc::new(State {
-        manager: SessionManager::new(db.clone(), log.clone(), cfg.clone(), engines)
-            .with_summarizer(summarizer),
         db,
         log,
         token: token.clone(),
         approver_token: approver_token.clone(),
         keep: keep.clone(),
         default_engine: cfg.default_engine,
-        turns: Mutex::new(JoinSet::new()),
+        app, telegram, presence,
         paths: paths.clone(),
-        quota: ultron_core::quota::QuotaService::from_env(),
+        quota: deps.quota,
         approvals,
         import_lock: tokio::sync::Mutex::new(()),
     });
 
     let cancel = CancellationToken::new();
-    tokio::spawn(trash_retention_loop(paths.clone(), cancel.clone()));
+    let trash_task = tokio::spawn(trash_retention_loop(paths.clone(), cancel.clone()));
     let loop_cancel = cancel.clone();
     let loop_name = pipe_name.clone();
     let task = tokio::spawn(async move {
@@ -471,6 +903,9 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
             tokio::select! {
                 () = loop_cancel.cancelled() => break,
                 Some(_) = conns.join_next(), if !conns.is_empty() => {}
+                result = settings_updates.changed() => {
+                    if result.is_ok() { updates_tx.send_replace(settings_updates.borrow_and_update().clone()); }
+                }
                 connected = server.connect() => {
                     if let Err(e) = connected {
                         tracing::warn!(error = %e, "pipe bağlantısı başarısız");
@@ -487,10 +922,12 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
                 }
             }
         }
+        loop_cancel.cancel();
         conns.shutdown().await;
-        if let Ok(mut turns) = state.turns.lock() {
-            turns.abort_all();
-        }
+        gateway.shutdown().await;
+        state.app.auto.shutdown().await;
+        state.app.shutdown().await;
+        let _ = trash_task.await;
     });
 
     Ok(ServerHandle {
@@ -500,6 +937,8 @@ pub async fn start(config: ServerConfig) -> Result<ServerHandle> {
         token,
         approver_token,
         keep,
+        #[cfg(test)]
+        registrations,
     })
 }
 
@@ -637,7 +1076,6 @@ fn set_reset_rights(paths: &Paths, pool: &str, count: u32) -> Result<()> {
     }
     // Daemon düzeyinde seri hale getirme; okuma yazmadan hemen önce yapılır ki dışarıdan
     // yapılan düzenlemeler (ör. `claude_live_quota`) ezilmesin.
-    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
     let _guard = CONFIG_LOCK
         .lock()
         .map_err(|_| anyhow!("config kilidi zehirlendi"))?;
@@ -696,25 +1134,12 @@ mod config_error_tests {
     }
 }
 
-/// Yol, kullanıcının ev dizini mi (büyük/küçük harf ve sembolik bağdan bağımsız)?
-fn is_user_home(path: &Path) -> bool {
-    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
-        return false;
-    };
-    let norm = |p: &Path| {
-        std::fs::canonicalize(p)
-            .unwrap_or_else(|_| p.to_path_buf())
-            .to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .to_lowercase()
-    };
-    norm(path) == norm(Path::new(&home))
-}
 
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
 
 /// Full tur için yalnız onaylayıcı bağlantısının verdiği, hâlâ geçerli karar kabul edilir.
-async fn wait_elevation(st: &State, id: &str, cancel: &CancellationToken) -> Result<()> {
+#[cfg(test)]
+async fn wait_elevation(db: &Db, approvals: &approvals::Approvals, id: &str, cancel: &CancellationToken) -> Result<()> {
     use ultron_core::db::approvals::{ApprovalStatus, ResolvedBy};
     let deadline = tokio::time::sleep(Duration::from_secs(u64::from(approvals::MAX_APPROVAL_WAIT_SECS)));
     tokio::pin!(deadline);
@@ -723,20 +1148,20 @@ async fn wait_elevation(st: &State, id: &str, cancel: &CancellationToken) -> Res
         tokio::select! {
             biased;
             () = cancel.cancelled() => {
-                let _ = st.approvals.resolve(id, false, ResolvedBy::Timeout);
+                let _ = approvals.resolve(id, false, ResolvedBy::Timeout);
                 return Err(anyhow!("yükseltme bekleyen tur iptal edildi"));
             }
             () = &mut deadline => {
-                let _ = st.approvals.resolve(id, false, ResolvedBy::Timeout);
+                let _ = approvals.resolve(id, false, ResolvedBy::Timeout);
                 return Err(anyhow!("yükseltme onay süresi doldu"));
             }
             _ = tick.tick() => {
-                let row = st.db.get_approval(id)?.ok_or_else(|| anyhow!("yükseltme onayı bulunamadı"))?;
+                let row = db.get_approval(id)?.ok_or_else(|| anyhow!("yükseltme onayı bulunamadı"))?;
                 match row.status {
                     ApprovalStatus::Pending => {}
                     ApprovalStatus::Approved if row.resolved_by == Some(ResolvedBy::Approver) => {
                         // Karar DB'ye yazılıp döküm/yayın başarısız olmuşsa tur başlamaz.
-                        if st.db.approval_outbox()?.is_empty() {
+                        if db.approval_outbox()?.is_empty() {
                             return Ok(());
                         }
                     }
@@ -747,70 +1172,8 @@ async fn wait_elevation(st: &State, id: &str, cancel: &CancellationToken) -> Res
     }
 }
 
-/// Denetim raporu normal olay günlüğünden geçer: SQLite, döküm ve tüm aboneler.
-fn persist_audit(log: &EventLog, report: ultron_core::session::audit::AuditReport) -> Result<()> {
-    for violation in report.violations {
-        log.append(
-            &report.chat_id,
-            Some(&report.session_id),
-            EngineEvent::PolicyViolation {
-                command: violation.command,
-                category: violation.category,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-/// Abonelik turdan önce kurulur; son rapor kalıcılaşmadan Send tamamlanmaz.
-async fn send_audited(
-    st: &State,
-    reservation: ultron_core::session::TurnReservation,
-    chat_id: &str,
-    cwd: &Path,
-    engine: EngineId,
-    text: &str,
-    policy: ToolPolicy,
-) -> Result<TurnOutcome> {
-    let mut audits = st.manager.subscribe_audits();
-    let turn = st.manager.send_reserved(reservation, chat_id, cwd, engine, text, policy);
-    tokio::pin!(turn);
-    let mut audit_error = None;
-    let result = loop {
-        tokio::select! {
-            biased;
-            report = audits.recv(), if audit_error.is_none() => {
-                match report {
-                    Ok(report) if report.chat_id == chat_id => {
-                        if let Err(error) = persist_audit(&st.log, report) {
-                            audit_error = Some(error);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => audit_error = Some(anyhow!("tur denetimi akışı kayıpsız alınamadı")),
-                }
-            }
-            result = &mut turn => break result,
-        }
-    };
-    // Tur future'ı aynı poll içinde rapor üretip tamamlanmış olabilir.
-    while audit_error.is_none() {
-        match audits.try_recv() {
-            Ok(report) if report.chat_id == chat_id => {
-                if let Err(error) = persist_audit(&st.log, report) {
-                    audit_error = Some(error);
-                }
-            }
-            Ok(_) => {}
-            Err(broadcast::error::TryRecvError::Empty) => break,
-            Err(_) => audit_error = Some(anyhow!("tur denetimi akışı kayıpsız alınamadı")),
-        }
-    }
-    match audit_error {
-        Some(error) => Err(error.context("politika ihlalleri kalıcılaştırılamadı")),
-        None => result,
-    }
-}
+#[cfg(test)]
+use crate::turn_service::persist_audit;
 
 /// IPC'den gelen katalog yolunu sınırlı okur: düzenli dosya, `.md`/`.txt`, en çok 1 MiB.
 async fn read_catalog_file(path: &Path) -> Result<String> {
@@ -853,13 +1216,36 @@ async fn dispatch(
     cancel: &CancellationToken,
 ) -> Result<Flow> {
     match request {
-        Request::TelegramStatus
-        | Request::TelegramSetToken { .. }
-        | Request::TelegramTest
-        | Request::GetTelegramSettings
-        | Request::SetTelegramSettings { .. }
-        | Request::DesktopHeartbeat { .. } => {
-            send_error(writer, "Telegram ağ geçidi henüz bağlanmadı").await;
+        Request::TelegramStatus => {
+            ok(writer, serde_json::to_value(st.telegram.status().map_err(gateway_error)?)?).await?;
+            Ok(Flow::Continue)
+        }
+        Request::GetTelegramSettings => {
+            ok(writer, serde_json::to_value(st.telegram.settings().map_err(gateway_error)?)?).await?;
+            Ok(Flow::Continue)
+        }
+        Request::TelegramSetToken { token } => {
+            require_approver(auth)?;
+            st.telegram.set_token(ControlRole::Approver, token).await.map_err(telegram_error)?;
+            ok(writer, json!({"saved": true})).await?;
+            Ok(Flow::Continue)
+        }
+        Request::TelegramTest => {
+            require_approver(auth)?;
+            ok(writer, serde_json::to_value(st.telegram.test(ControlRole::Approver).await.map_err(telegram_error)?)?).await?;
+            Ok(Flow::Continue)
+        }
+        Request::SetTelegramSettings { notify, auto_continue_enabled, auto_continue_wait_minutes, fallback_order } => {
+            require_approver(auth)?;
+            st.telegram.set_settings(ControlRole::Approver, ipc::TelegramSettings { notify, auto_continue_enabled, auto_continue_wait_minutes, fallback_order })
+                .await.map_err(gateway_error)?;
+            ok(writer, serde_json::to_value(st.telegram.settings().map_err(gateway_error)?)?).await?;
+            Ok(Flow::Continue)
+        }
+        Request::DesktopHeartbeat { instance_id } => {
+            require_approver(auth)?;
+            st.presence.heartbeat(ControlRole::Approver, &instance_id).map_err(gateway_error)?;
+            ok(writer, json!({"away": st.presence.is_away()})).await?;
             Ok(Flow::Continue)
         }
         Request::TrashList => {
@@ -942,13 +1328,21 @@ async fn dispatch(
             Ok(Flow::Continue)
         }
         Request::ResolveApproval { id, approve, by } => {
-            use ultron_core::db::approvals::ResolvedBy;
             require_approver(auth)?;
             if !matches!(by.as_str(), "desktop" | "telegram") {
                 return Err(anyhow!("geçersiz onay etiketi (desktop|telegram)"));
             }
             // Eski `by` yalnız uyumlu bir etikettir; kalıcı kimlik onaylayıcı bağlantısıdır.
-            let approval = st.approvals.resolve(&id, approve, ResolvedBy::Approver)?;
+            if let Err(error) = st.app.service.resolve_local_approval(ControlRole::Approver, &id, approve).await {
+                // Ortak resolver güvenli hata sınıfı döndürür; eski IPC'nin tekrar
+                // karar hata sözleşmesi kalıcı durumdan korunur (yarış dahil).
+                if st.approvals.get(&id)?.is_some_and(|a| a.status != ultron_core::db::approvals::ApprovalStatus::Pending)
+                    && st.db.approval_outbox()?.is_empty() {
+                    return Err(anyhow!("onay zaten çözüldü"));
+                }
+                return Err(gateway_error(error));
+            }
+            let approval = st.approvals.get(&id)?.context("onay bulunamadı")?;
             ok(writer, json!({"approval": approval})).await?;
             Ok(Flow::Continue)
         }
@@ -962,7 +1356,9 @@ async fn dispatch(
                 json!({
                     "version": ultron_core::VERSION,
                     "pid": std::process::id(),
-                    "running_turns": st.keep.holders(),
+                    "running_turns": st.keep.holders_for(KeepAwakeReason::Turn),
+                    "quota_wait_tasks": st.app.auto.timer_count(),
+                    "away": st.presence.is_away(),
                     "default_engine": st.default_engine,
                 }),
             )
@@ -1129,12 +1525,12 @@ async fn dispatch(
             Ok(Flow::Continue)
         }
         Request::Switch { chat_id, to } => {
-            st.manager.switch(&chat_id, to, SwitchReason::User).await?;
+            st.app.switch_chat(&chat_id, to).await?;
             ok(writer, json!({"chat_id": chat_id})).await?;
             Ok(Flow::Continue)
         }
         Request::Cancel { chat_id } => {
-            st.manager.cancel(&chat_id).await?;
+            st.app.cancel_chat(&chat_id).await?;
             ok(writer, json!({"chat_id": chat_id})).await?;
             Ok(Flow::Continue)
         }
@@ -1151,121 +1547,17 @@ async fn dispatch(
             ok(writer, json!({"hits": hits})).await?;
             Ok(Flow::Continue)
         }
-        Request::Send {
-            chat_id,
-            cwd,
-            engine,
-            text,
-            policy,
-            elevated,
-            project_id,
-        } => {
-            let chat_id = chat_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-            if chat_id.is_empty()
-                || !chat_id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Err(anyhow!("geçersiz sohbet kimliği: {chat_id}"));
+        Request::Send { chat_id, cwd, engine, text, policy, elevated, project_id } => {
+            if let Some(id) = &project_id {
+                anyhow::ensure!(st.db.get_project(id)?.is_some(), "proje bulunamadı: {id}");
             }
-            // Projeye bağlı gönderimde çalışma dizini projenin yoludur.
-            let project = match &project_id {
-                Some(pid) => Some(
-                    st.db
-                        .get_project(pid)?
-                        .ok_or_else(|| anyhow!("proje bulunamadı: {pid}"))?,
-                ),
-                None => None,
-            };
-            let cwd = match &project {
-                Some(p) => p.path.clone(),
-                // Projesiz sohbet kullanıcının ev dizininde çalışmaz: sohbete özel çalışma alanı.
-                None if cwd.trim().is_empty() || is_user_home(Path::new(&cwd)) => {
-                    let dir = st.paths.root.join("workspaces").join(&chat_id);
-                    std::fs::create_dir_all(&dir).with_context(|| {
-                        format!("çalışma alanı oluşturulamadı: {}", dir.display())
-                    })?;
-                    dir.to_string_lossy().into_owned()
-                }
-                None => cwd,
-            };
-            if !Path::new(&cwd).is_absolute() {
-                return Err(anyhow!("cwd mutlak bir yol olmalı: {cwd}"));
-            }
-            // Kabulden önce: motor kayıtlı mı ve sohbette tur çalışıyor mu. Hata burada dönerse
-            // istemci kabul yanıtı görmez; tur kilidi kabul öncesi ayrılır.
-            let pre_engine = match engine {
-                Some(engine) => engine,
-                None => st.db.chat_engine(&chat_id)?.unwrap_or(st.default_engine),
-            };
-            let mut reservation = st.manager.reserve_turn(&chat_id, pre_engine)?;
-            let policy = if elevated { ToolPolicy::Full } else { policy.into() };
-            st.db.insert_chat(&chat_id, None, "", chrono::Utc::now())?;
-            if let Some(project) = &project {
-                let bound = st.db.get_chat(&chat_id)?.and_then(|c| c.project_id);
-                if bound.as_ref().is_some_and(|b| *b != project.id) {
-                    return Err(anyhow!("sohbet başka bir projeye bağlı: {chat_id}"));
-                }
-                st.db.bind_chat_project(&chat_id, &project.id)?;
-            }
-            st.db.touch_chat(&chat_id, &text)?;
-            // Motor verilmezse mevcut sohbetin motoru kullanılır (sessiz motor değişimi olmaz).
-            let engine = pre_engine;
-            let mut last_seq = st.db.next_seq(&chat_id)? - 1;
             let mut wake = st.log.subscribe();
             let mut approval_wake = st.approvals.subscribe_global();
-            let elevation = if policy == ToolPolicy::Full {
-                let approval = st.manager.request_elevation(&mut reservation, Path::new(&cwd), &text)?;
-                st.approvals.publish_pending()?;
-                Some(approval)
-            } else {
-                None
-            };
-            let guard = st.keep.acquire();
-            let (done_tx, mut done_rx) = oneshot::channel();
-            {
-                let task_state = st.clone();
-                let task_chat = chat_id.clone();
-                let mut turns = st
-                    .turns
-                    .lock()
-                    .map_err(|_| anyhow!("tur kaydı kilidi zehirlendi"))?;
-                while turns.try_join_next().is_some() {}
-                turns.spawn(async move {
-                    let result = async {
-                        if let Some(approval) = elevation {
-                            wait_elevation(&task_state, &approval.id, &reservation.cancellation_token()).await?;
-                        }
-                        // Tur süresince geçerli çöp kutusu yetkisi (tur bitince düşer).
-                        let _grant = ultron_core::turn_grant::issue(&task_chat, Path::new(&cwd));
-                        send_audited(
-                            &task_state,
-                            reservation,
-                            &task_chat,
-                            Path::new(&cwd),
-                            engine,
-                            &text,
-                            policy,
-                        )
-                        .await
-                    }.await;
-                    // Kabulden sonraki hata yalnız bu bağlantıya gitmesin: sohbet günlüğüne yazılır,
-                    // böylece her abone görür.
-                    if let Err(e) = &result
-                        && let Err(log_err) = task_state.log.append(
-                            &task_chat,
-                            None,
-                            EngineEvent::Error {
-                                message: format!("{e:#}"),
-                            },
-                        )
-                    {
-                        tracing::error!(error = %log_err, "tur hatası günlüğe yazılamadı");
-                    }
-                    drop(guard);
-                    let _ = done_tx.send(result);
-                });
-            }
+            let (accepted, mut last_seq) = st.app.submit_local(SubmitUserMessage {
+                chat_id, cwd: cwd.into(), engine, text, policy, elevated, project_id, origin: TurnOrigin::Local,
+            }).await.map_err(gateway_error)?;
+            let chat_id = accepted.chat_id;
+            let mut done_rx = accepted.completion;
             ok(writer, json!({"chat_id": chat_id})).await?;
             loop {
                 flush_events(st, &chat_id, &mut last_seq, writer).await?;
@@ -1275,10 +1567,18 @@ async fn dispatch(
                         flush_events(st, &chat_id, &mut last_seq, writer).await?;
                         match result {
                             Ok(Ok(outcome)) => {
-                                ok(writer, json!({"done": true, "outcome": outcome_name(&outcome)})).await?;
+                                let application_failure = outcome.outcome == CompletionOutcome::Failed
+                                    && st.db.events_for_chat_page(&chat_id, Some(outcome.end_seq - 1), 1)?
+                                        .first().is_some_and(|event| event.seq == outcome.end_seq && event.session_id.is_none() && event.kind == "error");
+                                if application_failure {
+                                    // Full reddi/uygulama hatası eski Send sözleşmesinde Error'dır.
+                                    send_error(writer, "Tur uygulama katmanında tamamlanamadı").await;
+                                } else {
+                                    ok(writer, json!({"done": true, "outcome": completion_outcome_name(outcome.outcome)})).await?;
+                                }
                             }
                             Ok(Err(e)) => {
-                                send_error(writer, format!("{e:#}")).await;
+                                send_error(writer, gateway_error(e).to_string()).await;
                             }
                             Err(_) => {
                                 send_error(writer, "tur sonlandırıldı").await;
@@ -1323,7 +1623,7 @@ async fn dispatch(
                     return Ok(Flow::Continue);
                 }
                 let mut wake = if follow {
-                    subscribe_and_ack(st, writer, Some(&chat)).await?
+                    subscribe_and_ack(st, writer, Some(&chat)).await?.0
                 } else {
                     st.log.subscribe()
                 };
@@ -1352,15 +1652,17 @@ async fn dispatch(
             }
             None if follow => {
                 let mut approval_wake = st.approvals.subscribe_global();
-                let mut wake = subscribe_and_ack(st, writer, None).await?;
+                let (mut wake, heads) = subscribe_and_ack(st, writer, None).await?;
                 // Sohbet başına son iletilen sıra. Yayın kanalı taşarsa (Lagged) kaçan olaylar
                 // bu imleçlerden itibaren veritabanından tamamlanır.
-                let mut cursors: HashMap<String, i64> = HashMap::new();
+                let mut cursors: HashMap<String, i64> = serde_json::from_value(heads)?;
+                let mut reconcile = tokio::time::interval(Duration::from_millis(100));
                 loop {
                     tokio::select! {
                         () = cancel.cancelled() => return Ok(Flow::Close),
                         event = approval_wake.recv() => match event {
-                            Ok(ev) => write_msg(writer, &Response::Event(ev)).await?,
+                            Ok(ev) if ev.chat_id.is_empty() => write_msg(writer, &Response::Event(ev)).await?,
+                            Ok(ev) => flush_events(st, &ev.chat_id, cursors.entry(ev.chat_id.clone()).or_insert(0), writer).await?,
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 // İstemci ListApprovals ile kalıcı durumdan yeniden eşitlenir.
                                 return Err(anyhow!("onay akışı geride kaldı; onay listesini yeniden okuyun"));
@@ -1369,11 +1671,8 @@ async fn dispatch(
                         },
                         woke = wake.recv() => match woke {
                             Ok(ev) => {
-                                let seen = cursors.get(&ev.chat_id).copied().unwrap_or(0);
-                                if ev.seq > seen {
-                                    cursors.insert(ev.chat_id.clone(), ev.seq);
-                                    write_msg(writer, &Response::Event(ev)).await?;
-                                }
+                                // Kabul edilmiş UserText yalnız DB'de olabilir: aradaki seq'leri de ilet.
+                                flush_events(st, &ev.chat_id, cursors.entry(ev.chat_id.clone()).or_insert(0), writer).await?;
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 for (chat, cursor) in cursors.iter_mut() {
@@ -1381,6 +1680,11 @@ async fn dispatch(
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => return Ok(Flow::Close),
+                        },
+                        _ = reconcile.tick() => {
+                            for chat in st.db.list_chats(None, true)? {
+                                flush_events(st, &chat.id, cursors.entry(chat.id.clone()).or_insert(0), writer).await?;
+                            }
                         },
                         extra = reader.fill_buf() => {
                             if extra.is_ok_and(|b| !b.is_empty()) {
@@ -1420,7 +1724,7 @@ async fn subscribe_and_ack(
     st: &State,
     writer: &mut Writer,
     chat_id: Option<&str>,
-) -> Result<broadcast::Receiver<ultron_core::db::StoredEvent>> {
+) -> Result<(broadcast::Receiver<ultron_core::db::StoredEvent>, Value)> {
     #[cfg(feature = "test-hooks")]
     let gate = SUBSCRIBE_GATE
         .lock()
@@ -1454,7 +1758,7 @@ async fn subscribe_and_ack(
         gate.acknowledge.acquire().await?.forget();
     }
     ok(writer, json!({"subscribed": true, "head_seq": head_seq})).await?;
-    Ok(wake)
+    Ok((wake, head_seq))
 }
 
 /// Kalıcı max(seq); genel akışta {chat_id: seq}, tek sohbette sayı. Onay beklenirken
@@ -1494,12 +1798,12 @@ async fn flush_events(
     }
 }
 
-fn outcome_name(outcome: &TurnOutcome) -> &'static str {
+fn completion_outcome_name(outcome: CompletionOutcome) -> &'static str {
     match outcome {
-        TurnOutcome::Completed => "completed",
-        TurnOutcome::Cancelled => "cancelled",
-        TurnOutcome::QuotaExhausted => "quota_exhausted",
-        TurnOutcome::Failed { .. } => "failed",
+        CompletionOutcome::Completed => "completed",
+        CompletionOutcome::Cancelled => "cancelled",
+        CompletionOutcome::QuotaExhausted => "quota_exhausted",
+        CompletionOutcome::Failed => "failed",
     }
 }
 
@@ -1522,38 +1826,31 @@ mod tests {
         let db = Arc::new(Db::open(&paths.db).unwrap());
         let log = Arc::new(EventLog::new(db.clone(), paths.clone()));
         db.insert_chat("elevation", None, "sentetik", chrono::Utc::now()).unwrap();
-        let st = State {
-            manager: SessionManager::new(db.clone(), log.clone(), Config::default(), HashMap::new()),
-            approvals: approvals::Approvals::new(db.clone(), log.clone(), paths.clone()),
-            db: db.clone(), log, token: String::new(), approver_token: String::new(),
-            keep: KeepAwake::new(), default_engine: EngineId::Codex,
-            turns: Mutex::new(JoinSet::new()), paths: paths.clone(),
-            quota: ultron_core::quota::QuotaService::from_env(), import_lock: tokio::sync::Mutex::new(()),
-        };
+        let approvals = approvals::Approvals::new(db.clone(), log, paths.clone());
         let create = || db.create_approval(Some("elevation"), EngineId::Codex,
             RiskCategory::SystemConfig, "sentetik", &Action::ToolCall {
                 tool: "ultron.turn.elevate".into(), input: json!({"policy": "full"}),
             }).unwrap();
         let row = create();
-        st.approvals.resolve(&row.id, true, ResolvedBy::Desktop).unwrap();
-        assert!(wait_elevation(&st, &row.id, &CancellationToken::new()).await.is_err());
+        approvals.resolve(&row.id, true, ResolvedBy::Desktop).unwrap();
+        assert!(wait_elevation(&db, &approvals, &row.id, &CancellationToken::new()).await.is_err());
         let row = create();
-        st.approvals.resolve(&row.id, true, ResolvedBy::Approver).unwrap();
-        wait_elevation(&st, &row.id, &CancellationToken::new()).await.unwrap();
+        approvals.resolve(&row.id, true, ResolvedBy::Approver).unwrap();
+        wait_elevation(&db, &approvals, &row.id, &CancellationToken::new()).await.unwrap();
         let row = create();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert!(wait_elevation(&st, &row.id, &cancel).await.is_err());
+        assert!(wait_elevation(&db, &approvals, &row.id, &cancel).await.is_err());
         assert_eq!(db.get_approval(&row.id).unwrap().unwrap().status,
             ultron_core::db::approvals::ApprovalStatus::Denied);
         let row = create();
         let transcript = paths.transcripts.join("elevation.jsonl");
         std::fs::remove_file(&transcript).unwrap();
         std::fs::create_dir(&transcript).unwrap();
-        assert!(st.approvals.resolve(&row.id, true, ResolvedBy::Approver).is_err());
+        assert!(approvals.resolve(&row.id, true, ResolvedBy::Approver).is_err());
         // DB'de approved olsa da teslim hatası Full çalıştırma iznine dönüşmez.
         assert!(tokio::time::timeout(Duration::from_millis(80),
-            wait_elevation(&st, &row.id, &CancellationToken::new())).await.is_err());
+            wait_elevation(&db, &approvals, &row.id, &CancellationToken::new())).await.is_err());
     }
 
     #[tokio::test]
@@ -1607,6 +1904,7 @@ mod tests {
     }
 
     async fn start_with(paths: &Paths, pipe: &str, lines: &[&str]) -> ServerHandle {
+        isolate_test_runtime();
         // Birim testlerinde yalnız sahte CLI çalıştırılır.
         static FAKE: std::sync::Once = std::sync::Once::new();
         FAKE.call_once(|| {
