@@ -118,9 +118,9 @@ pub(crate) async fn start_with_test_dependencies(
 type PendingAttempts = Arc<Mutex<HashMap<String, QuotaExhaustedAttempt>>>;
 type Registrations = Arc<tokio::sync::Mutex<HashMap<String, String>>>;
 
-struct SessionExecutor {
-    manager: Arc<SessionManager>,
-    pending: PendingAttempts,
+pub(crate) struct SessionExecutor {
+    pub(crate) manager: Arc<SessionManager>,
+    pub(crate) pending: PendingAttempts,
 }
 
 impl TurnExecutor for SessionExecutor {
@@ -274,7 +274,7 @@ impl GatewayApplication for DaemonApplication {
     fn set_binding<'a>(&'a self, user: i64, chat: Option<&'a str>) -> BoxFuture<'a, Result<(), GatewayError>> { self.service.set_binding(user, chat) }
 }
 
-struct DbOrigins { db: Arc<Db>, paths: Paths }
+pub(crate) struct DbOrigins { pub(crate) db: Arc<Db>, pub(crate) paths: Paths }
 impl crate::telegram::notifications::OriginReader for DbOrigins {
     fn origins_for_chat<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<Vec<ultron_core::db::telegram::TelegramTurnOrigin>, GatewayError>> {
         Box::pin(async move {
@@ -307,9 +307,9 @@ impl GatewayCallbacks for CallbackAdapter {
             self.callbacks.handle_callback(update_id, query).await.map(|_| ())
         })
     }
-    fn notify<'a>(&'a self, id: &'a str, recipient: i64) -> BoxFuture<'a, Result<(), GatewayError>> {
+    fn notify<'a>(&'a self, id: &'a str, recipient: i64) -> BoxFuture<'a, Result<(), crate::telegram::approval_callbacks::CallbackError>> {
         Box::pin(async move {
-            self.callbacks.notify(id, recipient, recipient).await.map_err(|_| GatewayError::Unavailable)?;
+            self.callbacks.notify(id, recipient, recipient).await?;
             self.notified.lock().map_err(|_| GatewayError::Unavailable)?.insert(id.into());
             Ok(())
         })

@@ -836,6 +836,46 @@ async fn quota_resume_refuses_ambiguous_effects_full_and_invalidated_generation(
     assert_eq!(env.reqs[&EngineId::Claude].lock().unwrap().len(), 2);
 }
 
+async fn resume_after_second_quota(first: EngineId, fallback: EngineId, can_resume: bool) {
+    use ultron_core::db::quota_wait::{QuotaWaitProgress, QuotaWaitState, ResumePolicy};
+    const CALL: &str = r#"{"type":"tool_call","tool":"synthetic.write","input":{}}"#;
+    let env = env_with(&[(first, vec![STARTED, QUOTA]), (fallback, vec![STARTED, CALL, QUOTA])]);
+    let chat = "fallback-second-quota";
+    assert_eq!(env.mgr.send(chat, &env.cwd, first, "hedef", ToolPolicy::Workspace).await.unwrap(), TurnOutcome::QuotaExhausted);
+    let wait = quota_wait(&env, chat, ResumePolicy::Workspace);
+    let claimed = env.db.claim_quota_wait(&wait.id, wait.generation, Utc::now()).unwrap().unwrap();
+    let reservation = env.mgr.reserve_turn(chat, fallback).unwrap();
+    let attempt = env.mgr.resume_quota_step(reservation, &wait.id, claimed.generation, fallback).await.unwrap();
+    assert_eq!(attempt.outcome, TurnOutcome::QuotaExhausted);
+    let waiting = env.db.advance_quota_wait(&wait.id, attempt.quota_generation.unwrap(), QuotaWaitState::Waiting,
+        Some(&QuotaWaitProgress { checkpoint_seq: attempt.end_seq, next_engine_index: 1, reset_at: None, next_attempt_at: None }),
+        Utc::now()).unwrap().unwrap();
+    assert_eq!(waiting.engine, first);
+    let claimed = env.db.claim_quota_wait(&wait.id, waiting.generation, Utc::now()).unwrap().unwrap();
+    let reservation = env.mgr.reserve_turn(chat, fallback).unwrap();
+    let result = env.mgr.resume_quota_step(reservation, &wait.id, claimed.generation, fallback).await;
+    let requests = env.reqs[&fallback].lock().unwrap();
+    if can_resume {
+        assert_eq!(result.unwrap().outcome, TurnOutcome::QuotaExhausted);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].prompt.contains("Araç tamamlandı: synthetic.write"));
+    } else {
+        assert!(result.is_err());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(env.db.quota_wait(&wait.id).unwrap().unwrap().state, QuotaWaitState::NeedsAttention);
+    }
+}
+
+#[tokio::test]
+async fn codex_to_claude_second_quota_blocks_unfinished_claude_tool() {
+    resume_after_second_quota(EngineId::Codex, EngineId::Claude, false).await;
+}
+
+#[tokio::test]
+async fn claude_to_codex_second_quota_preserves_completed_codex_tool() {
+    resume_after_second_quota(EngineId::Claude, EngineId::Codex, true).await;
+}
+
 /// Sentetik motorun yeni araç adımı, üretimdeki prepare_command sınırında
 /// kalıcı yeni onayı bekler. Eski bir kararın otomatik devralınması test edilir.
 struct ApprovalGateEngine {

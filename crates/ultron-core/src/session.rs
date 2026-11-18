@@ -731,7 +731,7 @@ impl SessionManager {
             for next in page {
                 after = next.seq;
                 if matches!(next.kind.as_str(), "user_text" | "session_started" | "assistant_text"
-                    | "tool_call" | "tool_result" | "command" | "file_changed" | "turn_completed")
+                    | "tool_call" | "tool_result" | "command" | "file_changed" | "turn_completed" | "turn_cancelled")
                 {
                     bail!("kabul edilmiş kullanıcı olayı artık yürütülemez");
                 }
@@ -746,7 +746,8 @@ impl SessionManager {
     /// temizlenip rastgele işaretli bir veri çiti içinde verilir.
     fn continuation_text(&self, context: &QuotaResumeContext) -> Result<Option<String>> {
         let wait = &context.wait;
-        let mut pending: HashMap<String, usize> = HashMap::new();
+        let mut pending: HashMap<(String, String), usize> = HashMap::new();
+        let mut engines = HashMap::new();
         let mut commands = BTreeSet::new();
         let mut effects: Vec<String> = Vec::new();
         let mut after = wait.user_event_seq;
@@ -758,21 +759,35 @@ impl SessionManager {
                 if event.seq > wait.checkpoint_seq {
                     // Yaşam döngüsü bildirimleri normaldir; yürütme kanıtı checkpoint'i aşamaz.
                     if matches!(event.kind.as_str(), "session_started" | "assistant_text" | "tool_call"
-                        | "tool_result" | "command" | "file_changed" | "turn_completed" | "user_text")
+                        | "tool_result" | "command" | "file_changed" | "turn_completed" | "turn_cancelled" | "user_text")
                     { return Ok(None); }
                     continue;
                 }
                 let parsed: EngineEvent = serde_json::from_value(event.payload)?;
                 let completed = match parsed {
                     EngineEvent::ToolCall { tool, .. } => {
+                        let Some(id) = event.session_id else { return Ok(None); };
+                        let engine = match engines.entry(id.clone()) {
+                            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let Some(engine) = self.db.session_engine(&wait.chat_id, &id)? else { return Ok(None); };
+                                *entry.insert(engine)
+                            },
+                        };
                         // Codex mcp_tool_call yalnız item.completed yolundan gelir.
-                        if wait.engine != EngineId::Codex { *pending.entry(tool).or_default() += 1; }
-                        None
+                        if engine == EngineId::Codex {
+                            Some(format!("Araç tamamlandı: {}", fence_safe(&tool, 80)))
+                        } else {
+                            *pending.entry((id, tool)).or_default() += 1;
+                            None
+                        }
                     },
                     EngineEvent::ToolResult { tool, is_error, .. } => {
-                        if let Some(count) = pending.get_mut(&tool) { *count = count.saturating_sub(1); }
+                        let Some(id) = event.session_id else { continue; };
                         let state = if is_error { "hatalı" } else { "başarılı" };
-                        Some(format!("Araç tamamlandı: {} ({state})", fence_safe(&tool, 80)))
+                        let completed = format!("Araç tamamlandı: {} ({state})", fence_safe(&tool, 80));
+                        if let Some(count) = pending.get_mut(&(id, tool)) { *count = count.saturating_sub(1); }
+                        Some(completed)
                     },
                     EngineEvent::Command { command, exit_code, .. } => {
                         if let Some(code) = exit_code {

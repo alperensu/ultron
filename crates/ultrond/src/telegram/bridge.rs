@@ -13,6 +13,7 @@ use ultron_core::config::TelegramConfig;
 use ultron_core::db::approvals::ApprovalStatus;
 use ultron_core::ipc::TelegramErrorCode;
 use crate::server::approvals::Approvals;
+use super::approval_callbacks::CallbackError;
 use super::client::{BotApiClient, BotApiError};
 use super::commands::{CommandProcessor, CommandResult};
 use super::contracts::*;
@@ -24,6 +25,8 @@ const MAX_ACTIVE_USERS: usize = 32;
 /// Komut yanıtları için replay'in dokunmadığı boş kuyruk payı.
 const OUTBOUND_RESERVE: usize = 16;
 const APPROVAL_RETRY_CAP_SECS: u64 = 300;
+const APPROVAL_SEND_INTERVAL: Duration = Duration::from_millis(250);
+const APPROVAL_RECIPIENT_INTERVAL: Duration = Duration::from_secs(1);
 
 // Task 10 için sağlık sözleşmesi: poller terminal hatayla (InvalidToken, PollConflict/409,
 // Unauthorized, ResponseTooLarge->InvalidResponse) biterken `verified=false` ve `error=Some(kod)`
@@ -47,7 +50,7 @@ pub trait GatewayCallbacks: Send + Sync {
     fn handle<'a>(&'a self, callback: &'a TelegramCallbackQuery, origin: TurnOrigin)
         -> BoxFuture<'a, Result<(), GatewayError>>;
     fn notify<'a>(&'a self, approval_id: &'a str, recipient: i64)
-        -> BoxFuture<'a, Result<(), GatewayError>>;
+        -> BoxFuture<'a, Result<(), CallbackError>>;
 }
 
 pub struct GatewayDependencies {
@@ -103,6 +106,8 @@ fn authorized_user(user: &TelegramUser, chat: &TelegramChat, allowed: &[i64]) ->
 struct Batch { updates: Vec<TelegramUpdate>, acknowledged: oneshot::Sender<Option<i64>> }
 
 async fn poll_loop(deps: &GatewayDependencies, bot: i64, cancel: &CancellationToken, batches: mpsc::Sender<Batch>) -> Result<(), GatewayRunError> {
+    // Ofset doğrulanmış bot kimliğine aittir. Kaydı olmayan bot ofsetsiz başlar;
+    // Telegram'ın beklettiği güncellemeler mesaj tarihine bakılmadan işlenir.
     let mut offset = deps.db.telegram_next_update_id(bot).map_err(|_| GatewayError::Unavailable)?;
     let mut failures = 0u32;
     loop {
@@ -204,7 +209,11 @@ fn live_allowed(deps: &GatewayDependencies) -> Result<Vec<i64>, GatewayError> {
 }
 
 #[derive(Default)]
-struct ApprovalState { notified: HashSet<(String, i64)>, backoff: HashMap<(String, i64), (u32, std::time::Instant)> }
+struct ApprovalState {
+    notified: HashSet<(String, i64)>,
+    backoff: HashMap<(String, i64), (u32, std::time::Instant)>,
+    recipient_next: HashMap<i64, std::time::Instant>,
+}
 
 /// Çağıran lifecycle eski future'ı cancel+join etmeden yenisini başlatmamalıdır.
 /// Boş allowlist ilk ağ çağrısından önce döner. Credential okuma burada yoktur.
@@ -236,9 +245,10 @@ pub async fn run_gateway(deps: GatewayDependencies, cancel: CancellationToken) -
     let mut commands = CommandProcessor::new(deps.db.clone(), deps.app.clone(), deps.clock.clone());
     let mut active = HashMap::new();
     let mut completions = JoinSet::new();
-    let mut approval_state = ApprovalState::default();
+    let (approval_requests, requested) = mpsc::channel(OUTBOUND_RESERVE);
+    let approval_notices = approval_notification_loop(&deps, requested);
     let mut rejected = 0u64;
-    let result = async {
+    let main_loop = async {
         loop {
             let tick = deps.clock.sleep_until(deps.clock.now_monotonic() + Duration::from_secs(1));
             tokio::select! {
@@ -261,6 +271,8 @@ pub async fn run_gateway(deps: GatewayDependencies, cancel: CancellationToken) -
                             }
                             continue;
                         };
+                        // Kabul ve ofset birlikte kalıcıdır. Kurtarma yarım kalan işi
+                        // işaretler; yan etkileri yinelememek için tekrar yürütmez.
                         if deps.db.telegram_next_update_id(bot).map_err(|_| GatewayError::Unavailable)?.is_some_and(|offset| update.update_id < offset) { continue; }
                         let busy = active.contains_key(&user) || active.len() >= MAX_ACTIVE_USERS;
                         let operation = async {
@@ -283,8 +295,15 @@ pub async fn run_gateway(deps: GatewayDependencies, cancel: CancellationToken) -
                             } else { CommandResult::default() };
                             for outbound in result.outbound { enqueue(&deps, &outbound_tx, &in_flight, outbound, &counters)?; }
                             if result.show_approvals {
-                                let count = notify_approvals(&deps, &allowed, &mut approval_state, Some(user)).await?;
-                                if count == 0 { enqueue(&deps, &outbound_tx, &in_flight, notifications::reply(user, "Telegram'dan çözülebilen bekleyen araç onayı yok."), &counters)?; }
+                                let pending = deps.db.list_approvals(Some(ApprovalStatus::Pending)).map_err(|_| GatewayError::Unavailable)?;
+                                let response = if !pending.iter().any(|approval| approval.is_policy_tool()) {
+                                    "Telegram'dan çözülebilen bekleyen araç onayı yok."
+                                } else if approval_requests.try_send(user).is_err() {
+                                    "Onay bildirimleri sırada, lütfen bekleyin."
+                                } else {
+                                    "Bekleyen onayları bildirimlerinizden kontrol edin."
+                                };
+                                enqueue(&deps, &outbound_tx, &in_flight, notifications::reply(user, response), &counters)?;
                             }
                             if let Some(turn) = result.accepted {
                                 active.insert(user, turn.logical_turn_id.clone());
@@ -306,12 +325,16 @@ pub async fn run_gateway(deps: GatewayDependencies, cancel: CancellationToken) -
             let capacity = outbound_tx.capacity().saturating_sub(OUTBOUND_RESERVE);
             let replay = async {
                 for message in notifications.replay(&allowed, mode, deps.presence.is_away(), capacity).await? { enqueue(&deps, &outbound_tx, &in_flight, message, &counters)?; }
-                notify_approvals(&deps, &allowed, &mut approval_state, None).await?;
                 Ok::<(), GatewayError>(())
             };
             tokio::select! { biased; () = cancel.cancelled() => return Ok(()), result = replay => result? }
         }
-    }.await;
+    };
+    let result = tokio::select! {
+        biased;
+        result = main_loop => result,
+        result = approval_notices => result.map_err(Into::into),
+    };
     child_cancel.cancel();
     // Futures aşağıda drop edilir; spawned completion bekleyicileri kesin join edilir.
     completions.shutdown().await;
@@ -319,32 +342,85 @@ pub async fn run_gateway(deps: GatewayDependencies, cancel: CancellationToken) -
     Ok(GatewayReport { rejected_updates: rejected, delivered_messages: counters.delivered.load(Ordering::Relaxed), failed_deliveries: counters.failed.load(Ordering::Relaxed) })
 }
 
-async fn notify_approvals(deps: &GatewayDependencies, allowed: &[i64], state: &mut ApprovalState, explicit: Option<i64>) -> Result<usize, GatewayError> {
-    let pending = deps.db.list_approvals(Some(ApprovalStatus::Pending)).map_err(|_| GatewayError::Unavailable)?;
-    state.notified.retain(|(id, _)| pending.iter().any(|a| a.id == *id));
-    state.backoff.retain(|(id, _), _| pending.iter().any(|a| a.id == *id));
+async fn approval_notification_loop(deps: &GatewayDependencies, mut requests: mpsc::Receiver<i64>) -> Result<(), GatewayError> {
+    let mut events = deps.approvals.subscribe_global();
+    let mut state = ApprovalState::default();
+    let mut explicit = HashSet::new();
+    let mut next_send = deps.clock.now_monotonic();
+    loop {
+        let allowed = live_allowed(deps)?;
+        explicit.retain(|user| allowed.contains(user));
+        if deps.clock.now_monotonic() >= next_send
+            && let Some(delay) = notify_approvals(deps, &allowed, &mut state, &mut explicit).await?
+        {
+            next_send = deps.clock.now_monotonic() + delay;
+        }
+        let now = deps.clock.now_monotonic();
+        let wake = if next_send > now { next_send } else { now + Duration::from_secs(1) };
+        tokio::select! {
+            user = requests.recv() => match user {
+                Some(user) => { explicit.insert(user); }
+                None => return Ok(()),
+            },
+            _ = events.recv() => {},
+            () = deps.clock.sleep_until(wake) => {},
+        }
+    }
+}
+
+/// Her adım tek ağ isteği yapar; 429 bütün onay gönderimlerini verilen süre kadar erteler.
+async fn notify_approvals(deps: &GatewayDependencies, allowed: &[i64], state: &mut ApprovalState, explicit: &mut HashSet<i64>) -> Result<Option<Duration>, GatewayError> {
+    let mut pending = deps.db.list_approvals(Some(ApprovalStatus::Pending)).map_err(|_| GatewayError::Unavailable)?;
+    let now = deps.clock.now_monotonic();
+    state.notified.retain(|(id, user)| allowed.contains(user) && pending.iter().any(|a| a.id == *id));
+    state.backoff.retain(|(id, user), _| allowed.contains(user) && pending.iter().any(|a| a.id == *id));
+    state.recipient_next.retain(|_, next| *next > now);
+    pending.retain(|row| row.is_policy_tool());
+    pending.sort_by_cached_key(|row| !row.is_telegram_tool());
+    explicit.retain(|user| pending.iter().any(|row| !state.notified.contains(&(row.id.clone(), *user))));
     let mode = deps.config.read().map_err(|_| GatewayError::Unavailable)?.notify;
-    let mut count = 0;
-    for approval in pending.into_iter().filter(|a| a.is_policy_tool()) {
+    let away = deps.presence.is_away();
+    let mut selected = None;
+    for approval in pending {
         let origins = if let Some(chat) = &approval.chat_id { deps.origins.origins_for_chat(chat).await? } else { Vec::new() };
-        for user in allowed.iter().copied().filter(|user| explicit.is_none_or(|id| *user == id)) {
+        for user in allowed.iter().copied() {
             let remote = origins.iter().any(|origin| origin.user_id == user && origin.private_chat_id == user && origin.end_seq.is_none());
-            if explicit.is_none() && (!notifications::should_notify(mode, deps.presence.is_away(), remote, true) || state.notified.contains(&(approval.id.clone(), user))) { continue; }
             let key = (approval.id.clone(), user);
-            // Telegram kesintisinde her tick yeniden denenmez (429 önlemi); açık /onay geri çekilmeyi atlar.
-            if explicit.is_none() && state.backoff.get(&key).is_some_and(|(_, next)| *next > deps.clock.now_monotonic()) { continue; }
-            if deps.callbacks.notify(&approval.id, user).await.is_ok() {
-                state.backoff.remove(&key);
-                state.notified.insert(key);
-                count += 1;
-            } else {
-                let failures = state.backoff.get(&key).map_or(0, |(n, _)| *n).saturating_add(1);
-                let delay = (1u64 << failures.min(10)).min(APPROVAL_RETRY_CAP_SECS);
-                state.backoff.insert(key, (failures, deps.clock.now_monotonic() + Duration::from_secs(delay)));
+            let requested = explicit.contains(&user);
+            if (!requested && !notifications::should_notify(mode, away, remote, true))
+                || state.notified.contains(&key) || state.recipient_next.contains_key(&user)
+                || state.backoff.get(&key).is_some_and(|(_, next)| *next > now)
+            { continue; }
+            // Açık istekler ve turun sahibi, genel dağıtımı beklemez.
+            let priority = (!requested, !remote);
+            if selected.as_ref().is_none_or(|(best, _)| priority < *best) {
+                selected = Some((priority, key));
             }
         }
     }
-    Ok(count)
+    let Some((_, key)) = selected else { return Ok(None); };
+    let result = deps.callbacks.notify(&key.0, key.1).await;
+    let now = deps.clock.now_monotonic();
+    state.recipient_next.insert(key.1, now + APPROVAL_RECIPIENT_INTERVAL);
+    let mut pace = APPROVAL_SEND_INTERVAL;
+    match result {
+        Ok(()) => {
+            state.backoff.remove(&key);
+            state.notified.insert(key);
+        }
+        Err(error) => {
+            let failures = state.backoff.get(&key).map_or(0, |(n, _)| *n).saturating_add(1);
+            let mut retry = Duration::from_secs((1u64 << failures.min(10)).min(APPROVAL_RETRY_CAP_SECS));
+            if let CallbackError::Transport(transport) = error
+                && transport.code == TelegramErrorCode::RateLimited
+            {
+                pace = Duration::from_secs(transport.retry_after_seconds.map(u64::from).unwrap_or(2).clamp(1, 3600));
+                retry = retry.max(pace);
+            }
+            state.backoff.insert(key, (failures, now + retry));
+        }
+    }
+    Ok(Some(pace))
 }
 
 #[cfg(test)]
@@ -434,7 +510,7 @@ mod tests {
         fn answer_callback_query(&self, _: AnswerCallbackQuery) -> BoxFuture<'_, Result<(), TransportError>> { Box::pin(async { Ok(()) }) }
     }
 
-    struct App { db: Arc<Db>, submits: Mutex<Vec<Option<String>>>, held: Mutex<Vec<oneshot::Sender<Result<TurnCompletion, GatewayError>>>> }
+    struct App { db: Arc<Db>, submits: Mutex<Vec<Option<String>>>, held: Mutex<Vec<oneshot::Sender<Result<TurnCompletion, GatewayError>>>>, quota_calls: AtomicU64 }
     impl GatewayApplication for App {
         fn submit_user_message(&self, request: SubmitUserMessage) -> BoxFuture<'_, Result<AcceptedTurn, GatewayError>> {
             self.submits.lock().unwrap().push(request.chat_id.clone());
@@ -454,7 +530,10 @@ mod tests {
         fn route<'a>(&'a self, _: &'a str, _: Option<&'a str>) -> BoxFuture<'a, Result<RouteResult, GatewayError>> {
             Box::pin(async { Ok(RouteResult { project_id: None, confidence: 1.0, reason: String::new(), alternatives: vec![] }) })
         }
-        fn quota_report(&self) -> BoxFuture<'_, Result<QuotaReport, GatewayError>> { Box::pin(async { Ok(QuotaReport { fetched_at: chrono::Utc::now(), pools: vec![] }) }) }
+        fn quota_report(&self) -> BoxFuture<'_, Result<QuotaReport, GatewayError>> {
+            self.quota_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(QuotaReport { fetched_at: chrono::Utc::now(), pools: vec![] }) })
+        }
         fn get_binding(&self, user: i64) -> BoxFuture<'_, Result<Option<String>, GatewayError>> {
             Box::pin(async move { self.db.telegram_binding(user).map_err(|_| GatewayError::Unavailable) })
         }
@@ -464,13 +543,29 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Callbacks { fail: std::sync::atomic::AtomicBool, calls: std::sync::atomic::AtomicU32 }
+    struct Callbacks {
+        fail: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicU32,
+        retry_after: std::sync::atomic::AtomicU32,
+        hold_next: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+    }
     impl GatewayCallbacks for Callbacks {
         fn handle<'a>(&'a self, _: &'a TelegramCallbackQuery, _: TurnOrigin) -> BoxFuture<'a, Result<(), GatewayError>> { Box::pin(async { Ok(()) }) }
-        fn notify<'a>(&'a self, _: &'a str, _: i64) -> BoxFuture<'a, Result<(), GatewayError>> {
+        fn notify<'a>(&'a self, _: &'a str, _: i64) -> BoxFuture<'a, Result<(), CallbackError>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let fail = self.fail.load(Ordering::Relaxed);
-            Box::pin(async move { if fail { Err(GatewayError::Unavailable) } else { Ok(()) } })
+            Box::pin(async move {
+                if self.hold_next.swap(false, Ordering::Relaxed) { self.release.notified().await; }
+                let retry_after = self.retry_after.swap(0, Ordering::Relaxed);
+                if retry_after != 0 {
+                    Err(CallbackError::Transport(transport_error(TelegramErrorCode::RateLimited, Some(retry_after))))
+                } else if fail {
+                    Err(GatewayError::Unavailable.into())
+                } else {
+                    Ok(())
+                }
+            })
         }
     }
     struct DbOrigins { db: Arc<Db>, ids: Mutex<Vec<String>> }
@@ -495,7 +590,7 @@ mod tests {
             db.insert_chat("c1", None, "sentetik", chrono::Utc::now()).unwrap();
             let log = Arc::new(EventLog::new(db.clone(), paths.clone()));
             let approvals = Arc::new(Approvals::new(db.clone(), log.clone(), paths));
-            let app = Arc::new(App { db: db.clone(), submits: Mutex::default(), held: Mutex::default() });
+            let app = Arc::new(App { db: db.clone(), submits: Mutex::default(), held: Mutex::default(), quota_calls: AtomicU64::default() });
             let clock: Arc<dyn Clock> = Arc::new(TestClock);
             Self { _temp: temp, origins: Arc::new(DbOrigins { db: db.clone(), ids: Mutex::default() }), db, app, poller: Arc::new(Poller::default()),
                 transport: Arc::new(Transport::default()), deps_parts: (log, approvals), callbacks: Arc::new(Callbacks::default()),
@@ -567,6 +662,43 @@ mod tests {
         handle.await.unwrap().unwrap();
         assert_eq!(env.texts().len(), 1);
         assert_eq!(env.poller.offsets.lock().unwrap().last().copied().flatten(), Some(6));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backlog_uses_verified_bot_offset_and_replays_only_unaccepted_updates() {
+        use ultron_core::db::telegram::InboxState;
+
+        let env = Env::new();
+        env.db.checkpoint_telegram_poll(200, 1000).unwrap();
+        let old_message = |id| {
+            let mut value = message(id, "/durum");
+            value["message"]["date"] = serde_json::json!(1);
+            value
+        };
+        env.push(old_message(5));
+        let (cancel, handle) = env.run(vec![101]);
+        settle().await;
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+        assert_eq!(env.poller.offsets.lock().unwrap()[0], None);
+        assert_eq!(env.texts().len(), 1);
+
+        // Önceki süreç güncellemeyi kabul etti, ancak yanıtı gönderemeden durdu.
+        assert!(env.db.accept_telegram_update(100, 6, 101).unwrap());
+        assert!(env.db.start_telegram_inbox(100, 6).unwrap());
+        assert_eq!(env.db.recover_telegram_inbox().unwrap(), 1);
+        let offset_index = env.poller.offsets.lock().unwrap().len();
+        env.push(old_message(6));
+        env.push(old_message(7));
+        let (cancel, handle) = env.run(vec![101]);
+        settle().await;
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+        assert_eq!(env.poller.offsets.lock().unwrap()[offset_index], Some(7));
+        assert_eq!(env.texts().len(), 2);
+        assert_eq!(env.db.telegram_inbox_entry(100, 6).unwrap().unwrap().state, InboxState::NeedsAttention);
+        assert_eq!(env.db.telegram_inbox_entry(100, 7).unwrap().unwrap().state, InboxState::Completed);
+        assert_eq!(env.db.telegram_next_update_id(100).unwrap(), Some(8));
     }
 
     #[tokio::test(start_paused = true)]
@@ -711,6 +843,49 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn limit_cooldown_is_per_user_and_skips_the_quota_provider() {
+        let env = Env::new();
+        let (cancel, handle) = env.run(vec![101, 102]);
+        env.push(message(1, "/limit"));
+        env.push(message(2, "/limit"));
+        let mut other = message(3, "/limit");
+        other["message"]["from"]["id"] = 102.into();
+        other["message"]["chat"]["id"] = 102.into();
+        env.push(other);
+        settle().await;
+        assert_eq!(env.app.quota_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(env.texts().iter().filter(|text| text.contains("lütfen bekleyin")).count(), 1);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        env.push(message(4, "/limit"));
+        settle().await;
+        assert_eq!(env.app.quota_calls.load(Ordering::Relaxed), 3);
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_fans_out_to_49_users_once_and_advances_to_later_event() {
+        let env = Env::new();
+        env.config.write().unwrap().notify = ultron_core::config::NotifyMode::Always;
+        let allowed: Vec<_> = (101..150).collect();
+        let (cancel, handle) = env.run(allowed.clone());
+        settle().await;
+        env.switch_event();
+        env.deps_parts.0.append("c1", None, ultron_core::events::EngineEvent::EngineSwitched {
+            from: EngineId::Codex, to: EngineId::Claude, reason: ultron_core::events::SwitchReason::Quota,
+        }).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let sent = env.transport.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2 * allowed.len());
+        for user in allowed {
+            let texts: Vec<_> = sent.iter().filter(|(chat, _)| *chat == user).map(|(_, text)| text.as_str()).collect();
+            assert_eq!(texts, ["Motor değişti: Claude → Codex.", "Motor değişti: Codex → Claude."]);
+        }
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn final_is_delivered_to_origin_and_marked_delivered() {
         let env = Env::new();
         env.ready_turn("turn-a", 1, "A-final");
@@ -839,6 +1014,32 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let calls = env.callbacks.calls.load(Ordering::Relaxed);
         assert!((2..=7).contains(&calls), "geri çekilme bekleniyordu, çağrı: {calls}");
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_429_and_slow_send_do_not_block_updates_or_explicit_backoff() {
+        let env = Env::new();
+        env.callbacks.hold_next.store(true, Ordering::Relaxed);
+        env.callbacks.retry_after.store(20, Ordering::Relaxed);
+        env.db.create_policy_tool_approval(None, EngineId::Claude, ultron_core::policy::RiskCategory::Delete, "sentetik",
+            &ultron_core::policy::Action::FileDelete { path: "synthetic.txt".into() }, None).unwrap();
+        let (cancel, handle) = env.run(vec![101, 102]);
+        settle().await;
+        assert_eq!(env.callbacks.calls.load(Ordering::Relaxed), 1);
+        env.push(message(1, "/durum"));
+        settle().await;
+        assert!(env.texts().iter().any(|text| text.starts_with("Aktif turlar:")));
+        assert_eq!(env.db.telegram_next_update_id(100).unwrap(), Some(2));
+        env.callbacks.release.notify_one();
+        settle().await;
+        env.push(message(2, "/onay"));
+        settle().await;
+        assert_eq!(env.db.telegram_next_update_id(100).unwrap(), Some(3));
+        assert_eq!(env.callbacks.calls.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(Duration::from_secs(22)).await;
+        assert_eq!(env.callbacks.calls.load(Ordering::Relaxed), 3);
         cancel.cancel();
         handle.await.unwrap().unwrap();
     }

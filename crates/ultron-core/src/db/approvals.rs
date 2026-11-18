@@ -14,10 +14,29 @@ use crate::import::mask_secrets;
 use crate::policy::{Action, RiskCategory};
 
 pub const MAX_ACTION_BYTES: usize = 16 * 1024;
-pub const MAX_PENDING_APPROVALS: usize = 128;
+pub const MAX_PENDING_APPROVALS: usize = 64;
+pub const MAX_PENDING_APPROVALS_PER_REQUESTER: usize = 16;
 pub const MAX_RESOLVED_APPROVALS: usize = 256;
 pub const MAX_APPROVAL_PAGE: usize = 32;
 pub const MAX_APPROVAL_PAGE_BYTES: usize = 256 * 1024;
+const TELEGRAM_SUMMARY_LIMIT: usize = 48;
+
+#[derive(Debug, Clone, Copy)]
+pub enum ApprovalCapacity {
+    Global,
+    Requester,
+}
+
+impl std::fmt::Display for ApprovalCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Global => "bekleyen onay kuyruğu dolu; yeni işlem reddedildi",
+            Self::Requester => "bu bağlantının bekleyen onay sınırı dolu; yeni işlem reddedildi",
+        })
+    }
+}
+
+impl std::error::Error for ApprovalCapacity {}
 
 #[derive(Debug, Serialize)]
 pub struct ApprovalPage {
@@ -117,40 +136,67 @@ impl Approval {
         {
             return false;
         }
-        serde_json::from_str::<Action>(&self.action_json).is_ok_and(|action| remote_action(&action))
+        serde_json::from_str::<Action>(&self.action_json).is_ok_and(|action| {
+            remote_action(&action)
+                && shell_context(&action).is_none_or(|(command, cwd)| {
+                    telegram_shell_summary(command, cwd).is_some()
+                })
+        })
     }
 
-    /// Telegram bildirimi için kısa özet (en çok 48 karakter): program/araç başı ve
-    /// hedefin yalnız dosya adı. Kontrol karakterleri atılır, metin gizli bilgi
-    /// maskesinden geçer; ham eylem JSON'u veya tam yol asla dönmez.
+    /// Telegram özeti: araç, bayraklar, hedef ve kabuk eylemlerinde çalışma dizini.
     pub fn telegram_summary(&self) -> String {
         let Ok(action) = serde_json::from_str::<Action>(&self.action_json) else { return String::new(); };
+        if let Some((command, cwd)) = shell_context(&action) {
+            return telegram_shell_summary(command, cwd).unwrap_or_else(|| {
+                truncate_summary(&mask_summary(&shell_summary(command)), TELEGRAM_SUMMARY_LIMIT)
+            });
+        }
         let raw = match &action {
             Action::FileWrite { path } => format!("yaz {}", basename(&path.to_string_lossy())),
-            Action::FileDelete { path } => format!("sil {}", basename(&path.to_string_lossy())),
-            Action::Shell { command, .. } => shell_summary(command),
+            Action::FileDelete { path } => return delete_path_summary("sil", &path.to_string_lossy()).unwrap_or_default(),
             Action::ToolCall { tool, input } => match input.as_object() {
-                Some(fields) if matches!(tool.to_ascii_lowercase().as_str(), "bash" | "shell" | "powershell" | "run_command") => {
-                    fields.get("command").and_then(Value::as_str).map(shell_summary).unwrap_or_default()
-                }
                 Some(fields) => {
+                    if matches!(tool.to_ascii_lowercase().as_str(), "delete" | "file_delete") {
+                        return tool_delete_path(fields)
+                            .and_then(|path| delete_path_summary(tool, path)).unwrap_or_default();
+                    }
                     let target = fields.get("path").or_else(|| fields.get("file_path")).and_then(Value::as_str)
                         .map(basename).unwrap_or_default();
                     format!("{} {}", tool, target)
                 }
                 None => String::new(),
             },
-            Action::Network { .. } => String::new(),
+            Action::Shell { .. } | Action::Network { .. } => String::new(),
         };
-        let clean: String = raw.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
-        let masked = mask_secrets(&crate::turn_grant::mask_live(&clean)).0;
-        let squeezed = masked.split_whitespace().collect::<Vec<_>>().join(" ");
-        if squeezed.chars().count() > 48 {
-            format!("{}…", squeezed.chars().take(47).collect::<String>())
-        } else {
-            squeezed
-        }
+        truncate_summary(&mask_summary(&raw), TELEGRAM_SUMMARY_LIMIT)
     }
+}
+
+fn shell_context(action: &Action) -> Option<(&str, &str)> {
+    match action {
+        Action::Shell { command, cwd } => Some((command, cwd.to_str().unwrap_or_default())),
+        Action::ToolCall { tool, input } if matches!(tool.to_ascii_lowercase().as_str(), "bash" | "shell" | "powershell" | "run_command") => {
+            Some((input.get("command")?.as_str()?, input.get("cwd").and_then(Value::as_str).unwrap_or_default()))
+        }
+        _ => None,
+    }
+}
+
+fn mask_summary(raw: &str) -> String {
+    let clean: String = raw.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
+    let masked = mask_secrets(&crate::turn_grant::mask_live(&clean)).0;
+    masked.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn telegram_shell_summary(command: &str, cwd: &str) -> Option<String> {
+    let leaf = mask_summary(&basename(cwd));
+    if matches!(leaf.as_str(), "" | "." | "..") || leaf.ends_with(':') || leaf.contains("[MASKED]") {
+        return None;
+    }
+    let summary = mask_summary(&shell_summary(command));
+    let with_cwd = format!("{summary} @{leaf}");
+    (!summary.is_empty() && with_cwd.chars().count() <= TELEGRAM_SUMMARY_LIMIT).then_some(with_cwd)
 }
 
 fn basename(path: &str) -> String {
@@ -158,18 +204,142 @@ fn basename(path: &str) -> String {
 }
 
 fn shell_summary(command: &str) -> String {
-    let Some(tokens) = shell_tokens(command) else { return String::new(); };
-    let Some(program) = tokens.first() else { return String::new(); };
-    let program = basename(program).to_lowercase();
-    if program == "git" {
-        let sub = tokens.get(1).map(String::as_str).unwrap_or_default();
-        let target = if sub == "commit" { None } else {
-            tokens.iter().skip(2).rfind(|token| !token.starts_with('-')).map(|token| basename(token))
-        };
-        return format!("git {sub} {}", target.unwrap_or_default());
+    if let Some((tokens, quoted)) = shell_tokens(command) {
+        let (mut required, target, _) = shell_summary_parts(&tokens, &quoted);
+        if let Some(target) = target && required.chars().count() < TELEGRAM_SUMMARY_LIMIT - 1 {
+            required.push(' ');
+            required.push_str(&target);
+        }
+        return required;
     }
-    let target = tokens.iter().skip(1).rfind(|token| !token.starts_with('-')).map(|token| basename(token));
-    format!("{program} {}", target.unwrap_or_default())
+    // Maskelenmiş veya alıntılanmış URL, izin jetonlayıcısından geçmez.
+    // Masaüstü gereken push özetinde yalnız bilinen bayraklar ve host gösterilir.
+    let tokens: Vec<_> = command.split_whitespace().collect();
+    if let [program, sub, args @ ..] = tokens.as_slice()
+        && matches!(basename(program).to_ascii_lowercase().as_str(), "git" | "git.exe")
+        && sub.eq_ignore_ascii_case("push")
+    {
+        let host = args.iter().find_map(|arg| remote_host(arg));
+        return push_summary(args.iter().copied().filter(|arg| destructive_flag(arg)), host.as_deref());
+    }
+    String::new()
+}
+
+fn truncate_summary(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit { return text.into(); }
+    format!("{}…", text.chars().take(limit - 1).collect::<String>())
+}
+
+fn remote_host(arg: &str) -> Option<String> {
+    let arg = arg.trim_matches(['"', '\'']);
+    let host = if let Some((_, address)) = arg.split_once("://") {
+        let authority = address.split(['/', '?', '#']).next()?;
+        authority.rsplit('@').next()?
+    } else {
+        let (authority, _) = arg.split_once(':')?;
+        authority.rsplit('@').next()?
+    };
+    // Yalnız host/port; userinfo, yol, sorgu ve fragment özet dışındadır.
+    (!host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b)))
+        .then(|| host.to_owned())
+}
+
+fn destructive_flag(arg: &str) -> bool {
+    let flag = arg.split('=').next().unwrap_or_default();
+    matches!(flag, "--hard" | "--force" | "--force-with-lease" | "--force-if-includes"
+        | "--mirror" | "--delete" | "--prune" | "--repo" | "--recursive" | "-f" | "-rf" | "-fr" | "-d")
+}
+
+fn push_summary<'a>(flags: impl Iterator<Item = &'a str>, remote: Option<&str>) -> String {
+    let mut summary = String::from("git push");
+    for flag in flags {
+        summary.push(' ');
+        summary.push_str(flag.split('=').next().unwrap_or_default());
+    }
+    if let Some(remote) = remote {
+        if summary.chars().count() + 1 + remote.chars().count() <= TELEGRAM_SUMMARY_LIMIT {
+            summary.push(' ');
+            summary.push_str(remote);
+            return summary;
+        }
+        // Riskli bayrakları önce ve tam göster; uzun bir host kalan alana sığdırılır.
+        if summary.chars().count() >= TELEGRAM_SUMMARY_LIMIT - 2 {
+            return format!("{} {}", truncate_summary(&summary, 33), truncate_summary(remote, 14));
+        }
+        let budget = TELEGRAM_SUMMARY_LIMIT - summary.chars().count() - 1;
+        summary.push(' ');
+        summary.push_str(&truncate_summary(remote, budget));
+    }
+    summary
+}
+
+fn shell_flag(arg: &str, program: &str) -> bool {
+    arg.starts_with('-') || (arg.len() == 2 && arg.starts_with('/') && matches!(program, "del" | "erase" | "remove-item"))
+}
+
+fn shell_summary_parts(tokens: &[String], quoted: &[bool]) -> (String, Option<String>, bool) {
+    let leaf = basename(&tokens[0]).to_ascii_lowercase();
+    let program = leaf.strip_suffix(".exe").unwrap_or(&leaf);
+    if matches!(program, "rm" | "del" | "erase" | "remove-item") {
+        return match delete_shell_summary(program, &tokens[1..]) {
+            Some(summary) => (summary, None, !quoted[0]),
+            None => (program.to_owned(), None, false),
+        };
+    }
+    let mut required = program.to_owned();
+    let mut args = &tokens[1..];
+    let mut quoted_args = &quoted[1..];
+    if program == "git" && let Some((sub, rest)) = args.split_first() {
+        required.push(' ');
+        required.push_str(sub);
+        args = rest;
+        quoted_args = &quoted_args[1..];
+        if sub.eq_ignore_ascii_case("push") {
+            let mut positional = args.iter().filter(|arg| !shell_flag(arg, program));
+            let named = positional.next();
+            let remote = args.iter().find_map(|arg| remote_host(arg))
+                .or_else(|| named.map(|arg| basename(arg)));
+            let flagged = || args.iter().map(String::as_str).filter(|arg| shell_flag(arg, program));
+            let flags = flagged().filter(|arg| destructive_flag(arg)).chain(flagged().filter(|arg| !destructive_flag(arg)));
+            let target = positional.rfind(|arg| remote_host(arg).is_none()).map(|arg| basename(arg));
+            return (push_summary(flags, remote.as_deref()), target, true);
+        }
+    }
+    let commit = required.eq_ignore_ascii_case("git commit");
+    let mut old_len = required.chars().count();
+    let mut flags_visible = !quoted[0] && (!commit || !quoted[1]);
+    let mut target = None;
+    let mut skip_value = false;
+    let mut options = true;
+    for (arg, quoted) in args.iter().zip(quoted_args) {
+        let flag = arg.split('=').next().unwrap_or_default();
+        // Önceki uzunluk kontrolü, değerleri artık göstermediğimiz için kümeyi genişletmesin.
+        if commit && shell_flag(arg, program) {
+            let old_flag = if !flag.starts_with("--") && let Some(index) = flag.find('m') {
+                &flag[..=index]
+            } else { flag };
+            old_len += 1 + old_flag.chars().count();
+        }
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        if options && shell_flag(arg, program) {
+            if *quoted {
+                flags_visible = false;
+                break;
+            }
+            let short_value = (commit && flag.starts_with('-') && !flag.starts_with("--"))
+                .then(|| flag.find(['m', 'F'])).flatten();
+            let shown = short_value.map_or(flag, |index| &flag[..=index]);
+            skip_value = commit && shown == arg && (short_value.is_some() || matches!(flag, "--message" | "--file"));
+            options = !commit || flag != "--";
+            required.push(' ');
+            required.push_str(shown);
+        } else if !commit {
+            target = Some(basename(arg));
+        }
+    }
+    (required, target, flags_visible && (!commit || old_len <= TELEGRAM_SUMMARY_LIMIT))
 }
 
 /// Korunan çalışma zamanı yol bölümleri ve dosya adları (idari yazma hedefleri).
@@ -190,12 +360,13 @@ fn remote_path(path: &std::path::Path) -> bool {
 
 /// Tek komut için jeton ayırıcı: yalnız güvenli karakterler; çift tırnak yalnız
 /// `git commit` iletisi içindir. `; | & $ ` ( ) < >`, satır sonu ve kaçışlar reddedilir.
-fn shell_tokens(command: &str) -> Option<Vec<String>> {
+fn shell_tokens(command: &str) -> Option<(Vec<String>, Vec<bool>)> {
     const OUTSIDE: &str = " -_./\\:=@+,~*";
     const INSIDE: &str = " -_./:,@#+=?'";
     let mut tokens = Vec::new();
+    let mut quoted_tokens = Vec::new();
     let (mut current, mut started, mut quoted) = (String::new(), false, false);
-    let mut used_quote = false;
+    let mut token_quoted = false;
     for ch in command.chars() {
         if quoted {
             match ch {
@@ -206,9 +377,13 @@ fn shell_tokens(command: &str) -> Option<Vec<String>> {
         } else if ch == '"' {
             quoted = true;
             started = true;
-            used_quote = true;
+            token_quoted = true;
         } else if ch == ' ' {
-            if started { tokens.push(std::mem::take(&mut current)); started = false; }
+            if started {
+                tokens.push(std::mem::take(&mut current));
+                quoted_tokens.push(std::mem::take(&mut token_quoted));
+                started = false;
+            }
         } else if ch.is_alphanumeric() || OUTSIDE.contains(ch) {
             current.push(ch);
             started = true;
@@ -217,52 +392,69 @@ fn shell_tokens(command: &str) -> Option<Vec<String>> {
         }
     }
     if quoted { return None; }
-    if started { tokens.push(current); }
+    if started {
+        tokens.push(current);
+        quoted_tokens.push(token_quoted);
+    }
     let git_commit = tokens.first().is_some_and(|t| t.eq_ignore_ascii_case("git"))
         && tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("commit"));
-    if used_quote && !git_commit { return None; }
-    (!tokens.is_empty()).then_some(tokens)
+    if !git_commit && quoted_tokens.contains(&true) { return None; }
+    (!tokens.is_empty()).then_some((tokens, quoted_tokens))
 }
 
-/// `rm`/`del` hedefi: tek basit glob (`build/*`) olabilir; kök, ev, üst dizin ve çıplak `*` olamaz.
+/// Telegram silme hedefleri için Windows ve POSIX ayraçlarıyla göreli yol kontrolü.
 fn remote_delete_target(token: &str) -> bool {
-    let trimmed = token.trim_end_matches(['/', '\\']);
-    if trimmed.is_empty() || matches!(trimmed, "." | ".." | "~") || trimmed.ends_with(':')
-        || token.starts_with('~') || token.contains('=')
-    {
-        return false;
-    }
-    if let Some(star) = token.find('*') {
-        let prefix = &token[..star];
-        let name_start = prefix.rfind(['/', '\\']).map_or(0, |i| i + 1);
-        // Yıldız yalnız son bölümde; öncesinde gerçek bir dizin adı bulunmalı.
-        let dir = prefix[..name_start].trim_end_matches(['/', '\\']);
-        let rest = &token[star..];
-        if rest.contains(['/', '\\']) || dir.is_empty() || matches!(dir, "." | "..") || dir.ends_with(':') {
-            return false;
+    let segments = || token.split(['/', '\\']).filter(|part| !part.is_empty() && *part != ".");
+    !token.starts_with(['/', '\\'])
+        && !token.contains([':', '=', '~'])
+        && remote_path(token.as_ref())
+        && segments().next().is_some()
+        && segments().all(|part| !part.ends_with(['.', ' ']))
+}
+
+fn delete_shell_summary(program: &str, args: &[String]) -> Option<String> {
+    let mut has_target = false;
+    let mut summary = program.to_owned();
+    for arg in args {
+        let flag = match program {
+            "rm" => matches!(arg.as_str(), "-r" | "-R" | "-f" | "-rf" | "-fr"
+                | "--recursive" | "--force"),
+            "remove-item" => matches!(arg.to_ascii_lowercase().as_str(), "-recurse" | "-force" | "-whatif" | "-confirm"),
+            _ => false,
+        };
+        if !flag {
+            // Ters eğik çizgi kabuğa göre yol ayıracı veya kaçış karakteridir.
+            if shell_flag(arg, program) || arg.contains('\\') || !remote_delete_target(arg) {
+                return None;
+            }
+            has_target = true;
         }
+        summary.push(' ');
+        summary.push_str(arg);
     }
-    !protected_path(token)
+    (has_target && mask_summary(&summary) == summary).then_some(summary)
+}
+
+fn delete_path_summary(label: &str, path: &str) -> Option<String> {
+    let summary = format!("{label} {path}");
+    (remote_delete_target(path) && summary.chars().count() <= TELEGRAM_SUMMARY_LIMIT
+        && mask_summary(&summary) == summary).then_some(summary)
+}
+
+fn tool_delete_path(fields: &serde_json::Map<String, Value>) -> Option<&str> {
+    let path = fields.get("path").or_else(|| fields.get("file_path"))?.as_str()?;
+    fields.get("file_path").is_none_or(|other| other.as_str() == Some(path)).then_some(path)
 }
 
 fn remote_shell(command: &str) -> bool {
     // Script, alt kabuk, zincir ve dinamik genişletme sınıflandırılmaz.
-    let Some(tokens) = shell_tokens(command) else { return false; };
-    let leaf = basename(&tokens[0]).to_lowercase();
+    let Some((tokens, quoted)) = shell_tokens(command) else { return false; };
+    if tokens[0].contains(['/', '\\', ':']) { return false; }
+    let leaf = tokens[0].to_ascii_lowercase();
     let program = leaf.strip_suffix(".exe").unwrap_or(&leaf);
     let args = &tokens[1..];
-    match program {
-        "rm" | "del" | "erase" | "remove-item" => {
-            let mut targets = 0;
-            for arg in args {
-                let flag = arg.starts_with('-')
-                    || (arg.len() == 2 && arg.starts_with('/') && program != "rm");
-                if flag { continue; }
-                if !remote_delete_target(arg) { return false; }
-                targets += 1;
-            }
-            targets > 0
-        }
+    let allowed = match program {
+        "rm" | "del" | "erase" | "remove-item" => true,
         "git" => {
             let Some(sub) = args.first().map(|s| s.to_ascii_lowercase()) else { return false; };
             matches!(sub.as_str(), "push" | "reset" | "rebase" | "commit")
@@ -272,19 +464,41 @@ fn remote_shell(command: &str) -> bool {
                         || lower.starts_with("--config") || lower.starts_with("--upload-pack")
                         || lower.starts_with("--receive-pack")
                 })
+                && (sub != "push" || remote_push(&args[1..]))
         }
         _ => false,
+    };
+    allowed && {
+        let (required, _, flags_visible) = shell_summary_parts(&tokens, &quoted);
+        flags_visible && required.chars().count() <= TELEGRAM_SUMMARY_LIMIT
     }
+}
+
+fn remote_push(args: &[String]) -> bool {
+    let mut positional = args.iter().filter(|arg| !arg.starts_with('-'));
+    let remote = positional.next();
+    let flags = || args.iter().filter(|arg| arg.starts_with('-'));
+    "git push".len() + remote.map_or(0, |name| name.len() + 1)
+        + flags().map(|arg| arg.len() + 1).sum::<usize>() <= TELEGRAM_SUMMARY_LIMIT
+        && remote.is_none_or(|name| name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+        && positional.all(|arg| !arg.starts_with('+') && !arg.contains([':', '@', '\\']))
+        && flags().all(|arg| {
+            matches!(arg.as_str(), "--set-upstream" | "-u" | "--dry-run" | "-n" | "--atomic"
+                | "--porcelain" | "--verbose" | "-v" | "--quiet" | "-q")
+        })
 }
 
 fn remote_action(action: &Action) -> bool {
     match action {
-        Action::FileWrite { path } | Action::FileDelete { path } => remote_path(path),
+        Action::FileWrite { path } => remote_path(path),
+        Action::FileDelete { path } => path.to_str().is_some_and(|path| delete_path_summary("sil", path).is_some()),
         Action::Shell { command, cwd } => remote_path(cwd) && remote_shell(command),
         Action::Network { .. } => false,
         Action::ToolCall { tool, input } => {
             let Some(fields) = input.as_object() else { return false; };
-            match tool.to_ascii_lowercase().as_str() {
+            let name = tool.to_ascii_lowercase();
+            match name.as_str() {
                 "bash" | "shell" | "powershell" | "run_command" => {
                     fields.keys().all(|key| matches!(key.as_str(), "command" | "cwd"))
                         && fields.get("command").and_then(Value::as_str).is_some_and(remote_shell)
@@ -295,6 +509,8 @@ fn remote_action(action: &Action) -> bool {
                         && fields.get("path").or_else(|| fields.get("file_path"))
                             .and_then(Value::as_str).is_some_and(|path| remote_path(path.as_ref()))
                         && fields.get("file_path").is_none_or(|value| value.as_str().is_some_and(|path| remote_path(path.as_ref())))
+                        && (!matches!(name.as_str(), "delete" | "file_delete")
+                            || tool_delete_path(fields).is_some_and(|path| delete_path_summary(tool, path).is_some()))
                 }
                 _ => false,
             }
@@ -443,9 +659,22 @@ impl Db {
             [],
             |r| r.get(0),
         )?;
+        if pending >= MAX_PENDING_APPROVALS {
+            return Err(ApprovalCapacity::Global.into());
+        }
+        if kind == ApprovalKind::PolicyTool && let Some(requester_id) = requester_id {
+            let requester_pending: usize = tx.query_row(
+                "SELECT COUNT(*) FROM approvals WHERE status = 'pending' AND requester_id = ?1",
+                [requester_id],
+                |r| r.get(0),
+            )?;
+            if requester_pending >= MAX_PENDING_APPROVALS_PER_REQUESTER {
+                return Err(ApprovalCapacity::Requester.into());
+            }
+        }
         let backlog: usize =
             tx.query_row("SELECT COUNT(*) FROM approval_outbox", [], |r| r.get(0))?;
-        if pending >= MAX_PENDING_APPROVALS || backlog >= 512 {
+        if backlog >= 512 {
             bail!("onay kuyruğu dolu; yeni işlem reddedildi");
         }
         tx.execute(
@@ -733,7 +962,8 @@ mod tests {
             (Action::ToolCall { tool: "future_unknown_tool".into(), input: serde_json::json!({}) }, false),
             (Action::ToolCall { tool: "Write".into(), input: serde_json::json!({ "path": "synthetic.txt", "command": "admin" }) }, false),
             (Action::ToolCall { tool: "Write".into(), input: serde_json::json!({ "path": "synthetic.txt", "content": "synthetic" }) }, true),
-            (Action::ToolCall { tool: "Bash".into(), input: serde_json::json!({ "command": "rm synthetic.txt" }) }, true),
+            (Action::ToolCall { tool: "Bash".into(), input: serde_json::json!({ "command": "rm synthetic.txt" }) }, false),
+            (Action::ToolCall { tool: "Bash".into(), input: serde_json::json!({ "command": "rm synthetic.txt", "cwd": "synthetic/workspace" }) }, true),
             (Action::FileDelete { path: "$dynamic".into() }, false),
         ];
         for (action, expected) in actions {
@@ -767,7 +997,7 @@ mod tests {
             (RiskCategory::GitHistory, shell("git reset --hard HEAD~1"), true),
             (RiskCategory::GitHistory, shell("git rebase main"), true),
             (RiskCategory::Delete, shell("rm -rf imports"), true),
-            (RiskCategory::Delete, shell("rm -rf build/*"), true),
+            (RiskCategory::Delete, shell("rm -rf build/*"), false),
             (RiskCategory::Delete, shell("rm restore_notes.txt"), true),
             (RiskCategory::Delete, Action::FileDelete { path: "synthetic/import_policy.txt".into() }, true),
             (RiskCategory::Delete, Action::FileWrite { path: "synthetic/src/main.rs".into() }, true),
@@ -818,22 +1048,142 @@ mod tests {
     }
 
     #[test]
-    fn telegram_summary_is_short_masked_and_path_free() {
+    fn telegram_summary_is_short_masked_and_preserves_relative_delete_paths() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(&temp.path().join("db.sqlite")).unwrap();
         let make = |action: Action| db.create_policy_tool_approval(None, EngineId::Claude, RiskCategory::Delete, "r", &action, None).unwrap();
         let file = make(Action::FileDelete { path: "synthetic/dir/note.txt".into() });
-        assert_eq!(file.telegram_summary(), "sil note.txt");
+        assert_eq!(file.telegram_summary(), "sil synthetic/dir/note.txt");
         let git = make(Action::Shell { command: "git push origin feature/import-csv".into(), cwd: "w".into() });
-        assert_eq!(git.telegram_summary(), "git push import-csv");
+        assert_eq!(git.telegram_summary(), "git push origin import-csv @w");
         let rm = make(Action::Shell { command: "rm -rf synthetic/dir/build".into(), cwd: "w".into() });
-        assert_eq!(rm.telegram_summary(), "rm build");
+        assert_eq!(rm.telegram_summary(), "rm -rf synthetic/dir/build @w");
         let long = make(Action::FileWrite { path: format!("d/{}", "x".repeat(200)).into() });
         assert!(long.telegram_summary().chars().count() <= 48);
         let secret = make(Action::FileWrite { path: "d/password=synthetic-secret.txt".into() });
         assert!(!secret.telegram_summary().contains("synthetic-secret"));
         let control = make(Action::FileWrite { path: "d/a\nb\u{1b}c.txt".into() });
         assert!(!control.telegram_summary().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn telegram_delete_rejects_non_plain_and_unrepresentable_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db.sqlite")).unwrap();
+        let make = |action: Action| db.create_policy_tool_approval(
+            None, EngineId::Claude, RiskCategory::Delete, "sentetik", &action, None,
+        ).unwrap();
+        let shell = |command: String| Action::Shell { command, cwd: "workspace".into() };
+        for target in [
+            "../other/x", "dir/../x", r"dir\..\x", "/other/x", r"\other\x",
+            r"C:\other\x", "C:other/x", r"\\server\share\x", r"\\?\C:\other\x",
+            "~/x", "dir/x~", "$HOME/x", "%TEMP%/x", "build/*", "build/?",
+            "build/[ab]", "build/a]",
+        ] {
+            assert!(!remote_delete_target(target), "{target}");
+            assert!(!make(shell(format!("rm safe.txt {target}"))).is_telegram_tool(), "{target}");
+            assert!(!make(Action::FileDelete { path: target.into() }).is_telegram_tool(), "{target}");
+        }
+        let row = make(shell("rm -f dir/a dir/b".into()));
+        assert!(row.is_telegram_tool());
+        assert_eq!(row.telegram_summary(), "rm -f dir/a dir/b @workspace");
+        let tail = "x".repeat(25);
+        let overflow = make(shell(format!("rm {tail}/a {tail}/b")));
+        assert!(!overflow.is_telegram_tool());
+        assert!(!make(shell("del /f dir/a".into())).is_telegram_tool());
+        let tool = |input| Action::ToolCall { tool: "Delete".into(), input };
+        let row = make(tool(serde_json::json!({ "file_path": r"dir\a" })));
+        assert!(row.is_telegram_tool());
+        assert_eq!(row.telegram_summary(), r"Delete dir\a");
+        assert!(!make(tool(serde_json::json!({ "path": "dir/a", "file_path": "../x" }))).is_telegram_tool());
+    }
+
+    #[test]
+    fn telegram_shell_summary_shows_destructive_flags_and_masks_remote_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db.sqlite")).unwrap();
+        let make = |command: &str| db.create_policy_tool_approval(None, EngineId::Claude, RiskCategory::GitHistory,
+            "sentetik", &Action::Shell { command: command.into(), cwd: "w".into() }, None).unwrap();
+        assert_eq!(make("git reset --hard HEAD~5").telegram_summary(), "git reset --hard HEAD~5 @w");
+        assert_eq!(make("git reset --keep HEAD~5").telegram_summary(), "git reset --keep HEAD~5 @w");
+        assert_eq!(make("rm -rf build").telegram_summary(), "rm -rf build @w");
+        for (command, flags, host) in [
+            ("git push --force --mirror https://sample-user:sample-pass@repo.example/synthetic.git", &["--force", "--mirror"][..], "repo.example"),
+            ("git push -f --delete ssh://sample-user@repo.example/özel", &["-f", "--delete"], "repo.example"),
+            ("git push --repo=https://sample-user@repo.example/synthetic.git", &["--repo"], "repo.example"),
+            (r#"git push --force "https://sample-user@repo.example/stub?key=sample-query""#, &["--force"], "repo.example"),
+            ("git push -f --delete sample-user@repo.example:repo.git", &["-f", "--delete"], "repo.example"),
+        ] {
+            let row = make(command);
+            let summary = row.telegram_summary();
+            assert!(summary.contains(host), "{summary}");
+            assert!(flags.iter().all(|flag| summary.split_whitespace().any(|part| part == *flag)), "{summary}");
+            assert!(summary.chars().count() <= TELEGRAM_SUMMARY_LIMIT);
+            assert!(!summary.contains("sample-"));
+            assert!(!row.is_telegram_tool());
+        }
+        let long = make("git push --force --mirror https://repository-with-a-long-name.example/stub");
+        assert!(long.telegram_summary().starts_with("git push --force --mirror repository"));
+        assert_eq!(long.telegram_summary().chars().count(), TELEGRAM_SUMMARY_LIMIT);
+    }
+
+    #[test]
+    fn telegram_commit_summary_excludes_flag_like_messages_and_message_files() {
+        for (command, expected) in [
+            (r#"git commit -m "- fix x" -a"#, "git commit -m -a"),
+            ("git commit --message --private -a", "git commit --message -a"),
+            (r#"git commit -F "- private" -a"#, "git commit -F -a"),
+            ("git commit -F-private -mprivate -a", "git commit -F -m -a"),
+            ("git commit --message=private --file=private -a", "git commit --message --file -a"),
+        ] {
+            assert_eq!(shell_summary(command), expected);
+        }
+        assert!(!remote_shell(r#"git commit "--amend""#));
+        assert!(!remote_shell(&format!("git commit -m \"--{}\"", "x".repeat(48))));
+    }
+
+    #[test]
+    fn telegram_shell_requires_a_masked_summary_with_cwd_inside_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db.sqlite")).unwrap();
+        let make = |command: String, cwd: &str| db.create_policy_tool_approval(
+            None, EngineId::Claude, RiskCategory::Delete, "sentetik",
+            &Action::Shell { command, cwd: cwd.into() }, None,
+        ).unwrap();
+        let prefix = "rm -rf ";
+        let target = "x".repeat(TELEGRAM_SUMMARY_LIMIT - prefix.len() - " @harness".len());
+        let exact = make(format!("{prefix}{target}"), r"synthetic\parent\harness");
+        assert!(exact.is_telegram_tool());
+        assert_eq!(exact.telegram_summary(), format!("{prefix}{target} @harness"));
+        assert_eq!(exact.telegram_summary().chars().count(), TELEGRAM_SUMMARY_LIMIT);
+        let overflow = make(format!("{prefix}{target}x"), "synthetic/parent/harness");
+        assert!(!overflow.is_telegram_tool());
+        let masked = make("rm stub".into(), "synthetic/password=synthetic-value");
+        assert!(!masked.is_telegram_tool());
+        assert!(!masked.telegram_summary().contains("synthetic-value"));
+        let push = make("git push --set-upstream --porcelain abcdefghij".into(), "w");
+        assert!(!push.is_telegram_tool());
+    }
+
+    #[test]
+    fn telegram_shell_rejects_explicit_push_destinations_and_risky_push_flags() {
+        for command in ["git push https://repo.example/stub", "git push repo.example:stub", "git push ../repo",
+            "git push --force origin main", "git push -f origin main", "git push --mirror origin",
+            "git push --delete origin branch", "git push --force-with-lease origin main",
+            "git push --repo=origin", "git push origin +main", "git push origin :main"] {
+            assert!(!remote_shell(command), "{command}");
+        }
+        assert!(remote_shell("git push -u origin feature/topic"));
+    }
+
+    #[test]
+    fn telegram_shell_rejects_path_qualified_programs() {
+        for command in [r"payload\git push origin main", "./tool/git push origin main",
+            r".\tools\rm x", r"C:\tools\git.exe push origin main", "C:git push origin main"] {
+            assert!(!remote_shell(command), "{command}");
+        }
+        assert!(remote_shell("git push origin main"));
+        assert!(remote_shell("rm -rf build"));
     }
 
     fn action() -> Action {

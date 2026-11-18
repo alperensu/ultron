@@ -29,7 +29,7 @@ fn ask(category: RiskCategory) -> Decision {
 
 fn uncertain() -> Decision {
     Decision::Ask {
-        reason: "Komut güvenle çözümlenemedi; kullanıcı onayı gerekir".into(),
+        reason: super::UNPARSEABLE_COMMAND_REASON.into(),
         category: RiskCategory::SystemConfig,
     }
 }

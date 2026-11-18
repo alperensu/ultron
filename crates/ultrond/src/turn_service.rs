@@ -16,7 +16,7 @@ use ultron_core::db::approvals::{ApprovalStatus, ResolvedBy};
 use ultron_core::db::quota_wait::{QuotaResumeContext, QuotaWaitState, ResumePolicy};
 use ultron_core::db::telegram::{TelegramAcceptance, TelegramTurnAcceptance};
 use ultron_core::engine::{ToolPolicy, TurnOutcome};
-use ultron_core::events::{EngineEvent, QuotaWaitReason, SwitchReason};
+use ultron_core::events::{EngineEvent, QuotaWaitReason};
 use ultron_core::ipc::{ChatInfo, PolicyArg, RouteResult};
 use ultron_core::quota::{QuotaReport, QuotaService};
 use ultron_core::session::TurnReservation;
@@ -267,7 +267,12 @@ impl TurnService {
                 let _grant = matches!(&execution.source, ExecutionSource::AcceptedUser(_))
                     .then(|| ultron_core::turn_grant::issue(&chat_id, &execution.cwd));
                 let outcome = run_audited(&inner.deps.manager, &inner.deps.log, &chat_id, inner.deps.executor.execute(execution)).await.map_err(unavailable)?;
-                let end_seq = inner.deps.db.next_seq(&chat_id).map_err(unavailable)? - 1;
+                let end_seq = if remote && matches!(outcome, TurnOutcome::Cancelled) {
+                    // Ready sınırı iptal olayını işaret eder; restart aynı sonucu okuyabilir.
+                    persist_terminal_event(&inner.deps, &chat_id, EngineEvent::TurnCancelled)?
+                } else {
+                    inner.deps.db.next_seq(&chat_id).map_err(unavailable)? - 1
+                };
                 let mut after = start_seq;
                 let mut text = String::new();
                 loop {
@@ -301,8 +306,7 @@ impl TurnService {
     }
 
     /// Scheduler hedefi etkin ve fallback_order içinde olmalıdır. Kaynak
-    /// oturum/motor bağlamı değişmez; farklı hedefte rezervasyondan önce
-    /// EngineSwitched(Quota) ve QuotaHandoff kalıcılaştırılır.
+    /// oturum/motor bağlamı değişmez. Geçiş olayının sahibi SessionManager'dır.
     /// Task 1 taşıma sözleşmesine hedef motor veya yeni bir yetki eklemez.
     pub fn resume_quota_step_with_engine(&self, request: ResumeQuotaStep, engine: EngineId) -> Result<AcceptedTurn, GatewayError> {
         self.resume(request, Some(engine))
@@ -321,12 +325,10 @@ impl TurnService {
         let engine = target.unwrap_or(context.wait.engine);
         if !deps.config.engines.iter().any(|e| e.id == engine && e.enabled) { return Err(GatewayError::Unavailable); }
         if target.is_some() && !settings.fallback_order.contains(&engine) { return Err(GatewayError::InvalidInput); }
+        let reservation = deps.manager.reserve_turn(&chat_id, engine).map_err(|_| GatewayError::Busy)?;
         if engine != context.wait.engine {
-            // Sessiz geçiş yoktur; olay yazılamazsa rezervasyon/çalıştırma yapılmaz.
-            deps.log.append(&chat_id, Some(&context.wait.source_session_id), EngineEvent::EngineSwitched { from: context.wait.engine, to: engine, reason: SwitchReason::Quota }).map_err(unavailable)?;
             deps.log.append(&chat_id, Some(&context.wait.source_session_id), EngineEvent::QuotaHandoff { logical_turn_id: context.wait.logical_turn_id.clone(), from: context.wait.engine, to: engine, resets_at: context.wait.reset_at, reason: QuotaWaitReason::FallbackSelected }).map_err(unavailable)?;
         }
-        let reservation = deps.manager.reserve_turn(&chat_id, engine).map_err(|_| GatewayError::Busy)?;
         let logical_turn_id = context.wait.logical_turn_id.clone();
         let user_event_seq = context.wait.user_event_seq;
         let remote = deps.db.telegram_turn_origin(&logical_turn_id).map_err(unavailable)?.is_some();
@@ -339,11 +341,18 @@ impl TurnService {
 /// Hata metni sabittir; sağlayıcı hatası, araç çıktısı veya sır taşınmaz. Transcript
 /// arızası SQLite final sınırını engelleyemez; yayın telafisi kalıcı seq'den yapılır.
 fn failed_completion(deps: &TurnServiceDependencies, logical_turn_id: &str, chat_id: &str, start_seq: i64, remote: bool) -> Result<TurnCompletion, GatewayError> {
-    let event = StoredEvent { id: uuid::Uuid::new_v4().to_string(), chat_id: chat_id.into(), session_id: None, seq: 0, ts: Utc::now(), kind: "error".into(), payload: serde_json::json!({"type": "error", "message": "Tur uygulama katmanında tamamlanamadı"}) };
-    let event = deps.db.append_event(&event).map_err(unavailable)?.ok_or(GatewayError::Unavailable)?;
-    let _ = deps.log.write_persisted_transcript(&event);
-    if remote && !deps.db.complete_telegram_turn(logical_turn_id, event.seq).map_err(unavailable)? { return Err(GatewayError::NeedsAttention); }
-    Ok(TurnCompletion { logical_turn_id: logical_turn_id.into(), chat_id: chat_id.into(), start_seq, end_seq: event.seq, outcome: CompletionOutcome::Failed, assistant_text: None })
+    let end_seq = persist_terminal_event(deps, chat_id, EngineEvent::Error { message: "Tur uygulama katmanında tamamlanamadı".into() })?;
+    if remote && !deps.db.complete_telegram_turn(logical_turn_id, end_seq).map_err(unavailable)? { return Err(GatewayError::NeedsAttention); }
+    Ok(TurnCompletion { logical_turn_id: logical_turn_id.into(), chat_id: chat_id.into(), start_seq, end_seq, outcome: CompletionOutcome::Failed, assistant_text: None })
+}
+
+fn persist_terminal_event(deps: &TurnServiceDependencies, chat_id: &str, terminal: EngineEvent) -> Result<i64, GatewayError> {
+    let payload = serde_json::to_value(terminal).map_err(unavailable)?;
+    let kind = payload["type"].as_str().ok_or(GatewayError::Unavailable)?.into();
+    let event = StoredEvent { id: uuid::Uuid::new_v4().to_string(), chat_id: chat_id.into(), session_id: None, seq: 0, ts: Utc::now(), kind, payload };
+    let stored = deps.db.append_event(&event).map_err(unavailable)?.ok_or(GatewayError::Unavailable)?;
+    let _ = deps.log.write_persisted_transcript(&stored);
+    Ok(stored.seq)
 }
 
 fn unavailable(_: impl std::fmt::Display) -> GatewayError { GatewayError::Unavailable }
@@ -491,6 +500,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use ultron_core::config::SummarizerMode;
     use ultron_core::engine::{Engine, FakeEngine};
+    use ultron_core::events::SwitchReason;
     use ultron_core::ipc::ProjectInfo;
     use ultron_core::quota::{HttpClient, HttpFuture, QuotaSources, Token};
     use crate::telegram::control::SystemClock;
@@ -535,7 +545,13 @@ mod tests {
                 self.seen.lock().unwrap().push((turn.logical_turn_id.clone(), turn.cwd.clone(), event.seq));
                 assert!(ultron_core::turn_grant::live_tokens().iter().any(|s| !s.is_empty()));
                 self.started.notify_one();
-                if self.blocked.load(Ordering::SeqCst) { self.release.notified().await; }
+                if self.blocked.load(Ordering::SeqCst) {
+                    let cancel = turn.reservation.cancellation_token();
+                    tokio::select! {
+                        () = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
+                        () = self.release.notified() => {},
+                    }
+                }
                 if self.fail.load(Ordering::SeqCst) { return Err(anyhow!("synthetic-private-executor-detail")); }
                 self.log.append(&turn.chat_id, None, EngineEvent::AssistantText { text: "Araçtan önceki açıklama".into() })?;
                 self.log.append(&turn.chat_id, None, EngineEvent::ToolResult { tool: "synthetic".into(), output_excerpt: "özel araç çıktısı".into(), is_error: false })?;
@@ -664,8 +680,7 @@ mod tests {
             assert_eq!(seen[0].checkpoint_seq, checkpoint);
         }
         let events = env.db.events_for_chat(&chat_id, Some(checkpoint)).unwrap();
-        assert!(matches!(serde_json::from_value::<EngineEvent>(events[0].payload.clone()).unwrap(), EngineEvent::EngineSwitched { from: EngineId::Claude, to: EngineId::Codex, reason: SwitchReason::Quota }));
-        assert!(matches!(serde_json::from_value::<EngineEvent>(events[1].payload.clone()).unwrap(), EngineEvent::QuotaHandoff { logical_turn_id, from: EngineId::Claude, to: EngineId::Codex, reason: QuotaWaitReason::FallbackSelected, .. } if logical_turn_id == result.logical_turn_id));
+        assert!(matches!(serde_json::from_value::<EngineEvent>(events[0].payload.clone()).unwrap(), EngineEvent::QuotaHandoff { logical_turn_id, from: EngineId::Claude, to: EngineId::Codex, reason: QuotaWaitReason::FallbackSelected, .. } if logical_turn_id == result.logical_turn_id));
         assert_eq!(env.db.events_for_chat(&chat_id, None).unwrap().iter().filter(|event| event.kind == "user_text").count(), 1);
         assert_eq!(env.db.quota_wait("wait").unwrap().unwrap().engine, EngineId::Claude);
         assert_eq!(env.db.telegram_turn_origin(&result.logical_turn_id).unwrap().unwrap().end_seq, Some(result.end_seq));
@@ -705,7 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_switch_is_persisted_before_reservation_and_log_failure_stops_execution() {
+    async fn busy_quota_fallback_does_not_publish_handoff_and_log_failure_stops_execution() {
         for fail_transcript in [false, true] {
             let env = env();
             let (request, chat_id, checkpoint) = claimed_quota(&env).await;
@@ -715,16 +730,73 @@ mod tests {
                 std::fs::remove_file(&path).unwrap();
                 std::fs::create_dir(&path).unwrap();
             }
-            let reservation = env.service.inner.deps.manager.reserve_turn(&chat_id, EngineId::Claude).unwrap();
+            let reservation = (!fail_transcript).then(|| env.service.inner.deps.manager.reserve_turn(&chat_id, EngineId::Claude).unwrap());
             let result = env.service.resume_quota_step_with_engine(request, EngineId::Codex);
             assert!(matches!((fail_transcript, result), (true, Err(GatewayError::Unavailable)) | (false, Err(GatewayError::Busy))));
             let events = env.db.events_for_chat(&chat_id, Some(checkpoint)).unwrap();
-            assert_eq!(events[0].kind, "engine_switched");
+            if fail_transcript {
+                assert_eq!(events[0].kind, "quota_handoff");
+            } else {
+                assert!(events.is_empty());
+            }
             assert_eq!(env.executor.calls.load(Ordering::SeqCst), 1);
             drop(reservation);
             assert!(env.service.inner.deps.manager.reserve_turn(&chat_id, EngineId::Codex).is_ok());
             env.service.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn production_quota_fallback_persists_exactly_one_engine_switch() {
+        let mut env = env();
+        let (request, chat_id, checkpoint) = claimed_quota(&env).await;
+        let deps = &mut Arc::get_mut(&mut env.service.inner).unwrap().deps;
+        let fixture = env._tmp.path().join("fallback.jsonl");
+        std::fs::write(&fixture, "{\"type\":\"turn_completed\"}\n").unwrap();
+        deps.manager = Arc::new(SessionManager::new(deps.db.clone(), deps.log.clone(), deps.config.clone(),
+            HashMap::from([(EngineId::Codex, Arc::new(FakeEngine::from_fixture(&fixture)) as Arc<dyn Engine>)])));
+        deps.executor = Arc::new(crate::server::SessionExecutor { manager: deps.manager.clone(), pending: Arc::default() });
+        deps.telegram.write().unwrap().fallback_order = vec![EngineId::Codex];
+        let accepted = env.service.resume_quota_step_with_engine(request, EngineId::Codex).unwrap();
+        assert_eq!(accepted.completion.await.unwrap().unwrap().outcome, CompletionOutcome::Completed);
+        let events = env.db.events_for_chat(&chat_id, Some(checkpoint)).unwrap();
+        let switches: Vec<_> = events.iter().filter(|event| event.kind == "engine_switched").collect();
+        assert_eq!(switches.len(), 1);
+        assert_eq!(serde_json::from_value::<EngineEvent>(switches[0].payload.clone()).unwrap(),
+            EngineEvent::EngineSwitched { from: EngineId::Claude, to: EngineId::Codex, reason: SwitchReason::Quota });
+        assert_eq!(env.db.chat_engine(&chat_id).unwrap(), Some(EngineId::Codex));
+        env.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_telegram_turn_replays_as_cancelled_after_database_reopen() {
+        use crate::server::DbOrigins;
+        use crate::telegram::notifications::NotificationCursor;
+        use ultron_core::config::NotifyMode;
+
+        let env = env();
+        env.executor.blocked.store(true, Ordering::SeqCst);
+        let accepted = env.service.submit_user_message(request(1)).await.unwrap();
+        env.executor.started.notified().await;
+        env.service.inner.deps.manager.cancel(&accepted.chat_id).await.unwrap();
+        let result = accepted.completion.await.unwrap().unwrap();
+        assert_eq!(result.outcome, CompletionOutcome::Cancelled);
+        assert_eq!(env.db.last_event(&accepted.chat_id).unwrap().unwrap().kind, "turn_cancelled");
+        env.service.shutdown().await.unwrap();
+        let paths = env.service.inner.deps.paths.clone();
+        let _temp = env._tmp;
+        drop(env.service);
+        drop(env.executor);
+        drop(env.db);
+        let db = Arc::new(Db::open(&paths.db).unwrap());
+        let mut cursor = NotificationCursor::new(db.clone(), Arc::new(DbOrigins { db: db.clone(), paths }));
+        cursor.initialize().unwrap();
+        let messages = cursor.replay(&[101], NotifyMode::Away, false, 48).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message.text, "Tur iptal edildi.");
+        assert_eq!(messages[0].logical_turn_id.as_deref(), Some(result.logical_turn_id.as_str()));
+        assert!(db.finish_telegram_delivery(&result.logical_turn_id, true).unwrap());
+        assert!(cursor.replay(&[101], NotifyMode::Away, false, 48).await.unwrap().is_empty());
     }
 
     #[tokio::test]

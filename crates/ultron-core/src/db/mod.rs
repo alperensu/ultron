@@ -909,6 +909,16 @@ impl Db {
         Ok(out)
     }
 
+    pub(crate) fn session_engine(&self, chat_id: &str, session_id: &str) -> Result<Option<EngineId>> {
+        let conn = self.conn()?;
+        let engine: Option<String> = conn.query_row(
+            "SELECT engine FROM engine_sessions WHERE chat_id = ?1 AND id = ?2",
+            params![chat_id, session_id],
+            |row| row.get(0),
+        ).optional()?;
+        engine.as_deref().map(engine_parse).transpose()
+    }
+
     /// Sohbetin en son başlayan oturumu (durumdan bağımsız).
     pub fn latest_session(&self, chat_id: &str) -> Result<Option<SessionRow>> {
         let conn = self.conn()?;

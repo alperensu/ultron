@@ -326,7 +326,10 @@ fn synthetic_policy_engine_child() {
         println!("{}", json!({"type":"session_started","native_session_id":"synthetic-native"}));
         let mut client = Client::connect(&pipe, &token).await.unwrap();
         // Eylem yalnız policy girdisidir; hiçbir Git komutu yürütülmez.
-        client.send(&Request::PolicyCheck { action: ultron_core::policy::Action::ToolCall { tool: "Bash".into(), input: json!({"command":"git reset --hard"}) }, chat_id: Some(chat), engine: EngineId::Claude, wait_secs: 15 }).await.unwrap();
+        let action = ultron_core::policy::Action::Shell {
+            command: "git rebase x".into(), cwd: std::env::current_dir().unwrap(),
+        };
+        client.send(&Request::PolicyCheck { action, chat_id: Some(chat), engine: EngineId::Claude, wait_secs: 15 }).await.unwrap();
         let Response::Ok { data } = client.next().await.unwrap().unwrap() else { panic!("policy yanıtı yok"); };
         let decision: ultron_core::policy::Decision = serde_json::from_value(data["decision"].clone()).unwrap();
         let text = if matches!(decision, ultron_core::policy::Decision::Allow) { "Sentetik araç onaylandı." } else { "Sentetik araç reddedildi." };
@@ -369,6 +372,7 @@ async fn daemon_telegram_command_approval_and_reply() {
         assert_eq!(final_message["chat_id"], 101); assert!(final_message.get("parse_mode").is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let binding = db.telegram_binding(101).unwrap().unwrap(); let events = db.events_for_chat(&binding, None).unwrap();
+        assert!(notification["text"].as_str().unwrap().contains(&format!("git rebase x @{binding}")));
         assert_eq!(events.iter().filter(|e| e.kind == "user_text").count(), 1);
         assert!(!serde_json::to_string(&events).unwrap().contains("izinsiz"));
         let mut streamed = Vec::new();

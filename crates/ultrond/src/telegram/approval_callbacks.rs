@@ -4,18 +4,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use ultron_core::config::TelegramConfig;
+use ultron_core::config::{MAX_TELEGRAM_ALLOWED_USERS, TelegramConfig};
 use ultron_core::db::approvals::{Approval, ApprovalStatus};
 use ultron_core::policy::RiskCategory;
 
-use crate::server::approvals::{Approvals, MAX_APPROVAL_WAIT_SECS};
+use crate::server::approvals::{Approvals, MAX_APPROVAL_WAIT_SECS, MAX_NOTIFIABLE_APPROVALS};
 use super::contracts::{
     AnswerCallbackQuery, Clock, EditMessageText, GatewayApplication, GatewayError,
     InlineKeyboardButton, InlineKeyboardMarkup, SendMessage, TelegramCallbackQuery,
     TelegramTransport, TransportError, TurnOrigin,
 };
 
-pub const MAX_CALLBACK_NONCES: usize = 1024;
+pub const MAX_CALLBACK_NONCES: usize = MAX_NOTIFIABLE_APPROVALS * MAX_TELEGRAM_ALLOWED_USERS * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallbackError {
@@ -68,6 +68,12 @@ pub struct ApprovalCallbacks {
     nonces: Mutex<HashMap<String, Capability>>,
 }
 
+impl Drop for ApprovalCallbacks {
+    fn drop(&mut self) {
+        self.approvals.close_telegram_gateway();
+    }
+}
+
 impl ApprovalCallbacks {
     pub fn new(
         approvals: Arc<Approvals>,
@@ -76,6 +82,7 @@ impl ApprovalCallbacks {
         settings: Arc<RwLock<TelegramConfig>>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        approvals.open_telegram_gateway();
         Self { approvals, application, transport, settings, clock, nonces: Mutex::new(HashMap::new()) }
     }
 
@@ -130,7 +137,7 @@ impl ApprovalCallbacks {
         if row.status != ApprovalStatus::Pending {
             return Err(GatewayError::InvalidInput.into());
         }
-        if !row.is_telegram_tool() {
+        if !self.approvals.is_telegram_offered(&row).map_err(|_| GatewayError::Unavailable)? {
             let sent = self.transport.send_message(SendMessage {
                 chat_id: private_chat_id,
                 text: "Bu işlem için masaüstünde onay gerekli.".into(),
@@ -152,10 +159,20 @@ impl ApprovalCallbacks {
         let deadline = self.clock.now_monotonic() + remaining;
         let keys = {
             let mut nonces = self.nonces.lock().map_err(|_| GatewayError::Unavailable)?;
+            let now = self.clock.now_monotonic();
+            if let Some(message_id) = nonces.values()
+                .filter(|entry| entry.approval_id == approval_id && entry.user_id == user_id
+                    && entry.deadline > now && !entry.consumed)
+                .find_map(|entry| entry.message_id)
+            {
+                return Ok(ApprovalNotification { message_id, actionable: true });
+            }
             if nonces.len() + 2 > MAX_CALLBACK_NONCES {
-                // Baskı altında yalnız süresi dolmuş mezar taşları feda edilir.
-                let now = self.clock.now_monotonic();
-                nonces.retain(|_, capability| capability.deadline > now);
+                // Bitmiş kararlar veya artık izinli olmayan alıcılar canlı onayı engellemez.
+                let users = &self.settings.read().map_err(|_| GatewayError::Unavailable)?.allowed_user_ids;
+                let pending = self.approvals.pending_ids().map_err(|_| GatewayError::Unavailable)?;
+                nonces.retain(|_, capability| capability.deadline > now
+                    && users.contains(&capability.user_id) && pending.contains(&capability.approval_id));
             }
             if nonces.len() + 2 > MAX_CALLBACK_NONCES { return Err(GatewayError::Busy.into()); }
             let mut keys = Vec::with_capacity(2);
@@ -444,11 +461,20 @@ mod tests {
             let callbacks = Arc::new(ApprovalCallbacks::new(queue.clone(), app.clone(), transport.clone(), settings.clone(), clock.clone()));
             Self { _temp: temp, db, queue, settings, clock, transport, app, callbacks }
         }
-        fn row(&self) -> Approval {
-            let row = self.db.create_policy_tool_approval(Some("chat"), EngineId::Claude, RiskCategory::Delete,
-                "password=synthetic-secret", &Action::FileDelete { path: "synthetic/dir/synthetic.txt".into() }, None).unwrap();
+        async fn row(&self) -> Approval {
+            let mut events = self.queue.subscribe_global();
+            let queue = self.queue.clone();
+            tokio::spawn(async move {
+                queue.check(
+                    Action::FileDelete { path: "synthetic/dir/synthetic.txt".into() },
+                    Some("chat".into()), EngineId::Claude, MAX_APPROVAL_WAIT_SECS,
+                ).await.unwrap();
+            });
+            let requested = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+            assert_eq!(requested.kind, "approval_requested");
+            let id = requested.payload["approval_id"].as_str().unwrap();
             *self.clock.utc.lock().unwrap() = Utc::now();
-            row
+            self.queue.get(id).unwrap().unwrap()
         }
         fn key(&self, notification: usize, approve: bool) -> String {
             self.transport.sent.lock().unwrap()[notification]["reply_markup"]["inline_keyboard"][0][usize::from(!approve)]["callback_data"]
@@ -465,10 +491,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_nonce_is_single_use() {
+    async fn telegram_decision_is_audited_and_callback_nonce_is_single_use() {
         let f = Fixture::new();
-        let row = f.row();
-        f.callbacks.notify(&row.id, 101, 101).await.unwrap();
+        let row = f.row().await;
+        let first_message = f.callbacks.notify(&row.id, 101, 101).await.unwrap();
+        let repeated = f.callbacks.notify(&row.id, 101, 101).await.unwrap();
+        assert_eq!(repeated.message_id, first_message.message_id);
         f.callbacks.notify(&row.id, 202, 202).await.unwrap();
         let key = f.key(0, true);
         assert_eq!(key.len(), 50);
@@ -483,18 +511,16 @@ mod tests {
         assert!(sibling.already_decided);
         assert_eq!(sibling.status, ApprovalStatus::Approved);
         assert_eq!(f.app.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(f.db.get_approval(&row.id).unwrap().unwrap().resolved_by, Some(ResolvedBy::Approver));
+        assert_eq!(f.db.get_approval(&row.id).unwrap().unwrap().resolved_by, Some(ResolvedBy::Telegram));
+        let audit = f.db.events_for_chat("chat", None).unwrap();
+        assert!(audit.iter().any(|event| event.kind == "approval_resolved" && event.payload["by"] == "telegram"));
         for edit in f.transport.edited.lock().unwrap().iter() {
             assert_eq!(edit["text"], "Onaylandı.");
             assert_eq!(edit["reply_markup"]["inline_keyboard"], serde_json::json!([]));
         }
         assert!(f.transport.answers.lock().unwrap()[1]["text"].as_str().unwrap().contains("Zaten karara bağlandı"));
         let output = f.transport.sent.lock().unwrap()[0].to_string();
-        assert!(!output.contains("synthetic-secret"));
-        // Yalnız kısa maskeli özet: dosya adı var, tam yol yok.
-        assert!(output.contains("synthetic.txt"));
-        assert!(!output.contains("synthetic/dir"));
-        assert!(!output.contains("synthetic\\\\dir"));
+        assert!(output.contains("sil synthetic/dir/synthetic.txt"));
         assert!(!output.contains("parse_mode"));
         assert!(output.len() < 4096);
     }
@@ -502,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn callback_binds_identity_chat_message_and_decision() {
         let f = Fixture::new();
-        let row = f.row();
+        let row = f.row().await;
         f.callbacks.notify(&row.id, 101, 101).await.unwrap();
         let key = f.key(0, true);
         let mut variants = vec![f.query(&key, 202, 1), f.query(&key, 101, 2)];
@@ -526,7 +552,7 @@ mod tests {
     async fn expiry_restart_expired_approval_and_removed_user_are_rejected() {
         for scenario in ["expiry", "restart", "expired_approval", "removed_user"] {
             let f = Fixture::new();
-            let row = f.row();
+            let row = f.row().await;
             f.callbacks.notify(&row.id, 101, 101).await.unwrap();
             let query = f.query(&f.key(0, true), 101, 1);
             match scenario {
@@ -549,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn failed_delivery_gives_no_capability_and_edit_failure_keeps_decision() {
         let f = Fixture::new();
-        let row = f.row();
+        let row = f.row().await;
         f.transport.fail_send.store(true, Ordering::SeqCst);
         assert!(f.callbacks.notify(&row.id, 101, 101).await.is_err());
         let lost = f.key(0, true);
@@ -571,7 +597,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn desktop_telegram_race_first_decision_wins() {
         let f = Fixture::new();
-        let row = f.row();
+        let row = f.row().await;
         f.callbacks.notify(&row.id, 101, 101).await.unwrap();
         let query = f.query(&f.key(0, true), 101, 1);
         let queue = f.queue.clone();
@@ -590,7 +616,7 @@ mod tests {
     #[tokio::test]
     async fn desktop_decision_is_reported_and_refresh_removes_buttons() {
         let f = Fixture::new();
-        let row = f.row();
+        let row = f.row().await;
         f.callbacks.notify(&row.id, 101, 101).await.unwrap();
         f.queue.resolve(&row.id, false, ResolvedBy::Approver).unwrap();
         f.callbacks.refresh_resolved(&row.id).await.unwrap();
@@ -604,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn transient_resolve_failure_releases_nonces_and_answers() {
         let f = Fixture::new();
-        let row = f.row();
+        let row = f.row().await;
         f.callbacks.notify(&row.id, 101, 101).await.unwrap();
         let key = f.key(0, true);
         f.app.fail_next.store(true, Ordering::SeqCst);
@@ -621,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_after_deadline_still_edits_message_within_grace() {
         let f = Fixture::new();
-        let row = f.row();
+        let row = f.row().await;
         f.callbacks.notify(&row.id, 101, 101).await.unwrap();
         let key = f.key(0, true);
         f.clock.advance(300);
@@ -665,8 +691,8 @@ mod tests {
     #[tokio::test]
     async fn nonce_capacity_is_bounded_and_expiry_releases_it() {
         let f = Fixture::new();
-        let row = f.row();
-        let template = Capability { approval_id: row.id.clone(), user_id: 101, chat_id: 101,
+        let row = f.row().await;
+        let template = Capability { approval_id: row.id.clone(), user_id: 202, chat_id: 202,
             message_id: Some(1), approve: true, deadline: f.clock.now_monotonic() + Duration::from_secs(1),
             retain_until: f.clock.now_monotonic() + Duration::from_secs(1) + TOMBSTONE_GRACE, consumed: false };
         for index in 0..MAX_CALLBACK_NONCES {
@@ -683,6 +709,69 @@ mod tests {
         // Onayın kendi 300 sn penceresi için UTC saati yeniden hizalanır.
         *f.clock.utc.lock().unwrap() = Utc::now();
         f.callbacks.notify(&row.id, 101, 101).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finished_approvals_do_not_starve_new_callbacks_at_nonce_capacity() {
+        let f = Fixture::new();
+        let old = f.row().await;
+        let new = f.row().await;
+        let now = f.clock.now_monotonic();
+        let stale = Capability { approval_id: old.id.clone(), user_id: 101, chat_id: 101,
+            message_id: Some(1), approve: true, deadline: now + Duration::from_secs(30),
+            retain_until: now + TOMBSTONE_GRACE, consumed: false };
+        for index in 0..MAX_CALLBACK_NONCES {
+            f.callbacks.nonces.lock().unwrap().insert(index.to_string(), stale.clone());
+        }
+        f.queue.resolve(&old.id, false, ResolvedBy::Approver).unwrap();
+        assert!(f.callbacks.notify(&new.id, 101, 101).await.unwrap().actionable);
+        assert_eq!(f.callbacks.nonces.lock().unwrap().len(), 2);
+        let key = f.key(0, true);
+        assert_eq!(f.callbacks.handle_callback(1, &f.query(&key, 101, 1)).await.unwrap().status, ApprovalStatus::Approved);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telegram_capacity_preserves_the_fifth_approval_for_desktop() {
+        let f = Fixture::new();
+        let mut events = f.queue.subscribe_global();
+        let mut checks = tokio::task::JoinSet::new();
+        let mut ids = Vec::new();
+        for index in 0..=MAX_NOTIFIABLE_APPROVALS + 1 {
+            let queue = f.queue.clone();
+            checks.spawn(async move {
+                let command = if index == 0 { "rm synthetic.txt; echo done" } else { "rm synthetic.txt" };
+                queue.check_owned(Action::Shell { command: command.into(), cwd: "workspace/harness".into() },
+                    Some("chat".into()), EngineId::Claude, 30, Some("synthetic-requester")).await.unwrap()
+            });
+            let requested = events.recv().await.unwrap();
+            assert_eq!(requested.kind, "approval_requested");
+            let id = requested.payload["approval_id"].as_str().unwrap();
+            *f.clock.utc.lock().unwrap() = Utc::now();
+            let offered = f.callbacks.notify(id, 101, 101).await.unwrap();
+            assert_eq!(offered.actionable, (1..=MAX_NOTIFIABLE_APPROVALS).contains(&index));
+            let sent = f.transport.sent.lock().unwrap();
+            if offered.actionable {
+                assert!(sent[index]["text"].as_str().unwrap().contains("rm synthetic.txt @harness"));
+            } else {
+                assert!(sent[index]["reply_markup"].is_null());
+            }
+            ids.push(id.to_owned());
+        }
+        assert_eq!(f.callbacks.nonces.lock().unwrap().len(), 2 * MAX_NOTIFIABLE_APPROVALS);
+        assert_eq!(f.queue.pending_ids().unwrap().len(), MAX_NOTIFIABLE_APPROVALS + 2);
+        f.queue.resolve(&ids[1], false, ResolvedBy::Desktop).unwrap();
+        let fifth = ids.last().unwrap();
+        assert!(!f.callbacks.notify(fifth, 101, 101).await.unwrap().actionable);
+        assert_eq!(f.app.resolve_tool_approval(
+            TurnOrigin::Telegram { user_id: 101, private_chat_id: 101, update_id: 1 }, fifth, true,
+        ).await, Err(GatewayError::Unauthorized));
+        for id in ids.iter().filter(|id| *id != &ids[1]) {
+            let row = f.queue.resolve(id, false, ResolvedBy::Desktop).unwrap();
+            assert_eq!(row.resolved_by, Some(ResolvedBy::Desktop));
+        }
+        while let Some(result) = checks.join_next().await {
+            assert!(matches!(result.unwrap(), ultron_core::policy::Decision::Deny { .. }));
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -722,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn shared_resolver_revalidates_identity_and_local_capability_handles_elevation() {
         let f = Fixture::new();
-        let row = f.row();
+        let row = f.row().await;
         for (user_id, private_chat_id, update_id) in [(303, 303, 1), (101, 202, 1), (101, 101, -1), (0, 0, 1)] {
             assert_eq!(f.app.resolver.resolve(TurnOrigin::Telegram { user_id, private_chat_id, update_id }, &row.id, true).await,
                 Err(GatewayError::Unauthorized));

@@ -14,6 +14,7 @@ pub const BUSY: &str = "Tur sürüyor; tamamlandıktan sonra yeniden gönderin."
 pub const SELECTION_PREFIX: &str = "sel:";
 const SELECTION_TTL: Duration = Duration::from_secs(300);
 const MAX_SELECTIONS: usize = 128;
+const LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(PartialEq, Eq)]
 pub enum Command<'a> { New, Chats, Status, Limit, Approvals, Help, Text(&'a str) }
@@ -49,11 +50,12 @@ pub struct CommandProcessor {
     app: Arc<dyn GatewayApplication>,
     clock: Arc<dyn Clock>,
     selections: HashMap<String, Selection>,
+    limit_until: HashMap<i64, Instant>,
 }
 
 impl CommandProcessor {
     pub fn new(db: Arc<Db>, app: Arc<dyn GatewayApplication>, clock: Arc<dyn Clock>) -> Self {
-        Self { db, app, clock, selections: HashMap::new() }
+        Self { db, app, clock, selections: HashMap::new(), limit_until: HashMap::new() }
     }
 
     fn clear_choices(&mut self, user: i64) { self.selections.retain(|_, choice| choice.user != user); }
@@ -124,7 +126,16 @@ impl CommandProcessor {
                     else { Ok(self.choices(user, chat, "Bir sohbet seçin:", options)) }
                 }
                 Command::Status => Ok(single(chat, format_status(&self.app.status_snapshot().await?))),
-                Command::Limit => Ok(single(chat, format_limit(&self.app.quota_report().await?))),
+                Command::Limit => {
+                    let now = self.clock.now_monotonic();
+                    self.limit_until.retain(|_, until| *until > now);
+                    if let std::collections::hash_map::Entry::Vacant(entry) = self.limit_until.entry(user) {
+                        entry.insert(now + LIMIT_COOLDOWN);
+                        Ok(single(chat, format_limit(&self.app.quota_report().await?)))
+                    } else {
+                        Ok(single(chat, "Kota sorgusunu yinelemek için lütfen bekleyin."))
+                    }
+                }
                 Command::Approvals => Ok(CommandResult { show_approvals: true, ..Default::default() }),
                 Command::Text(_) => Ok(single(chat, if busy { BUSY } else { "Boş metin gönderilemez." })),
                 Command::Help => Ok(single(chat, HELP)),

@@ -20,6 +20,12 @@ pub use rules::{evaluate, is_delete_like};
 /// Onaylanan silmenin ham çalışmak yerine döndüğü gerekçe (Claude `ultron trash` kullanır).
 pub const APPROVED_DELETE_REDIRECT: &str = "Onaylandı: silmek için `ultron trash <yol>` kullan; dosya çöp kutusuna gider ve geri alınabilir.";
 
+/// Çözümlenemeyen komut onaylanmazsa hook aynı gerekçeyi motora döndürür.
+pub const UNPARSEABLE_COMMAND_REASON: &str = concat!(
+    "Komut güvenle çözümlenemedi; kullanıcı onayı gerekir. ",
+    "Komutu tek ve sade bir komut olarak (zincir, alt kabuk veya yönlendirme olmadan) yeniden dene."
+);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Shell { command: String, cwd: PathBuf },

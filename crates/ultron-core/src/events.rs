@@ -70,6 +70,7 @@ pub enum EngineEvent {
         reason: QuotaWaitReason,
     },
     TurnCompleted,
+    TurnCancelled,
     Error {
         message: String,
     },

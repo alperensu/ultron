@@ -33,6 +33,19 @@ fn ask(command: &str, category: RiskCategory) {
 }
 
 #[test]
+fn policy_unparseable_command_asks_with_retry_hint() {
+    let Decision::Ask { reason, category } =
+        shell("rm (Get-Item sentetik.txt)", &PolicyConfig::default())
+    else {
+        panic!("Çözümlenemeyen komut için onay bekleniyordu");
+    };
+    assert_eq!(category, RiskCategory::SystemConfig);
+    assert!(reason.ends_with(
+        "Komutu tek ve sade bir komut olarak (zincir, alt kabuk veya yönlendirme olmadan) yeniden dene."
+    ));
+}
+
+#[test]
 fn destructive_commands_ask() {
     for command in [
         "rm -rf target",

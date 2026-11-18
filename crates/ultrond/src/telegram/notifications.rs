@@ -20,19 +20,6 @@ pub trait OriginReader: Send + Sync {
         -> BoxFuture<'a, Result<Vec<TelegramTurnOrigin>, GatewayError>>;
 }
 
-/// Düz kesme (not eklemez): ara tamponlar için; son nota format_final ekler.
-fn truncate_plain(text: &mut String, max_units: usize) {
-    if text.encode_utf16().count() <= max_units { return; }
-    let mut used = 0;
-    let mut end = 0;
-    for (index, c) in text.char_indices() {
-        if used + c.len_utf16() > max_units { break; }
-        used += c.len_utf16();
-        end = index + c.len_utf8();
-    }
-    text.truncate(end);
-}
-
 /// Gönderim kuyruğundaki final mantıksal tur kimlikleri; send_loop işi bitirince bırakır.
 pub type InFlight = Arc<Mutex<HashSet<String>>>;
 
@@ -55,6 +42,93 @@ pub fn istanbul_time(at: Option<DateTime<Utc>>) -> String {
         .format("%d.%m.%Y %H:%M UTC+03:00").to_string()).unwrap_or_else(|| "bilinmiyor".into())
 }
 
+fn plain_inline(line: &str, out: &mut String) {
+    let mut rest = line;
+    let mut bold: Option<(&str, usize)> = None;
+    while let Some(ch) = rest.chars().next() {
+        if ["https://", "http://", "ftp://", "www.", "mailto:"].iter().any(|prefix| {
+            rest.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        }) {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let url = &rest[..end];
+            // Yalnız biçimlendirmenin tamamı URL ise çevresindeki işareti ayır.
+            let url = bold.filter(|(marker, at)| at + marker.len() == out.len())
+                .and_then(|(marker, _)| url.strip_suffix(marker)).unwrap_or(url);
+            out.push_str(url);
+            rest = &rest[url.len()..];
+            continue;
+        }
+        if let Some(code) = rest.strip_prefix('`')
+            && let Some(end) = code.find('`').filter(|end| *end > 0)
+        {
+            out.push_str(&code[..end]);
+            rest = &code[end + 1..];
+            continue;
+        }
+        if let Some(marker) = ["**", "__"].into_iter().find(|marker| rest.starts_with(marker)) {
+            let before = line[..line.len() - rest.len()].chars().next_back();
+            let after = rest[marker.len()..].chars().next();
+            let word = |c: char| c.is_alphanumeric() || c == '_';
+            if let Some((opening, at)) = bold
+                && opening == marker
+                && out.len() > at + marker.len()
+                && before.is_some_and(|c| !c.is_whitespace())
+                && !after.is_some_and(word)
+            {
+                out.replace_range(at..at + marker.len(), "");
+                bold = None;
+            } else {
+                if !before.is_some_and(word) && after.is_some_and(|c| !c.is_whitespace() && c != ch) {
+                    bold = Some((marker, out.len()));
+                }
+                out.push_str(marker);
+            }
+            rest = &rest[marker.len()..];
+        } else {
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+}
+
+fn markdown_to_plain(text: &str) -> String {
+    let mut out = String::new();
+    let mut fence = None;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let trimmed = body.trim_start_matches(' ');
+        let indent = body.len() - trimmed.len();
+        let ticks = trimmed.bytes().take_while(|b| *b == b'`').count();
+        if let Some(opening) = fence {
+            if indent <= 3 && ticks >= opening && trimmed[ticks..].trim().is_empty() {
+                fence = None;
+            } else {
+                out.push_str(line);
+            }
+            continue;
+        }
+        if indent <= 3 && ticks >= 3 && !trimmed[ticks..].contains('`') {
+            fence = Some(ticks);
+            continue;
+        }
+        let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+        let content = if indent <= 3 && (1..=6).contains(&hashes)
+            && let Some(heading) = trimmed[hashes..].strip_prefix([' ', '\t'])
+        {
+            heading.trim_start_matches([' ', '\t'])
+        } else if let Some(item) = trimmed.strip_prefix("* ").or_else(|| trimmed.strip_prefix("- ")) {
+            out.push_str(&body[..indent]);
+            out.push_str("• ");
+            item
+        } else {
+            body
+        };
+        plain_inline(content, &mut out);
+        out.push_str(&line[body.len()..]);
+    }
+    out
+}
+
 pub fn format_final(text: Option<&str>, outcome: CompletionOutcome) -> String {
     let status = match outcome {
         CompletionOutcome::Completed => "Tur tamamlandı.",
@@ -63,7 +137,9 @@ pub fn format_final(text: Option<&str>, outcome: CompletionOutcome) -> String {
         CompletionOutcome::Failed => "Tur tamamlanamadı; ayrıntılar masaüstünde.",
     };
     bounded_text(&match text.filter(|s| !s.trim().is_empty()) {
-        Some(text) if outcome == CompletionOutcome::Completed => format!("{status}\n\n{text}"),
+        Some(text) if outcome == CompletionOutcome::Completed => {
+            format!("{status}\n\n{}", markdown_to_plain(text))
+        }
         _ => status.into(),
     })
 }
@@ -116,13 +192,19 @@ pub fn reply(chat_id: i64, text: impl Into<String>) -> Outbound {
 pub struct NotificationCursor {
     db: Arc<Db>,
     origins: Arc<dyn OriginReader>,
-    after: HashMap<String, i64>,
+    positions: HashMap<String, ReplayPosition>,
     in_flight: InFlight,
+}
+
+#[derive(Default)]
+struct ReplayPosition {
+    after: i64,
+    recipients: HashSet<i64>,
 }
 
 impl NotificationCursor {
     pub fn new(db: Arc<Db>, origins: Arc<dyn OriginReader>) -> Self {
-        Self { db, origins, after: HashMap::new(), in_flight: Arc::default() }
+        Self { db, origins, positions: HashMap::new(), in_flight: Arc::default() }
     }
 
     pub fn in_flight_handle(&self) -> InFlight { self.in_flight.clone() }
@@ -132,38 +214,39 @@ impl NotificationCursor {
     pub fn initialize(&mut self) -> Result<(), GatewayError> {
         for chat in self.db.list_chats(None, true).map_err(|_| GatewayError::Unavailable)? {
             let seq = self.db.last_event(&chat.id).map_err(|_| GatewayError::Unavailable)?.map_or(0, |e| e.seq);
-            self.after.insert(chat.id, seq);
+            self.positions.insert(chat.id, ReplayPosition { after: seq, ..Default::default() });
         }
         Ok(())
     }
 
     /// `capacity`: kuyrukta kalan boş yer. Çıktı bunu aşmaz; imleç yalnız çıktıya
-    /// alınan olaylar için ilerler, sığmayan olay/final sonraki tick'te yeniden denenir.
+    /// alınan alıcıları kaydeder; tamamlanmayan fan-out sonraki tick'te devam eder.
     pub async fn replay(&mut self, allowed: &[i64], mode: NotifyMode, away: bool, capacity: usize) -> Result<Vec<Outbound>, GatewayError> {
         let mut output = Vec::new();
         for chat in self.db.list_chats(None, true).map_err(|_| GatewayError::Unavailable)? {
             if output.len() >= capacity { break; }
             let origins = self.origins.origins_for_chat(&chat.id).await?;
-            let after = self.after.entry(chat.id.clone()).or_insert(0);
+            let position = self.positions.entry(chat.id.clone()).or_default();
             // Bir sayfa/tick: büyük geçmiş poll/cancel işlemlerini aç bırakmaz.
-            let page = self.db.events_for_chat_page(&chat.id, Some(*after), 128).map_err(|_| GatewayError::Unavailable)?;
-            for event in page {
-                let mut messages = Vec::new();
+            let page = self.db.events_for_chat_page(&chat.id, Some(position.after), 128).map_err(|_| GatewayError::Unavailable)?;
+            'events: for event in page {
                 if let Some((text, silent, logical_id)) = event_text(&event) {
                     for user in allowed {
+                        if position.recipients.contains(user) { continue; }
                         let origin = origins.iter().find(|o| o.user_id == *user && o.private_chat_id == *user
                             && if let Some(id) = &logical_id { o.logical_turn_id == *id }
                             else { event.seq >= o.start_seq && o.end_seq.is_none_or(|end| event.seq <= end) });
                         if should_notify(mode, away, origin.is_some(), false) {
+                            if output.len() == capacity { break 'events; }
                             let mut message = reply(*user, text.clone());
                             message.message.disable_notification = silent;
-                            messages.push(message);
+                            output.push(message);
+                            position.recipients.insert(*user);
                         }
                     }
                 }
-                if output.len() + messages.len() > capacity { break; }
-                *after = event.seq;
-                output.extend(messages);
+                position.after = event.seq;
+                position.recipients.clear();
             }
             for origin in origins {
                 if output.len() >= capacity { break; }
@@ -201,11 +284,10 @@ pub fn final_from_origin(db: &Db, origin: &TelegramTurnOrigin) -> Result<Option<
                 Ok(EngineEvent::AssistantText { text: chunk }) => text.push_str(&chunk),
                 Ok(EngineEvent::ToolCall { .. } | EngineEvent::ToolResult { .. } | EngineEvent::Command { .. }) => text.clear(),
                 Ok(EngineEvent::TurnCompleted) => outcome = CompletionOutcome::Completed,
+                Ok(EngineEvent::TurnCancelled) if event.seq == end => outcome = CompletionOutcome::Cancelled,
                 Ok(EngineEvent::Error { .. }) => outcome = CompletionOutcome::Failed,
                 _ => {},
             }
-            // Not eklenmez; format_final kesilmiş metne notu tek kez ekler.
-            truncate_plain(&mut text, MESSAGE_LIMIT);
         }
         if !progressed || after >= end { break; }
     }
@@ -237,6 +319,28 @@ mod tests {
         assert!(out.ends_with(TRUNCATION_NOTE));
         assert!(out.starts_with("Tur tamamlandı."));
         assert_eq!(format_final(Some(""), CompletionOutcome::Failed), "Tur tamamlanamadı; ayrıntılar masaüstünde.");
+    }
+
+    #[test]
+    fn telegram_final_renders_markdown_as_plain_turkish_text() {
+        let markdown = concat!(
+            "# Özet\n###### Ayrıntılar\n",
+            "Şu an **Claude Opus 5.5** ve __Türkçe yanıt__ hazır.\n",
+            "* `snake_case` ve 2*3\n  - **`çıktı`**\n",
+            "https://örnek.example/a**b**?q=__değer__ #etiket\n",
+            "**Bağlantı https://örnek.example/** burada**\n",
+            "```powershell\n# yorum\n- **aynen**  \n    `kod`\n```\n",
+            "Son satır: snake_case ve yarım **işaret."
+        );
+        assert_eq!(format_final(Some(markdown), CompletionOutcome::Completed), concat!(
+            "Tur tamamlandı.\n\nÖzet\nAyrıntılar\n",
+            "Şu an Claude Opus 5.5 ve Türkçe yanıt hazır.\n",
+            "• snake_case ve 2*3\n  • çıktı\n",
+            "https://örnek.example/a**b**?q=__değer__ #etiket\n",
+            "Bağlantı https://örnek.example/** burada\n",
+            "# yorum\n- **aynen**  \n    `kod`\n",
+            "Son satır: snake_case ve yarım **işaret."
+        ));
     }
 
     #[test]
@@ -347,6 +451,23 @@ mod tests {
         assert_eq!(out.message.text.matches("Yanıt kısaltıldı").count(), 1);
         assert!(out.message.text.ends_with(TRUNCATION_NOTE));
         assert!(out.message.text.encode_utf16().count() <= MESSAGE_LIMIT);
+    }
+
+    #[test]
+    fn stored_final_is_converted_before_truncation() {
+        let (_temp, db, log) = fixture();
+        let event = user_event("c1");
+        let ultron_core::db::telegram::TelegramAcceptance::Accepted(_) = db.accept_telegram_turn(&ultron_core::db::telegram::TelegramTurnAcceptance {
+            bot_id: 100, update_id: 1, user_id: 101, private_chat_id: 101, logical_turn_id: "t", event: &event }).unwrap()
+        else { panic!("kabul bekleniyordu"); };
+        let markdown = "**ışık** ".repeat(600);
+        assert!(markdown.encode_utf16().count() > MESSAGE_LIMIT);
+        log.append("c1", None, EngineEvent::AssistantText { text: markdown }).unwrap();
+        log.append("c1", None, EngineEvent::AssistantText { text: "__bitti__".into() }).unwrap();
+        let done = log.append("c1", None, EngineEvent::TurnCompleted).unwrap();
+        assert!(db.complete_telegram_turn("t", done.seq).unwrap());
+        let out = final_from_origin(&db, &db.telegram_turn_origin("t").unwrap().unwrap()).unwrap().unwrap();
+        assert_eq!(out.message.text, format!("Tur tamamlandı.\n\n{}bitti", "ışık ".repeat(600)));
     }
 
     #[test]
