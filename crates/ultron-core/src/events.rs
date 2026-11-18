@@ -102,6 +102,39 @@ pub enum EngineEvent {
     PolicyNotice {
         message: String,
     },
+    /// Tur sonu özetleyicisi bir hafıza adayı üretti (aday içeriği olaya kopyalanmaz).
+    MemorySuggestionCreated {
+        suggestion_id: crate::memory::MemoryId,
+        candidate_hash: crate::memory::Sha256Hash,
+        end_seq: i64,
+    },
+    /// Aday kabul/ret/çakışma ile sonuçlandı; ilk karar kalıcıdır.
+    MemorySuggestionResolved {
+        suggestion_id: crate::memory::MemoryId,
+        status: crate::memory::SuggestionStatus,
+        by: crate::memory::DecisionSource,
+    },
+    /// Not oluşturuldu/değişti/çöpe taşındı. İlişkisiz kasa değişimleri `memory_changes`
+    /// cursor'ından sunulur; bu olay yalnız gerçek kaynak sohbetine varsa yazılır.
+    MemoryItemChanged {
+        item_id: crate::memory::MemoryId,
+        revision: crate::memory::Revision,
+        content_hash: crate::memory::Sha256Hash,
+        change: crate::memory::MemoryChangeKind,
+        source_seq: Option<i64>,
+    },
+    /// İndeks durumu (yeniden indeksleme/bozulma); kayıt başarısını taklit etmez.
+    MemoryIndexStatusChanged {
+        status: crate::memory::MemoryIndexStatus,
+        pending: u32,
+    },
+    /// Yerel modelin gölge P(güvenli) ölçümü; yalnız bilgi, karar kaynağı değildir.
+    ApprovalShadowScored {
+        approval_id: String,
+        model: String,
+        prompt_version: String,
+        p_safe: f64,
+    },
     PolicyViolation {
         #[serde(serialize_with = "serialize_violation_command", deserialize_with = "deserialize_violation_command")]
         command: String,

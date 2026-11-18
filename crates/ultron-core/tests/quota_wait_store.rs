@@ -105,7 +105,13 @@ fn scheduler_migration_preserves_existing_waits_and_events() {
     drop(db);
     // Önceki v12 şemasını kur; yeniden açılış gerçek ekleyici v13 migration'ını uygular.
     let conn = rusqlite::Connection::open(tmp.path().join("store.db")).unwrap();
-    conn.execute_batch("ALTER TABLE quota_waits DROP COLUMN scheduler_json; PRAGMA user_version = 12;").unwrap();
+    // v14 (hafıza) nesneleri de kaldırılır: yeniden açılış v13 ve v14'ü sırayla uygular.
+    conn.execute_batch(
+        "DROP TABLE memory_fts; DROP TABLE memory_item_receipts; DROP TABLE memory_receipts;
+         DROP TABLE memory_items; DROP TABLE memory_suggestions; DROP TABLE memory_jobs;
+         DROP TABLE memory_operations; DROP TABLE memory_changes; DROP TABLE approval_shadow_scores;
+         ALTER TABLE quota_waits DROP COLUMN scheduler_json; PRAGMA user_version = 12;",
+    ).unwrap();
     drop(conn);
     let db = Db::open(&tmp.path().join("store.db")).unwrap();
     let restored = db.quota_wait(&wait.id).unwrap().unwrap();

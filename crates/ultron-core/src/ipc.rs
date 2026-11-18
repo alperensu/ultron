@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use crate::config::{EngineId, NotifyMode, TelegramConfig};
 use crate::db::StoredEvent;
 use crate::engine::ToolPolicy;
+use crate::memory::contracts as mem;
 use crate::paths::Paths;
 
 /// Tek bir JSON satırının üst sınırı (1 MiB).
@@ -185,6 +186,123 @@ pub enum Request {
     SetPolicyConfig {
         settings: PolicySettings,
     },
+    /// Hafıza istekleri (Aşama 5a). Hepsi yalnız masaüstü/CLI onaylayıcısı içindir
+    /// (`require_approver`); motor requester'ı canlı tur belirteciyle yalnız dar `memory_search`/
+    /// `memory_get` aracını kullanır ve bu istekleri göndermez. Sınırlar `Request::validate_memory`.
+    MemoryList {
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        memory_type: Option<mem::MemoryType>,
+    },
+    MemoryGet {
+        id: mem::MemoryId,
+    },
+    MemorySearch {
+        query: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    MemoryCapture(mem::MemoryCaptureRequest),
+    MemoryUpdate(mem::MemoryUpdateRequest),
+    MemoryDelete {
+        request_id: String,
+        id: mem::MemoryId,
+        expected_revision: mem::Revision,
+    },
+    MemorySuggestions {
+        #[serde(default)]
+        status: Option<mem::SuggestionStatus>,
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// Onay, kullanıcının gördüğü adayın hash'ine bağlıdır; içerik değiştiyse conflict döner.
+    MemoryResolveSuggestion {
+        request_id: String,
+        id: mem::MemoryId,
+        accept: bool,
+        expected_candidate_hash: mem::Sha256Hash,
+    },
+    MemoryRefresh {
+        request_id: String,
+    },
+    /// Salt okunur gölge karşılaştırma raporu; puan yazma isteği yoktur.
+    ApprovalsShadowReport {
+        #[serde(default)]
+        since_days: Option<u32>,
+    },
+}
+
+impl Request {
+    /// Hafıza isteklerinin sınır doğrulaması (boyut, sayfa, kimlik biçimi). Diğer istekler `Ok`.
+    ///
+    /// ZORUNLU ÇAĞRI (Task 8): serde çözümlemesi bu sınırları uygulamaz; `dispatch` her hafıza
+    /// isteğini `require_approver` sonrası, işlemeden önce bu fonksiyondan geçirmek zorundadır
+    /// ve bu, entegrasyon testiyle sabitlenmelidir.
+    pub fn validate_memory(&self) -> Result<(), mem::ContractError> {
+        match self {
+            Request::MemoryList { cursor, limit, project, .. } => {
+                if let Some(cursor) = cursor {
+                    mem::validate_cursor(cursor)?;
+                }
+                if let Some(project) = project {
+                    mem::validate_project_name(project)?;
+                }
+                mem::validate_page_limit(*limit, mem::MAX_PAGE_LIMIT)
+            }
+            Request::MemoryGet { .. } => Ok(()),
+            Request::MemorySearch { query, project, limit } => {
+                mem::validate_query(query)?;
+                if let Some(project) = project {
+                    mem::validate_project_name(project)?;
+                }
+                mem::validate_page_limit(*limit, mem::MAX_PAGE_LIMIT)
+            }
+            Request::MemoryCapture(request) => request.validate(),
+            Request::MemoryUpdate(request) => request.validate(),
+            Request::MemoryDelete { request_id, .. } => mem::validate_request_id(request_id),
+            Request::MemorySuggestions { cursor, limit, .. } => {
+                if let Some(cursor) = cursor {
+                    mem::validate_cursor(cursor)?;
+                }
+                mem::validate_page_limit(*limit, mem::MAX_SUGGESTION_PAGE_LIMIT)
+            }
+            Request::MemoryResolveSuggestion { request_id, .. } => mem::validate_request_id(request_id),
+            Request::MemoryRefresh { request_id } => mem::validate_request_id(request_id),
+            Request::ApprovalsShadowReport { since_days } => match since_days {
+                Some(days) if *days == 0 || *days > mem::MAX_SHADOW_REPORT_DAYS => {
+                    Err(mem::ContractError::LimitExceeded)
+                }
+                _ => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    /// İstek bir hafıza/gölge rapor isteği mi (sunucu kapısı için).
+    pub fn is_memory_request(&self) -> bool {
+        matches!(
+            self,
+            Request::MemoryList { .. }
+                | Request::MemoryGet { .. }
+                | Request::MemorySearch { .. }
+                | Request::MemoryCapture(_)
+                | Request::MemoryUpdate(_)
+                | Request::MemoryDelete { .. }
+                | Request::MemorySuggestions { .. }
+                | Request::MemoryResolveSuggestion { .. }
+                | Request::MemoryRefresh { .. }
+                | Request::ApprovalsShadowReport { .. }
+        )
+    }
 }
 
 /// Masaüstü ayar sözleşmesi; değerlendirme kurallarının davranışını değiştirmez.
@@ -599,6 +717,36 @@ impl std::fmt::Debug for Request {
             Request::ImportProjects { .. } => f.write_str("ImportProjects"),
             Request::RemoveImportedChats { .. } => f.write_str("RemoveImportedChats"),
             Request::Route { .. } => f.write_str("Route"),
+            Request::MemoryList { .. } => f.write_str("MemoryList { .. }"),
+            Request::MemoryGet { id } => write!(f, "MemoryGet {{ id: {id} }}"),
+            Request::MemorySearch { .. } => f.write_str("MemorySearch { query: <gizli>, .. }"),
+            Request::MemoryCapture(request) => f.debug_tuple("MemoryCapture").field(request).finish(),
+            Request::MemoryUpdate(request) => f
+                .debug_struct("MemoryUpdate")
+                .field("request_id", &request.request_id)
+                .field("id", &request.id)
+                .field("expected_revision", &request.expected_revision)
+                .field("patch", &request.patch)
+                .finish(),
+            Request::MemoryDelete { id, expected_revision, .. } => f
+                .debug_struct("MemoryDelete")
+                .field("id", id)
+                .field("expected_revision", expected_revision)
+                .finish_non_exhaustive(),
+            Request::MemorySuggestions { status, .. } => f
+                .debug_struct("MemorySuggestions")
+                .field("status", status)
+                .finish_non_exhaustive(),
+            Request::MemoryResolveSuggestion { id, accept, .. } => f
+                .debug_struct("MemoryResolveSuggestion")
+                .field("id", id)
+                .field("accept", accept)
+                .finish_non_exhaustive(),
+            Request::MemoryRefresh { .. } => f.write_str("MemoryRefresh { .. }"),
+            Request::ApprovalsShadowReport { since_days } => f
+                .debug_struct("ApprovalsShadowReport")
+                .field("since_days", since_days)
+                .finish(),
             Request::SetResetRights { pool, count } => f
                 .debug_struct("SetResetRights")
                 .field("pool", pool)

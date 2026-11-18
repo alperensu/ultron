@@ -26,6 +26,9 @@ regex = "1.11.1"
 # Claude kota uc noktasi icin; ring tabanli rustls (aws-lc/cmake gerektirmez), varsayilan native-tls yok.
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
+# Hafiza kasasi: makbuz hash'i ve YAML on bilgi (alias/tag onceden reddedilir).
+sha2 = "0.10"
+yaml-rust2 = "=0.13.0"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Power",

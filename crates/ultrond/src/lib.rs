@@ -2,6 +2,7 @@
 //! testler sunucuyu süreç içinde başlatır.
 
 pub mod keepawake;
+pub mod memory_contracts;
 pub mod auto_continue;
 pub mod server;
 pub mod telegram;

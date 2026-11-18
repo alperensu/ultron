@@ -237,3 +237,126 @@ fn telegram_allowlist_is_bounded() {
     assert!(cfg.telegram.validate().is_err());
     assert!(load_config_text(&toml::to_string(&cfg).unwrap()).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Aşama 5a: [memory] yapılandırması ve kasa yolu çözümlemesi
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn ultron_home_never_resolves_to_the_real_profile_vault() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    // SAFETY: ENV_LOCK ile bu dosyadaki diğer env kullanan testlerden ayrıştırılmıştır.
+    unsafe { std::env::set_var("ULTRON_HOME", tmp.path()) };
+    let paths = Paths::resolve().unwrap();
+    unsafe { std::env::remove_var("ULTRON_HOME") };
+
+    assert_eq!(paths.default_vault, tmp.path().join("vault"));
+    let vault = ultron_core::config::MemoryConfig::default().resolve_vault(&paths).unwrap();
+    assert!(vault.starts_with(tmp.path()), "{vault:?}");
+    for var in ["USERPROFILE", "HOME"] {
+        if let Some(profile) = std::env::var_os(var) {
+            assert!(!vault.starts_with(&profile) || tmp.path().starts_with(&profile), "gerçek profil kasası seçildi");
+            assert!(!vault.ends_with("harness-brain"));
+        }
+    }
+    // Dizin yalnız `ensure` ile durum dizinleri oluşturulur; kasa kendiliğinden açılmaz.
+    paths.ensure().unwrap();
+    assert!(!paths.default_vault.exists());
+}
+
+#[test]
+fn production_resolution_uses_harness_brain_under_the_profile() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = tmp.path().join("profil");
+    let local = tmp.path().join("yerel");
+    let old_home = std::env::var_os("ULTRON_HOME");
+    let old_profile = std::env::var_os("USERPROFILE");
+    let old_local = std::env::var_os("LOCALAPPDATA");
+    // SAFETY: ENV_LOCK altında; değerler test sonunda geri yüklenir. Dizinler oluşturulmaz.
+    unsafe {
+        std::env::remove_var("ULTRON_HOME");
+        std::env::set_var("USERPROFILE", &profile);
+        std::env::set_var("LOCALAPPDATA", &local);
+    }
+    let paths = Paths::resolve();
+    unsafe {
+        match old_home { Some(v) => std::env::set_var("ULTRON_HOME", v), None => std::env::remove_var("ULTRON_HOME") }
+        match old_profile { Some(v) => std::env::set_var("USERPROFILE", v), None => std::env::remove_var("USERPROFILE") }
+        match old_local { Some(v) => std::env::set_var("LOCALAPPDATA", v), None => std::env::remove_var("LOCALAPPDATA") }
+    }
+    let paths = paths.unwrap();
+    assert_eq!(paths.root, local.join("ultron"));
+    assert_eq!(paths.default_vault, profile.join("harness-brain"));
+    assert!(!profile.exists() && !local.exists(), "çözümleme dosya sistemine dokunmamalı");
+}
+
+#[test]
+fn explicit_temp_vault_path_is_resolved_and_validated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::from_root(tmp.path().join("kok"));
+    let other = tempfile::tempdir().unwrap();
+    let cfg = ultron_core::config::MemoryConfig {
+        vault_path: Some(other.path().join("kasa").to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_ok());
+    assert_eq!(cfg.resolve_vault(&paths).unwrap(), other.path().join("kasa"));
+    assert!(!other.path().join("kasa").exists(), "çözümleme dizin oluşturmamalı");
+
+    for bad in ["", "kasa", "./kasa", "..\\kasa", "C:\\a\\..\\b", "\\\\sunucu\\paylasim\\k", "//sunucu/p/k", "\\\\?\\C:\\k", "C:\\k\0x"] {
+        let cfg = ultron_core::config::MemoryConfig { vault_path: Some(bad.to_string()), ..Default::default() };
+        assert!(cfg.validate().is_err(), "kabul edilmemeliydi: {bad:?}");
+    }
+    // Kasa Ultron durum dizininin içinde veya onu içeren yerde olamaz.
+    for inside in [paths.root.join("state").join("kasa"), paths.run.clone(), paths.transcripts.join("x"), paths.root.clone(),
+                   paths.root.parent().unwrap().to_path_buf()] {
+        let cfg = ultron_core::config::MemoryConfig { vault_path: Some(inside.to_string_lossy().into_owned()), ..Default::default() };
+        assert!(cfg.resolve_vault(&paths).is_err(), "{inside:?}");
+    }
+}
+
+#[test]
+fn memory_config_defaults_toml_and_bounds() {
+    use ultron_core::config::MemoryConfig;
+    let defaults = MemoryConfig::default();
+    assert_eq!(defaults.vault_path, None);
+    assert_eq!(defaults.retrieval_max_tokens, 2000);
+    assert!(defaults.validate().is_ok());
+
+    // Eski config (memory bölümü yok) ve v13 öncesi dosyalar olduğu gibi yüklenir.
+    let cfg = load_config_text("default_engine = \"codex\"\n").unwrap();
+    assert_eq!(cfg.memory, MemoryConfig::default());
+    assert_eq!(cfg.default_engine, EngineId::Codex);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vault = tmp.path().join("kasa").to_string_lossy().replace('\\', "/");
+    let cfg = load_config_text(&format!("[memory]\nvault_path = \"{vault}\"\nretrieval_max_tokens = 1500\nscan_interval_secs = 30\n")).unwrap();
+    assert_eq!(cfg.memory.retrieval_max_tokens, 1500);
+    assert_eq!(cfg.memory.scan_interval_secs, 30);
+    assert_eq!(cfg.memory.retrieval_max_items, 8, "belirtilmeyen anahtar varsayılan kalır");
+    let roundtrip: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(roundtrip.memory, cfg.memory);
+
+    for (key, value) in [
+        ("retrieval_max_tokens", 199), ("retrieval_max_tokens", 8001), ("retrieval_max_chars", 499),
+        ("retrieval_max_items", 0), ("retrieval_max_items", 21), ("scan_interval_secs", 9),
+        ("max_suggestions_per_turn", 0), ("job_queue_limit", 1025), ("job_max_attempts", 11), ("max_vault_items", 99),
+    ] {
+        assert!(load_config_text(&format!("[memory]\n{key} = {value}\n")).is_err(), "{key}={value}");
+    }
+    assert!(load_config_text("[memory]\nvault_path = \"goreli/kasa\"\n").is_err());
+}
+
+#[test]
+fn unknown_memory_keys_are_rejected_with_a_clear_error() {
+    // Yazım hatası kasa yolunun sessizce varsayılana düşmesine yol açmamalı.
+    let err = load_config_text("[memory]\nvault_pth = \"C:/kasa\"\n").unwrap_err().to_string();
+    assert_eq!(err, "config.toml [memory] bölümü geçersiz (bilinmeyen anahtar veya değer)");
+    let err = load_config_text("[memory]\nretrieval_max_tokens = \"çok\"\n").unwrap_err().to_string();
+    assert!(err.contains("[memory]"), "{err}");
+    // Memory dışı bozuk config eski, sızıntısız mesajı korur.
+    let err = load_config_text("[telegram]\nallowed_user_ids = [101,,202]\n").unwrap_err().to_string();
+    assert_eq!(err, "config.toml çözümlenemedi");
+}

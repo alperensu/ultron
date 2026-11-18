@@ -1216,6 +1216,22 @@ async fn dispatch(
     cancel: &CancellationToken,
 ) -> Result<Flow> {
     match request {
+        // Aşama 5a Task 1: hafıza/gölge rapor istekleri tel sözleşmesine eklendi ancak servis
+        // Task 8'de bağlanır. Yetki ve sınırlar şimdiden uygulanır; başarı simüle edilmez.
+        request @ (Request::MemoryList { .. }
+        | Request::MemoryGet { .. }
+        | Request::MemorySearch { .. }
+        | Request::MemoryCapture(_)
+        | Request::MemoryUpdate(_)
+        | Request::MemoryDelete { .. }
+        | Request::MemorySuggestions { .. }
+        | Request::MemoryResolveSuggestion { .. }
+        | Request::MemoryRefresh { .. }
+        | Request::ApprovalsShadowReport { .. }) => {
+            require_approver(auth)?;
+            request.validate_memory().map_err(|e| anyhow!(e.to_string()))?;
+            Err(crate::memory_contracts::not_wired_error())
+        }
         Request::TelegramStatus => {
             ok(writer, serde_json::to_value(st.telegram.status().map_err(gateway_error)?)?).await?;
             Ok(Flow::Continue)

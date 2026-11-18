@@ -289,6 +289,16 @@ fn variant_name(r: &Request) -> &'static str {
         Request::TrashPurge { .. } => "trash_purge",
         Request::GetPolicyConfig => "get_policy_config",
         Request::SetPolicyConfig { .. } => "set_policy_config",
+        Request::MemoryList { .. } => "memory_list",
+        Request::MemoryGet { .. } => "memory_get",
+        Request::MemorySearch { .. } => "memory_search",
+        Request::MemoryCapture(_) => "memory_capture",
+        Request::MemoryUpdate(_) => "memory_update",
+        Request::MemoryDelete { .. } => "memory_delete",
+        Request::MemorySuggestions { .. } => "memory_suggestions",
+        Request::MemoryResolveSuggestion { .. } => "memory_resolve_suggestion",
+        Request::MemoryRefresh { .. } => "memory_refresh",
+        Request::ApprovalsShadowReport { .. } => "approvals_shadow_report",
     }
 }
 
@@ -372,12 +382,37 @@ async fn every_request_variant_is_implemented_or_explicitly_not_yet_wired() {
             fallback_order: vec![],
         },
         Request::DesktopHeartbeat { instance_id: "synthetic-instance".into() },
+        // Aşama 5a: hafıza istekleri onaylayıcı ister; servis Task 8'de bağlanana kadar
+        // onaylayıcıya da açık "henüz bağlanmadı" hatası döner (başarı simüle edilmez).
+        Request::MemoryList { cursor: None, limit: None, project: None, memory_type: None },
+        Request::MemoryGet { id: ultron_core::memory::MemoryId::new() },
+        Request::MemorySearch { query: "sentetik".into(), project: None, limit: None },
+        Request::MemoryCapture(ultron_core::memory::MemoryCaptureRequest {
+            request_id: "sentetik-istek".into(), text: "sentetik not".into(),
+            title: None, project: None, tags: vec![], chat_ref: None,
+        }),
+        Request::MemoryUpdate(ultron_core::memory::MemoryUpdateRequest {
+            request_id: "sentetik-istek".into(), id: ultron_core::memory::MemoryId::new(),
+            expected_revision: ultron_core::memory::Revision::FIRST,
+            patch: ultron_core::memory::MemoryPatch { title: Some("Sentetik".into()), ..Default::default() },
+        }),
+        Request::MemoryDelete {
+            request_id: "sentetik-istek".into(), id: ultron_core::memory::MemoryId::new(),
+            expected_revision: ultron_core::memory::Revision::FIRST,
+        },
+        Request::MemorySuggestions { status: None, cursor: None, limit: None },
+        Request::MemoryResolveSuggestion {
+            request_id: "sentetik-istek".into(), id: ultron_core::memory::MemoryId::new(), accept: false,
+            expected_candidate_hash: ultron_core::memory::Sha256Hash::of(b"sentetik"),
+        },
+        Request::MemoryRefresh { request_id: "sentetik-istek".into() },
+        Request::ApprovalsShadowReport { since_days: None },
     ];
     for req in admin {
         seen.insert(variant_name(&req));
         assert_eq!(error_of(&h, req).await, "yetkisiz: onaylayıcı rolü gerekli");
     }
-    assert_eq!(seen.len(), 33,"her varyant denenmeli: {seen:?}");
+    assert_eq!(seen.len(), 43,"her varyant denenmeli: {seen:?}");
     h.shutdown().await;
 }
 

@@ -10,6 +10,9 @@ pub struct Paths {
     pub transcripts: PathBuf,
     pub fixtures_private: PathBuf,
     pub run: PathBuf,
+    /// Varsayılan hafıza kasası. `from_root` altında `root/vault` (test güvenli); üretim
+    /// çözümlemesinde (`ULTRON_HOME` yok) `~/harness-brain`. `[memory] vault_path` ayarı bunu ezer.
+    pub default_vault: PathBuf,
 }
 
 impl Paths {
@@ -20,6 +23,7 @@ impl Paths {
             transcripts: root.join("transcripts"),
             fixtures_private: root.join("fixtures-private"),
             run: root.join("run"),
+            default_vault: root.join("vault"),
             root,
         }
     }
@@ -31,7 +35,16 @@ impl Paths {
         }
         let local = std::env::var_os("LOCALAPPDATA")
             .context("LOCALAPPDATA tanımlı değil ve ULTRON_HOME yok")?;
-        Ok(Paths::from_root(PathBuf::from(local).join("ultron")))
+        let mut paths = Paths::from_root(PathBuf::from(local).join("ultron"));
+        // Yalnız üretim çözümlemesi kullanıcı profilindeki kasaya bağlanır; `ULTRON_HOME`
+        // (test/izole kurulum) kullanıldığında gerçek profil kasasına asla dokunulmaz.
+        if let Some(profile) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            let profile = PathBuf::from(profile);
+            if profile.is_absolute() {
+                paths.default_vault = profile.join("harness-brain");
+            }
+        }
+        Ok(paths)
     }
 
     /// Gerekli dizinleri oluşturur.

@@ -147,6 +147,103 @@ impl TelegramConfig {
     }
 }
 
+/// Hafıza kasası ve sınırları (`[memory]`). Varsayılanlar güvenlidir; kasa yolu açıkça verilmezse
+/// `Paths::default_vault` kullanılır (üretimde `~/harness-brain`, `ULTRON_HOME` altında
+/// `root/vault`). Bu yapı dosya sistemine dokunmaz.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Mutlak kasa yolu; `None` ise varsayılan kasa.
+    pub vault_path: Option<String>,
+    /// Prompt'a eklenecek hafıza için token üst tahmini (UTF-8 bayt sayısı).
+    pub retrieval_max_tokens: u32,
+    /// Prompt'a eklenecek hafıza için karakter sınırı.
+    pub retrieval_max_chars: u32,
+    pub retrieval_max_items: u32,
+    /// Dış değişiklik taramasının periyodu (saniye).
+    pub scan_interval_secs: u32,
+    pub max_suggestions_per_turn: u32,
+    pub job_queue_limit: u32,
+    pub job_max_attempts: u32,
+    /// Açılış envanterinde izlenecek en çok not sayısı.
+    pub max_vault_items: u32,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            vault_path: None,
+            retrieval_max_tokens: 2000,
+            retrieval_max_chars: 6000,
+            retrieval_max_items: 8,
+            scan_interval_secs: 60,
+            max_suggestions_per_turn: 5,
+            job_queue_limit: 64,
+            job_max_attempts: 3,
+            max_vault_items: 5000,
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn validate(&self) -> Result<()> {
+        let in_range = |name: &str, value: u32, lo: u32, hi: u32| -> Result<()> {
+            if (lo..=hi).contains(&value) {
+                Ok(())
+            } else {
+                bail!("memory.{name} {lo}–{hi} aralığında olmalı")
+            }
+        };
+        in_range("retrieval_max_tokens", self.retrieval_max_tokens, 200, 8000)?;
+        in_range("retrieval_max_chars", self.retrieval_max_chars, 500, 32000)?;
+        in_range("retrieval_max_items", self.retrieval_max_items, 1, 20)?;
+        in_range("scan_interval_secs", self.scan_interval_secs, 10, 3600)?;
+        in_range("max_suggestions_per_turn", self.max_suggestions_per_turn, 1, 10)?;
+        in_range("job_queue_limit", self.job_queue_limit, 1, 1024)?;
+        in_range("job_max_attempts", self.job_max_attempts, 1, 10)?;
+        in_range("max_vault_items", self.max_vault_items, 100, 50000)?;
+        if let Some(path) = &self.vault_path {
+            Self::validate_vault_path(path)?;
+        }
+        Ok(())
+    }
+
+    fn validate_vault_path(raw: &str) -> Result<()> {
+        use std::path::{Component, Path};
+        if raw.is_empty() || raw.len() > 400 || raw.chars().any(char::is_control) {
+            bail!("memory.vault_path geçersiz");
+        }
+        // UNC, aygıt (`\?\`, `\.\`) ve çift eğik çizgili yollar kabul edilmez.
+        if raw.starts_with("\\\\") || raw.starts_with("//") {
+            bail!("memory.vault_path yerel mutlak bir yol olmalı");
+        }
+        let path = Path::new(raw);
+        if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+            bail!("memory.vault_path mutlak olmalı ve '..' içermemeli");
+        }
+        Ok(())
+    }
+
+    /// Kasa köküne çözülür; dosya sistemine dokunmaz. Kasa, Ultron durum dizininin (DB, run,
+    /// transcripts) içinde veya onu içeren bir yer olamaz.
+    pub fn resolve_vault(&self, paths: &Paths) -> Result<std::path::PathBuf> {
+        let vault = match &self.vault_path {
+            Some(raw) => {
+                Self::validate_vault_path(raw)?;
+                std::path::PathBuf::from(raw)
+            }
+            None => paths.default_vault.clone(),
+        };
+        let state = paths.root.join("state");
+        let state_dirs = [&state, &paths.transcripts, &paths.fixtures_private, &paths.run];
+        let overlaps = paths.root.starts_with(&vault) || state_dirs.iter().any(|dir| vault.starts_with(dir));
+        if overlaps && self.vault_path.is_some() {
+            bail!("memory.vault_path Ultron durum dizininden ayrı olmalı");
+        }
+        Ok(vault)
+    }
+}
+
 /// Ultron genel yapılandırması (`root\config.toml`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -161,6 +258,8 @@ pub struct Config {
     /// Özetleyici seçimi: `auto` (varsayılan), `agy`, `claude-haiku` veya `none`.
     pub summarizer: SummarizerMode,
     pub telegram: TelegramConfig,
+    /// Hafıza kasası ve bütçeleri (`[memory]`).
+    pub memory: MemoryConfig,
 }
 
 /// Havuz başına kalan sıfırlama hakları; `None` = bilinmiyor.
@@ -183,6 +282,7 @@ impl Default for Config {
             claude_live_quota: true,
             summarizer: SummarizerMode::Auto,
             telegram: TelegramConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -194,7 +294,19 @@ impl Config {
         let cfg: Config = if file.exists() {
             let text = std::fs::read_to_string(&file)?;
             // TOML hata bağlamı kaynak satırını (izinli kimlikleri de) içerebilir.
-            toml::from_str(&text).map_err(|_| anyhow!("config.toml çözümlenemedi"))?
+            toml::from_str(&text).map_err(|_| {
+                // `[memory]` yazım hatası kasa yolunun sessizce varsayılana düşmesine yol açar;
+                // bu bölüm kimlik/sır taşımadığı için ayrı ve açık hata verilir.
+                let memory_invalid = toml::from_str::<toml::Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("memory").cloned())
+                    .is_some_and(|m| m.try_into::<MemoryConfig>().is_err());
+                if memory_invalid {
+                    anyhow!("config.toml [memory] bölümü geçersiz (bilinmeyen anahtar veya değer)")
+                } else {
+                    anyhow!("config.toml çözümlenemedi")
+                }
+            })?
         } else {
             Config::default()
         };
@@ -202,6 +314,7 @@ impl Config {
             engine.validate()?;
         }
         cfg.telegram.validate()?;
+        cfg.memory.validate()?;
         Ok(cfg)
     }
 }

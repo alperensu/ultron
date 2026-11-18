@@ -215,6 +215,164 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE quota_waits ADD COLUMN scheduler_json TEXT NOT NULL DEFAULT '{}';
     "#,
+    // v14: Aşama 5a hafıza indeksi/kuyrukları (yalnız ekleyici). Kabul edilmiş hafızanın
+    // doğruluk kaynağı Markdown kasasıdır; memory_items/memory_fts yeniden üretilebilir önbellektir.
+    // Öneri, iş ve işlem tabloları kalıcı durumdur; yeniden indeksleme bunları silmez.
+    // Hash kısıtları GLOB/substr ile büyük/küçük harf duyarlıdır (LIKE ASCII'de duyarsızdır).
+    r#"
+    CREATE TABLE memory_items (
+        id TEXT PRIMARY KEY NOT NULL,
+        relative_path TEXT NOT NULL UNIQUE COLLATE NOCASE CHECK(length(relative_path) BETWEEN 1 AND 260),
+        memory_type TEXT NOT NULL
+            CHECK(memory_type IN ('user', 'project', 'home', 'tool', 'person', 'rule', 'decision')),
+        project TEXT,
+        visibility TEXT NOT NULL DEFAULT 'private'
+            CHECK(visibility IN ('private', 'project', 'shared')),
+        remote_allowed INTEGER NOT NULL DEFAULT 0 CHECK(remote_allowed IN (0, 1)),
+        sensitivity TEXT NOT NULL DEFAULT 'personal'
+            CHECK(sensitivity IN ('normal', 'personal', 'finance')),
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        revision INTEGER NOT NULL CHECK(revision >= 1),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 71 AND substr(content_hash, 1, 7) = 'sha256:' AND NOT (substr(content_hash, 8) GLOB '*[^0-9a-f]*')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        review_at TEXT,
+        index_state TEXT NOT NULL DEFAULT 'indexed'
+            CHECK(index_state IN ('indexed', 'pending', 'stale', 'conflict', 'quarantined', 'inactive')),
+        trashed_at TEXT,
+        CHECK(NOT (visibility = 'private' AND remote_allowed = 1))
+    );
+    CREATE INDEX memory_items_project ON memory_items(project, updated_at);
+    CREATE INDEX memory_items_state ON memory_items(index_state, trashed_at);
+
+    CREATE TABLE memory_receipts (
+        hash TEXT PRIMARY KEY NOT NULL CHECK(length(hash) = 71 AND substr(hash, 1, 7) = 'sha256:' AND NOT (substr(hash, 8) GLOB '*[^0-9a-f]*')),
+        relative_path TEXT NOT NULL CHECK(length(relative_path) BETWEEN 1 AND 260),
+        source_kind TEXT NOT NULL CHECK(source_kind IN ('event', 'file', 'import')),
+        source_locator TEXT,
+        chat_id TEXT,
+        seq_from INTEGER,
+        seq_to INTEGER,
+        claim_status TEXT NOT NULL CHECK(claim_status IN ('claimed', 'verified', 'user_authored')),
+        excerpt TEXT NOT NULL DEFAULT '',
+        evidence_state TEXT NOT NULL DEFAULT 'present'
+            CHECK(evidence_state IN ('present', 'missing', 'mismatch')),
+        captured_at TEXT NOT NULL,
+        CHECK(source_kind != 'event'
+            OR (chat_id IS NOT NULL AND seq_from IS NOT NULL AND seq_to IS NOT NULL
+                AND seq_from >= 1 AND seq_to >= seq_from)),
+        CHECK(source_kind = 'event' OR source_locator IS NOT NULL)
+    );
+
+    CREATE TABLE memory_item_receipts (
+        item_id TEXT NOT NULL REFERENCES memory_items(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL CHECK(revision >= 1),
+        receipt_hash TEXT NOT NULL REFERENCES memory_receipts(hash),
+        UNIQUE(item_id, revision, receipt_hash)
+    );
+    CREATE INDEX memory_item_receipts_hash ON memory_item_receipts(receipt_hash);
+
+    CREATE TABLE memory_suggestions (
+        id TEXT PRIMARY KEY NOT NULL,
+        chat_id TEXT NOT NULL,
+        logical_turn_id TEXT NOT NULL,
+        end_seq INTEGER NOT NULL CHECK(end_seq >= 1),
+        candidate_json TEXT NOT NULL,
+        candidate_hash TEXT NOT NULL CHECK(length(candidate_hash) = 71 AND substr(candidate_hash, 1, 7) = 'sha256:' AND NOT (substr(candidate_hash, 8) GLOB '*[^0-9a-f]*')),
+        target_id TEXT,
+        target_revision INTEGER CHECK(target_revision IS NULL OR target_revision >= 1),
+        receipts_json TEXT NOT NULL DEFAULT '[]',
+        dedupe_key TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'accepted', 'rejected', 'conflict')),
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by TEXT CHECK(decided_by IN ('desktop', 'telegram', 'recovery')),
+        decision_request_id TEXT,
+        decision_request_hash TEXT CHECK(decision_request_hash IS NULL OR (length(decision_request_hash) = 71 AND substr(decision_request_hash, 1, 7) = 'sha256:' AND NOT (substr(decision_request_hash, 8) GLOB '*[^0-9a-f]*'))),
+        accepted_item_id TEXT,
+        UNIQUE(chat_id, logical_turn_id, candidate_hash),
+        CHECK((target_id IS NULL) = (target_revision IS NULL)),
+        CHECK((decision_request_id IS NULL) = (decision_request_hash IS NULL)),
+        CHECK((status = 'pending' AND decided_at IS NULL AND decided_by IS NULL)
+           OR (status != 'pending' AND decided_at IS NOT NULL AND decided_by IS NOT NULL))
+    );
+    CREATE INDEX memory_suggestions_status ON memory_suggestions(status, created_at);
+    CREATE INDEX memory_suggestions_dedupe ON memory_suggestions(dedupe_key);
+
+    CREATE TABLE memory_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        logical_turn_id TEXT NOT NULL,
+        end_seq INTEGER NOT NULL CHECK(end_seq >= 1),
+        status TEXT NOT NULL DEFAULT 'queued'
+            CHECK(status IN ('queued', 'running', 'done', 'failed', 'cancelled')),
+        attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+        lease_until TEXT,
+        generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+        error_code TEXT CHECK(error_code IS NULL OR error_code IN
+            ('timeout', 'engine_unavailable', 'invalid_output', 'store_unavailable', 'cancelled', 'quota')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(chat_id, logical_turn_id, end_seq)
+    );
+    CREATE INDEX memory_jobs_status ON memory_jobs(status, lease_until);
+
+    CREATE TABLE memory_operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL UNIQUE,
+        request_hash TEXT NOT NULL CHECK(length(request_hash) = 71 AND substr(request_hash, 1, 7) = 'sha256:' AND NOT (substr(request_hash, 8) GLOB '*[^0-9a-f]*')),
+        source TEXT NOT NULL CHECK(source IN ('desktop', 'telegram', 'engine', 'system')),
+        kind TEXT NOT NULL
+            CHECK(kind IN ('capture', 'update', 'delete', 'accept_suggestion', 'reconcile', 'restore')),
+        target_id TEXT,
+        expected_revision INTEGER CHECK(expected_revision IS NULL OR expected_revision >= 1),
+        state TEXT NOT NULL DEFAULT 'pending'
+            CHECK(state IN ('pending', 'file_committed', 'completed', 'failed')),
+        result_revision INTEGER CHECK(result_revision IS NULL OR result_revision >= 1),
+        content_hash TEXT CHECK(content_hash IS NULL OR (length(content_hash) = 71 AND substr(content_hash, 1, 7) = 'sha256:' AND NOT (substr(content_hash, 8) GLOB '*[^0-9a-f]*'))),
+        receipt_hash TEXT CHECK(receipt_hash IS NULL OR (length(receipt_hash) = 71 AND substr(receipt_hash, 1, 7) = 'sha256:' AND NOT (substr(receipt_hash, 8) GLOB '*[^0-9a-f]*'))),
+        error_code TEXT CHECK(error_code IS NULL
+            OR (length(error_code) BETWEEN 1 AND 48 AND error_code NOT GLOB '*[^a-z0-9_]*')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX memory_operations_state ON memory_operations(state, updated_at);
+
+    CREATE TABLE memory_changes (
+        cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id TEXT,
+        suggestion_id TEXT,
+        revision INTEGER CHECK(revision IS NULL OR revision >= 1),
+        kind TEXT NOT NULL CHECK(kind IN ('created', 'updated', 'trashed', 'restored',
+            'external_change', 'deactivated', 'suggestion_created', 'suggestion_resolved',
+            'index_rebuilt')),
+        created_at TEXT NOT NULL
+    );
+
+    CREATE VIRTUAL TABLE memory_fts USING fts5(
+        item_id UNINDEXED,
+        title,
+        summary,
+        body,
+        tags,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+
+    CREATE TABLE approval_shadow_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(id) ON DELETE CASCADE,
+        model TEXT NOT NULL CHECK(length(model) BETWEEN 1 AND 128),
+        prompt_version TEXT NOT NULL CHECK(length(prompt_version) BETWEEN 1 AND 64),
+        p_safe REAL NOT NULL CHECK(p_safe >= 0.0 AND p_safe <= 1.0),
+        measured_at TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
+        action_fingerprint TEXT NOT NULL CHECK(length(action_fingerprint) = 71 AND substr(action_fingerprint, 1, 7) = 'sha256:' AND NOT (substr(action_fingerprint, 8) GLOB '*[^0-9a-f]*'))
+    );
+    "#,
 ];
 
 type DupRow = (String, String, Option<String>, Option<String>, Option<String>, i64);

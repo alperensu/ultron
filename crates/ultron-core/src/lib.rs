@@ -10,6 +10,7 @@ pub mod external;
 pub mod handoff;
 pub mod import;
 pub mod ipc;
+pub mod memory;
 pub mod paths;
 pub mod policy;
 pub mod projects;
